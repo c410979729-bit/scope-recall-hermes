@@ -7,7 +7,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field, replace
 from itertools import islice
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..contracts import ContractError, utc_timestamp
 from . import private
@@ -38,6 +38,7 @@ from .recall_overflow import visible_query_pairs
 from .recall_policy import (
     RecallPolicy,
     asks_without_answering,
+    hard_identifiers,
     identifiers_compatible,
     meaningful_query_terms,
     rrf_score,
@@ -275,6 +276,14 @@ RELATION_WEIGHT = 0.5
 
 
 @dataclass
+class _VectorPool:
+    """What one collection round's vector search ranked, admitted or not (``RetrievalPipeline._vector_candidates``)."""
+
+    searched: bool = False
+    keys: set[tuple[str, str, int]] = field(default_factory=set)
+
+
+@dataclass
 class _Aside:
     """What hydration sets aside rather than delivers (``RetrievalPipeline._hydrate_admit``): older copies of the
     current message, which lead to their turn's replies, and what the asking model still holds, which leads on to
@@ -364,7 +373,9 @@ class RetrievalPipeline:
         budget: ChannelBudget | None = None,
         prefetched=None,
         channel: str = "vector",
+        pool: _VectorPool | None = None,
     ) -> tuple[CandidateRef, ...]:
+        """The vector hits admitted against the recall's best hit; ``pool`` also learns every hit ranked."""
         if self.vector_port is None or context.limits.vector_limit == 0:
             gaps.append("vector_unavailable")
             return ()
@@ -404,11 +415,28 @@ class RetrievalPipeline:
             return ()
         if budget is not None:
             budget.spend(channel, len(raw))
+        if pool is not None:
+            pool.searched = True
+            pool.keys.update(candidate.key for candidate in raw)
         admitted = []
+        # The current message is never recalled, so it neither sets the best hit nor takes a place in the ranking.
+        current = context.current_source_refs
+        ranked = [
+            candidate
+            for candidate in raw
+            if f"{candidate.ref}@{candidate.revision}" not in current
+            and candidate.embedding_space == self.policy.embedding_space_id
+        ]
+        best = self.policy.vector_best(ranked)
+        # Ranked hits below the threshold join automatic injection only: an explicit search asks for ten items, and
+        # the hits they added there pushed answers other channels found further down.
+        place = (
+            {candidate.key: index for index, candidate in enumerate(ranked, 1)} if context.automatic_injection else {}
+        )
         for rank, candidate in enumerate(raw, 1):
             if candidate.rank != rank:
                 candidate = replace(candidate, rank=rank)
-            accepted, reason = self.policy.vector_admission(candidate)
+            accepted, reason = self.policy.vector_admission(candidate, best=best, rank=place.get(candidate.key))
             note_candidate(candidate, None if accepted else "threshold")
             if accepted:
                 admitted.append(candidate)
@@ -427,7 +455,8 @@ class RetrievalPipeline:
         if candidate.kind == "event" and f"{candidate.ref}@{candidate.revision}" in context.current_source_refs:
             return False
         if candidate.source == "vector":
-            return self.policy.vector_admission(candidate)[0]
+            # Its channel admitted it against the recall's best hit and its rank there (``_vector_candidates``).
+            return True
         if candidate.source in {"exact_ref", "relation", "claim_lexical", "scoped", "dated"}:
             # A claim candidate already passed its own statement rule in storage; a scoped one is a message of
             # the day and entry the question names, and a dated one a source of the time it names that holds what
@@ -480,7 +509,9 @@ class RetrievalPipeline:
         _note_below_floor(gaps, candidate.source)
         return False
 
-    def _qualified_candidates(self, tx, raw: list[CandidateRef], context: SearchContext, gaps: list[str]):
+    def _qualified_candidates(
+        self, tx, raw: list[CandidateRef], context: SearchContext, gaps: list[str], pool: _VectorPool | None = None
+    ):
         """Require a passing channel per object, retaining its admitted ranking signals.
 
         A strong semantic hit can also have a weak lexical signal. Its position
@@ -488,7 +519,8 @@ class RetrievalPipeline:
         Each object with no legacy-admitted channel uses its passing signals
         directly, so an unrelated candidate cannot suppress that fallback.
         For a named time window, the dated channel owns relaxed lexical
-        admission; ordinary fallback would bypass that window.
+        admission; ordinary fallback would bypass that window.  Lexical hits
+        the vector search passed over are dropped (``_semantically_unrelated``).
         """
         for candidate in raw:
             note_candidate(
@@ -506,10 +538,38 @@ class RetrievalPipeline:
         ]
         keys = {candidate.key for candidate in passing}
         qualified = [candidate for candidate in admitted if candidate.key in keys]
-        if context.time is not None:
-            return qualified
-        qualified_keys = {candidate.key for candidate in qualified}
-        return qualified + [candidate for candidate in passing if candidate.key not in qualified_keys]
+        if context.time is None:
+            qualified_keys = {candidate.key for candidate in qualified}
+            qualified += [candidate for candidate in passing if candidate.key not in qualified_keys]
+        unrelated = self._semantically_unrelated(tx, qualified, context, pool)
+        return [candidate for candidate in qualified if candidate.source != "lexical" or candidate.key not in unrelated]
+
+    def _semantically_unrelated(
+        self, tx, candidates: list[CandidateRef], context: SearchContext, pool: _VectorPool | None
+    ) -> frozenset[tuple[str, str, int]]:
+        """Lexical hits an automatic recall leaves out: assistant replies that are embedded, so the vector search
+        could rank them, yet absent from all it ranked.  Their words match the question and their meaning does not;
+        on LongMemEval-S such hits were most of what reached another question's history and a third of every packet,
+        nearly all long replies sharing a common word.
+
+        The owner's own messages stay: an aggregate question ("how many times did I ...") is answered by many of
+        them that its words find and its meaning ranks too low.  So does a reply not embedded yet (a message said a
+        moment ago is found by its words), and every hit when the vector search did not run or the question names an
+        identifier, which words find and meaning does not.
+        """
+        reader = getattr(self.storage_reader, "embedded_replies", None)
+        if pool is None or not pool.searched or not callable(reader):
+            return frozenset()
+        loose = [
+            candidate for candidate in candidates if candidate.source == "lexical" and candidate.key not in pool.keys
+        ]
+        if not loose or hard_identifiers(self._admission_query(context)):
+            return frozenset()
+        unrelated = cast(frozenset[tuple[str, str, int]], reader(tx, loose))
+        for candidate in loose:
+            if candidate.key in unrelated:
+                note_candidate(candidate, "semantic_mismatch")
+        return unrelated
 
     def _collect(
         self,
@@ -527,11 +587,13 @@ class RetrievalPipeline:
             gaps.append("deadline_exceeded_collect")
             return ()
         raw: list[CandidateRef] = []
+        pool = _VectorPool()
 
-        def admitted() -> tuple[CandidateRef, ...]:
+        def admitted(*, quiet: bool = False) -> tuple[CandidateRef, ...]:
             # Deadline exits still pass every collected candidate through the
-            # same current-source and channel qualification gate.
-            accepted = self._qualified_candidates(tx, raw, context, gaps)
+            # same current-source and channel qualification gate.  A quiet pass
+            # re-qualifies what an earlier pass already counted the rejections of.
+            accepted = self._qualified_candidates(tx, raw, context, [] if quiet else gaps, pool)
             return self._fuse_candidates(accepted, seen)
 
         channels = (
@@ -592,10 +654,10 @@ class RetrievalPipeline:
             gaps.append("deadline_exceeded_collect")
             return admitted()
         return self._collect_optional(
-            context, gaps, raw, budget, prefetched=prefetched, admitted=admitted, on_ready=on_ready
+            context, gaps, raw, budget, prefetched=prefetched, admitted=admitted, on_ready=on_ready, pool=pool
         )
 
-    def _collect_optional(self, context, gaps, raw, budget, *, prefetched, admitted, on_ready):
+    def _collect_optional(self, context, gaps, raw, budget, *, prefetched, admitted, on_ready, pool=None):
         """Hydrate ready channels before an optional wait, then merge any added signals."""
         ready = admitted()
         if on_ready is not None:
@@ -606,7 +668,7 @@ class RetrievalPipeline:
             gaps.append("deadline_exceeded_collect")
             return ready
         with using_request_deadline(self._deadline(context)):
-            optional = list(self._vector_candidates(context, gaps, budget=budget, prefetched=prefetched))
+            optional = list(self._vector_candidates(context, gaps, budget=budget, prefetched=prefetched, pool=pool))
             view = self._owner_view(context)
             searchable = self.vector_port is not None and context.limits.vector_limit > 0
             if view is not None and searchable and self._remaining(context) > 0:
@@ -616,10 +678,15 @@ class RetrievalPipeline:
                 # agree on ranks by both.
                 owned = replace(context, query=view.first)
                 optional.extend(
-                    self._vector_candidates(owned, gaps, budget=budget, prefetched=prefetched, channel="vector_owner")
+                    self._vector_candidates(
+                        owned, gaps, budget=budget, prefetched=prefetched, channel="vector_owner", pool=pool
+                    )
                 )
         raw.extend(optional)
-        return admitted() if optional else ready
+        if optional:
+            return admitted()
+        # A search that ran re-qualifies even with nothing admitted: what it ranked decides which lexical hits stay.
+        return admitted(quiet=True) if pool is not None and pool.searched else ready
 
     # -- hydration and admission ----------------------------------------------
 
@@ -1155,8 +1222,13 @@ class RetrievalPipeline:
             hydrate_ready(seeds)
             # Optional signals can improve a ready candidate's fused rank.
             # Refresh its rank without repeating hydration or echo side effects.
+            # A ready candidate this round hydrated early that the final qualification dropped leaves with it.
             fused = {candidate.key: candidate for candidate in seeds}
-            hydrated[:] = [(fused.get(candidate.key, candidate), obj) for candidate, obj in hydrated]
+            hydrated[:] = [
+                (fused.get(candidate.key, candidate), obj)
+                for candidate, obj in hydrated
+                if candidate.key in fused or candidate.key not in attempted
+            ]
             cutoff = self._release_cutoff(working, release_deadline, timings, hydrated)
             working = replace(working, deadline=cutoff)
             if round_index + 1 >= max_rounds:

@@ -9,6 +9,7 @@ outside the trusted context.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from collections.abc import Iterator
@@ -496,6 +497,26 @@ class RetrievalStorage(RetrievalHydration):
 
     def _remaining(self, context: SearchContext) -> float:
         return context.deadline - self.clock.monotonic()
+
+    def embedded_replies(self, tx, candidates) -> frozenset[tuple[str, str, int]]:
+        """The keys of the event ``candidates`` the assistant wrote whose embedding is done, so the vector search
+        could have ranked them.
+
+        One look-up per candidate on the queue's unique key; the state is compared outside the index so the planner
+        does not walk every finished item instead.
+        """
+        wanted = [[candidate.ref, candidate.revision] for candidate in candidates if candidate.kind == "event"]
+        if not wanted:
+            return frozenset()
+        rows = tx._check().execute(
+            "SELECT i.subject_ref,i.subject_revision FROM json_each(?) w CROSS JOIN work_items i "
+            "ON i.work_type='embed' AND i.subject_ref=json_extract(w.value,'$[0]') "
+            "AND i.subject_revision=json_extract(w.value,'$[1]') "
+            "JOIN source_events e ON e.event_id=i.subject_ref AND e.source_revision=i.subject_revision "
+            "WHERE +i.state='done' AND e.role='assistant'",
+            (json.dumps(wanted),),
+        )
+        return frozenset(("event", ref, revision) for ref, revision in rows)
 
     def epoch(self, tx) -> int:
         return tx.memory_epoch()
