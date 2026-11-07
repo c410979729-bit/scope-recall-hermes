@@ -18,9 +18,12 @@ import json
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from scope_recall.contracts import ContractError
+from scope_recall.core.adoption import adoption_messages, decision_messages, fragments
+from scope_recall.core.entity_resolution import entity_messages
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig, build_auxiliary_runtime
 from scope_recall.runtime.consolidation_models import RESPONSES_KIND, ConsolidationRouteConfig, ResponsesRouteConfig
 from scope_recall.runtime.model_budget import (
@@ -165,6 +168,47 @@ def _answer(
         }
     )
     return json.dumps(payload).encode()
+
+
+def _structured_task_messages(task):
+    """Build real task envelopes whose synthetic source text cannot supply the format keyword."""
+    owner = SimpleNamespace(event={"content": "Adopt option one after checking the environment."})
+    parts = fragments("Option one: check the environment.")
+    selection = dict(adopted=True, fragment_ids=[1], scope="whole", conditions=[])
+    if task == "adoption_locate":
+        return adoption_messages(owner, parts)
+    if task == "adoption_describe":
+        snapshot = SimpleNamespace(confirmation=owner, fragments=parts)
+        return decision_messages(snapshot, selection)
+    assert task == "entity"
+    source = SimpleNamespace(
+        payload=dict(
+            subject="TEST-North Lodge",
+            value_text="TEST-North Lodge is a building.",
+            evidence_spans=[],
+        )
+    )
+    return entity_messages(source, (), ())
+
+
+@pytest.mark.parametrize("task", ["entity", "adoption_locate", "adoption_describe"])
+def test_structured_task_input_explicitly_requests_json(tmp_path, monkeypatch, task):
+    """The JSON format field alone cannot satisfy the provider's input-message requirement."""
+    monkeypatch.setenv(CREDENTIAL_ENV, "test-key")
+    messages = _structured_task_messages(task)
+    assert "json" not in messages[1]["content"].lower(), "source text must not accidentally satisfy the contract"
+    transport = FakeTransport(lambda **kwargs: (200, _answer("{}")))
+    runtime = _runtime(_payload(tmp_path), transport)
+    runtime.consolidation.propose(messages, remaining_seconds=2.0)
+
+    body = transport.calls[0]["body"]
+    assert body["text"]["format"] == {"type": "json_object"}
+    assert body["input"] == [
+        dict(type="message", role=message["role"], content=[dict(type="input_text", text=message["content"])])
+        for message in messages
+    ]
+    input_text = " ".join(part["text"] for message in body["input"] for part in message["content"])
+    assert "json" in input_text.lower(), "JSON mode requires the word in input, not just text.format"
 
 
 # ---------------------------------------------------------------------------
