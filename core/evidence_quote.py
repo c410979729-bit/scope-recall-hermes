@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import unicodedata
 
-from ..contracts import ContractError
+from ..contracts import ContractError, nfkc_letters_and_digits
 
 #: What ``json.dumps(..., ensure_ascii=False)`` emits for each character it
 #: rewrites.  Anything else below 0x20 becomes a ``\u00xx`` escape; everything
@@ -189,6 +189,8 @@ def align_claim_evidence(claim: dict, sources: dict, *, index: int) -> None:
 
     A window's content is searched before any omitted text and intervals are
     translated to the complete source. No source outside this map is read.
+    A quote without a letter or digit (``{``, ``。``) can state no subject,
+    relation or value, and is refused like a quote the source does not hold.
     """
     spans = claim.get("evidence_spans")
     if not isinstance(spans, list):
@@ -200,6 +202,8 @@ def align_claim_evidence(claim: dict, sources: dict, *, index: int) -> None:
         if source is None:
             field = "source_revision" if any(key[0] == span.get("source_ref") for key in sources) else "source_ref"
             raise ContractError("DERIVATION_INVALID", f"claim_proposals[{index}].evidence_spans[{span_index}].{field}")
+        if not nfkc_letters_and_digits(span["quote"]):
+            raise ContractError("DERIVATION_INVALID", f"claim_proposals[{index}].evidence_spans[{span_index}].quote")
         content = source.event["content"]
         window = getattr(source, "consolidation_window", None)
         offset = window.start if window is not None else 0

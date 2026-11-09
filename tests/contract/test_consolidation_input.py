@@ -36,8 +36,15 @@ def test_scope_instruction_does_not_escape_request_budget(app):
     source = capture(core, ctx, "TEST 用户决定使用蓝色。")
     plain = consolidation_messages((source,))
     exact = sum(len(message["content"].encode("utf-8")) for message in plain)
-    messages = consolidation_messages((source,), memory_instruction="只记决定", budget=exact)
-    assert all("只记决定" not in message["content"] for message in messages)
+    # A carried instruction counts toward the budget, so a batch sized to the
+    # budget without it is refused and the caller sends fewer sources.
+    with pytest.raises(ContractError) as refused:
+        consolidation_messages((source,), memory_instruction="只记决定", budget=exact)
+    assert (refused.value.code, refused.value.field) == ("INPUT_INVALID", "consolidation_input_budget")
+    # One that would take more than half the room the rules leave is omitted.
+    room = exact - len(plain[0]["content"].encode("utf-8"))
+    messages = consolidation_messages((source,), memory_instruction="决" * room, budget=exact)
+    assert messages == plain
 
 
 def test_consolidation_preserves_authorized_origin_role_and_attested_import(app):

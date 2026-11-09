@@ -120,6 +120,38 @@ def test_nonexistent_quote_is_rejected_without_losing_a_good_batch_item(worker_a
         align_claim_evidence(bad, {(source.ref, source.revision): source}, index=0)
 
 
+class _AgreeingJudge(FakeConsolidation):
+    """A model that also judges, and finds every proposal supported."""
+
+    def judge(self, messages, *, remaining_seconds):
+        return json.dumps(dict(support="supported", action="new", target_ref=None, target_revision=None))
+
+
+@pytest.mark.parametrize("quote", ["{", "。", " ——"])
+def test_quote_without_letters_or_digits_is_rejected_even_when_judged_supported(worker_app, quote):
+    core, ctx, clock = worker_app
+    source = capture(core, ctx, '{"Conversation summary": "TEST-project 配色蓝色。"} ——')
+    good = draft(source, subject="TEST-project", predicate="配色", value="蓝色")
+    good["evidence_spans"][0]["quote"] = "TEST-project 配色蓝色。"
+    bad = dict(
+        good,
+        subject="TEST-project",
+        predicate="摘要标题",
+        value_text="Conversation summary",
+        kind="fact",
+        evidence_spans=[dict(good["evidence_spans"][0], quote=quote)],
+    )
+    model = _AgreeingJudge(lambda sources, **kw: consolidation_payload(*sources, claims=[bad, good]))
+    core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=20)
+    with sqlite3.connect(core.storage.path) as conn:
+        values = [json.loads(row[0])["value_text"] for row in conn.execute("SELECT payload_json FROM claim_versions")]
+        errors = conn.execute("SELECT stage,error_code,error_field FROM work_error_details").fetchall()
+    assert values == ["蓝色"]
+    assert ("claim", "DERIVATION_INVALID", "claim_proposals[0].evidence_spans[0].quote") in errors
+    with pytest.raises(ContractError, match="claim_proposals\\[0\\].evidence_spans\\[0\\].quote"):
+        align_claim_evidence(bad, {(source.ref, source.revision): source}, index=0)
+
+
 def test_acceptance_failure_retries_with_the_field_and_same_budget(worker_app):
     core, ctx, clock = worker_app
     source = capture(core, ctx, "TEST-project 配色蓝色。")
