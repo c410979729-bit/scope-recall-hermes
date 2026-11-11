@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -33,7 +34,9 @@ from v11_support import source_event
 
 
 def route():
-    return cli.CodexCliRouteConfig(Path(sys.executable), next(iter(cli.VERIFIED_BINARIES)))
+    return cli.CodexCliRouteConfig(
+        Path(sys.executable), "960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc"
+    )
 
 
 def ledger(tmp_path, **policy):
@@ -382,8 +385,82 @@ def test_bounded_diagnostics_keep_stage_without_body_or_retry(tmp_path, monkeypa
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(("remaining", "expected"), [(30, 15), (10, 10), (4, 4)])
+def test_state_bootstrap_cap_respects_remaining_time(tmp_path, monkeypatch, remaining, expected):
+    limits = []
+
+    def run(command, *, cwd, prompt, seconds, diagnostics=None, environment=None):
+        limits.append(seconds)
+        state = cwd / "state"
+        state.mkdir()
+        with closing(sqlite3.connect(state / "state_test.sqlite")) as db, db:
+            db.executescript(
+                "CREATE TABLE backfill_state(id INTEGER PRIMARY KEY, status TEXT);"
+                "INSERT INTO backfill_state VALUES(1, 'complete');"
+                "CREATE TABLE threads(id TEXT);"
+            )
+        return 0, b""
+
+    monkeypatch.setattr(cli, "_run", run)
+    cli._prepare_state(route(), tmp_path, seconds=remaining)
+    assert limits == [expected]
+
+
+@pytest.mark.parametrize(
+    ("budget", "catalog_seconds", "bootstrap_seconds", "model_seconds"),
+    [(45, 41, 39, 32.75), (90, 41, 39, 32.75), (20, 16, 14, 7.75), (10, 6, 4, None)],
+)
+def test_propose_preparation_time_leaves_model_deadline(
+    tmp_path, monkeypatch, budget, catalog_seconds, bootstrap_seconds, model_seconds
+):
+    clock, seen = [100.0], {}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+
+    def catalog(configured, directory, *, seconds, diagnostics=None):
+        seen["catalog"] = seconds
+        clock[0] += 2
+        return directory / "model-catalog.json"
+
+    def bootstrap(configured, directory, *, seconds, diagnostics=None):
+        seen["bootstrap"] = seconds
+        if seconds < 6:
+            clock[0] += max(0, seconds)
+            raise AuxiliaryModelError("timeout")
+        clock[0] += 6
+
+    def run(command, *, cwd, prompt, seconds, diagnostics=None):
+        seen["model"] = seconds
+        clock[0] += 0.5
+        return 0, events()
+
+    account = ledger(tmp_path)
+    original_reserve = account.reserve
+
+    def reserve(model, *, timeout_seconds):
+        seen["reserve"] = timeout_seconds
+        clock[0] += 0.25
+        return original_reserve(model, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(cli, "_prepare_catalog", catalog)
+    monkeypatch.setattr(cli, "_prepare_state", bootstrap)
+    monkeypatch.setattr(cli, "_run", run)
+    monkeypatch.setattr(account, "reserve", reserve)
+    adapter = cli.CodexCliConsolidationAdapter(route(), ledger=account)
+    if model_seconds is None:
+        with pytest.raises(AuxiliaryModelError, match="timeout"):
+            adapter.propose([dict(role="user", content="synthetic")], remaining_seconds=budget)
+        assert "model" not in seen and "reserve" not in seen
+        assert account.status()["daily_calls"] == 0
+    else:
+        assert adapter.propose([dict(role="user", content="synthetic")], remaining_seconds=budget) == "{}"
+        assert seen["model"] == model_seconds
+        assert account.status()["daily_calls"] == 1
+    assert seen["catalog"] == catalog_seconds
+    assert seen["bootstrap"] == bootstrap_seconds
+
+
 def test_native_cli_wire_has_zero_tools(tmp_path, monkeypatch):
-    """Real pinned CLI, local fake HTTP only, isolated home and no OAuth."""
+    """Qualify a candidate CLI using local fake HTTP, an isolated home and no OAuth."""
     executable = os.environ.get("SCOPE_RECALL_CODEX_CLI")
     if not executable:
         pytest.skip("set SCOPE_RECALL_CODEX_CLI for the offline native boundary proof")
@@ -393,6 +470,7 @@ def test_native_cli_wire_has_zero_tools(tmp_path, monkeypatch):
     (tmp_path / "codex-home" / "config.toml").write_text("[invalid user config", encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     requests = []
+    authorization = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -400,6 +478,7 @@ def test_native_cli_wire_has_zero_tools(tmp_path, monkeypatch):
 
         def do_POST(self):
             raw = self.rfile.read(int(self.headers["Content-Length"]))
+            authorization.append(bool(self.headers.get("Authorization")))
             assert not self.headers.get("Authorization")
             body = json.loads(raw)
             requests.append(body)
@@ -439,9 +518,24 @@ def test_native_cli_wire_has_zero_tools(tmp_path, monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        configured = replace(route(), executable=Path(executable))
-        catalog = cli._prepare_catalog(configured, tmp_path, seconds=8)
-        cli._prepare_state(configured, tmp_path, seconds=5)
+        with Path(executable).open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        # Qualification precedes admission; this exception belongs only to this test.
+        monkeypatch.setattr(cli, "VERIFIED_BINARIES", cli.VERIFIED_BINARIES | {digest})
+        configured = replace(route(), executable=Path(executable), executable_sha256=digest)
+        # Hashing a CLI of several hundred megabytes twice and starting it once can take over eight seconds.
+        catalog = cli._prepare_catalog(configured, tmp_path, seconds=30)
+        print(f"native_catalog: sha256={digest} bundled_model={cli.MODEL}")
+        bootstrap_diagnostics = {}
+        bootstrap_started = time.monotonic()
+        cli._prepare_state(
+            configured, tmp_path, seconds=cli.STATE_INIT_TIMEOUT_SECONDS, diagnostics=bootstrap_diagnostics
+        )
+        print(
+            f"native_bootstrap: elapsed_seconds={time.monotonic() - bootstrap_started:.6f} "
+            f"process_seconds={bootstrap_diagnostics['elapsed_seconds']:.6f} "
+            f"limit_seconds={cli.STATE_INIT_TIMEOUT_SECONDS} exit={bootstrap_diagnostics['exit_code']}"
+        )
         # Native initialization belongs to an empty, credential-free home, not
         # the caller's login/history directory (whose config above is invalid).
         assert not (tmp_path / "bootstrap-home" / "auth.json").exists()
@@ -459,16 +553,23 @@ def test_native_cli_wire_has_zero_tools(tmp_path, monkeypatch):
             "enable_request_compression",
         ]
         code, raw = cli._run(command, cwd=tmp_path, prompt=b"Return {}", seconds=15)
+        print(f"native_process: requests={len(requests)} authorization={authorization} exit={code}")
         # Do not include stdout/stderr or request prompt in assertion diagnostics.
         assert len(requests) == 1, f"request_count={len(requests)}, exit={code}"
         additional = [item for item in requests[0].get("input", []) if item.get("type") == "additional_tools"]
+        print(
+            "native_tool_fields: "
+            + json.dumps({key: value for key, value in requests[0].items() if "tool" in key})
+            + f" additional_tools={additional}"
+        )
 
         assert requests[0].get("tools", []) == []
         assert all(item.get("tools") == [] for item in additional)
         assert requests[0].get("model") == cli.MODEL
         assert code == 0
         assert cli._decode(raw, code)[2] == "codex_success"
-        print("native_wire: model=gpt-5.6-luna tools=[] requests=1 authorization=absent exit=0")
+        tools = json.dumps(requests[0]["tools"]) if "tools" in requests[0] else "absent"
+        print(f"native_wire: model=gpt-5.6-luna tools={tools} requests=1 authorization=absent exit=0")
     finally:
         server.shutdown()
         server.server_close()

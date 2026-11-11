@@ -171,6 +171,7 @@ SCRIPT_GATE_TESTS = [
 GIT_TESTS = ["tests/integration/test_guard_git.py"]
 SUITES = {
     "unit": [
+        "tests/unit/test_codex_cli_identity.py",
         "tests/unit/test_file_access.py",
         "tests/unit/test_host_memory_status.py",
         "tests/unit/test_host_memory_context.py",
