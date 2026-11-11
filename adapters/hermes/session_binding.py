@@ -111,14 +111,13 @@ class SessionBinding:
             self._adapter._unbound_session = False
             self._adapter._identity = fresh
             self._adapter._ledger.reset()
-            self._adapter._turn_counter = 0
-            self._adapter._active_turn_id = ""
-            self._adapter._pre_llm_pending = False
             with self._adapter._said_lock:
-                self._adapter._interim_said.clear()
-                self._adapter._steer_said.clear()
+                self._adapter._turn_counter = 0
+                self._adapter._active_turn_id = ""
+                self._adapter._turns.reset_binding()
+                self._adapter._turns.clear_completed()
                 self._adapter._notice_turns.clear()
-            self._adapter._user_captured_turns.clear()
+                self._adapter._user_captured_turns.clear()
             self._adapter._session_watermark = 0
             self._adapter._turns.reset_source_refs()
             self._adapter._current_task_message = ""
@@ -193,15 +192,14 @@ class SessionBinding:
         # it said between tool calls, and what the person sent meanwhile, would never be recorded.
         if reset or kwargs.get("reason") != "compression":
             self._adapter._current_task_message = ""
-            self._adapter._pre_llm_pending = False
             with self._adapter._said_lock:
+                self._adapter._turns.reset_binding()
                 # With the turn id cleared under the same lock, a post_llm_call of the old session that arrives
                 # late finds no turn to keep its copy for.
                 self._adapter._active_turn_id = ""
-                self._adapter._interim_said.clear()
-                self._adapter._steer_said.clear()
+                self._adapter._turns.clear_completed()
                 self._adapter._notice_turns.clear()
-            self._adapter._user_captured_turns.clear()
+                self._adapter._user_captured_turns.clear()
         self._adapter._identity = fresh
         runtime_audience = fresh.runtime_audience
         self._adapter._diagnostics.capability_gaps = tuple(
@@ -220,7 +218,8 @@ class SessionBinding:
 
         update_adapter_binding(self._adapter)
         if reset:
-            self._adapter._turn_counter = 0
+            with self._adapter._said_lock:
+                self._adapter._turn_counter = 0
         self._adapter._session_watermark += 1
 
     def _report_unbound(self, identity: HermesIdentity) -> None:
