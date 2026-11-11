@@ -325,6 +325,10 @@ class RuntimeInstance:
     _default_embed: Any = None
     _default_purge: Any = None
     _ingress_authorizer: Callable[[object], frozenset[str]] | None = None
+    #: A shared store's ownership proof, which a drain gives its claim writes: the worker's context speaks for no
+    #: entry and carries none (``core.claim_normalization.using_owner_proof``).
+    #: ``None`` for a store of one installation.
+    _owner_proof: Callable[..., str | None] | None = None
     _owned_resources: list[Any] = field(default_factory=list)
     _vector_openers: dict[int, int] = field(default_factory=dict, init=False, repr=False, compare=False)
     _closed: bool = False
@@ -627,6 +631,7 @@ class RuntimeInstance:
                 *self.background_gaps,
                 f"deletion_mirror_failed:{(self.backup_upkeep or {}).get('error', 'unknown')}",
             )
+        from ..core.claim_normalization import using_owner_proof
         from ..core.worker import WorkerConfig, drain_worker  # only a process that drains loads the worker
 
         model, candidate = self._consolidation_ports(consolidation)
@@ -683,31 +688,32 @@ class RuntimeInstance:
         limit = self.config.request_seconds
         effective_embed = embed if embed is not None else self._default_embed
         effective_purge = purge if purge is not None else self._default_purge
-        return drain_worker(
-            self.core.storage,
-            self.core.clock,
-            self.config.context(),
-            config=WorkerConfig(
-                owner_id=self.config.owner_id,
-                max_items=self.config.max_items if max_items is None else max_items,
-                lease_seconds=self.config.lease_seconds,
-                auto_retry_cooldown_seconds=self.config.auto_retry_cooldown_seconds,
-                max_auto_recoveries=self.config.max_auto_recoveries,
-                purge_only=purge_only,
-                admission_policy=self.core.config.admission_policy,
-                # The bound the model and embedding ports below are clamped to.
-                request_seconds=limit,
-                model_request_seconds=self.config.model_request_seconds,
-                held_work_types=held_work_types,
-                summary_capable=summary_budget_enabled(self.config.auxiliary),
-                reflection_capable=summary_budget_enabled(self.config.auxiliary),
-            ),
-            remaining_seconds=max(0.001, deadline - time.monotonic()),
-            consolidation=model,
-            candidate=candidate,
-            embed=_BoundedEmbed(effective_embed, limit) if effective_embed is not None else None,
-            purge=_BoundedPurge(effective_purge, limit) if effective_purge is not None else None,
-        )
+        with using_owner_proof(self._owner_proof):
+            return drain_worker(
+                self.core.storage,
+                self.core.clock,
+                self.config.context(),
+                config=WorkerConfig(
+                    owner_id=self.config.owner_id,
+                    max_items=self.config.max_items if max_items is None else max_items,
+                    lease_seconds=self.config.lease_seconds,
+                    auto_retry_cooldown_seconds=self.config.auto_retry_cooldown_seconds,
+                    max_auto_recoveries=self.config.max_auto_recoveries,
+                    purge_only=purge_only,
+                    admission_policy=self.core.config.admission_policy,
+                    # The bound the model and embedding ports below are clamped to.
+                    request_seconds=limit,
+                    model_request_seconds=self.config.model_request_seconds,
+                    held_work_types=held_work_types,
+                    summary_capable=summary_budget_enabled(self.config.auxiliary),
+                    reflection_capable=summary_budget_enabled(self.config.auxiliary),
+                ),
+                remaining_seconds=max(0.001, deadline - time.monotonic()),
+                consolidation=model,
+                candidate=candidate,
+                embed=_BoundedEmbed(effective_embed, limit) if effective_embed is not None else None,
+                purge=_BoundedPurge(effective_purge, limit) if effective_purge is not None else None,
+            )
 
     def _replay_ingress(self, budget: float) -> tuple[str, ...]:
         """Persist captured inbox payloads.  Ingress never spends the model-work budget."""
@@ -991,16 +997,19 @@ def build_runtime_instance(
         retrieval_policy=config.recall_policy(),
     )
     core.recall_diagnostics.writer.observe = lambda: worker_observation(config.binding)
-    ingress_authorizer = None
+    ingress_authorizer = owner_proof = None
     # A shared store's inbox holds its Hermes entries' captures, whichever
     # process replays them; each is checked against the entry that made it.
     if config.host_adapter == "hermes" or config.binding.installation_kind == "shared":
-        # The worker checks a replayed capture against the host's current installation map, which is the host
-        # adapters' identity code: the one import from runtime up into adapters, kept to the call (it would add
-        # about twenty modules to every worker start).
-        from ..adapters.hermes.authorization import build_ingress_authorizer
+        # The worker checks a replayed capture against the host's current installation map, and reads from it
+        # which principals are the store's owner.  Both are the host adapters' identity code: the one import from
+        # runtime up into adapters, kept to the call (it would add about twenty modules to every worker start).
+        from ..adapters.hermes.authorization import build_ingress_authorizer, build_owner_proof
 
         ingress_authorizer = build_ingress_authorizer(config.binding)
+        # The adapters name the installed package's ``InstanceBinding``, which pyright reads as another class than
+        # this module's.
+        owner_proof = build_owner_proof(config.binding)  # pyright: ignore[reportArgumentType]
     elif config.host_adapter == "codex":
         from ..adapters.clients.authorization import build_ingress_authorizer
 
@@ -1013,6 +1022,7 @@ def build_runtime_instance(
         _vector_port=vectors,
         _vector_store=vectors,
         _ingress_authorizer=ingress_authorizer,
+        _owner_proof=owner_proof,
         _owned_resources=[resource for resource in (vectors, auxiliary) if resource is not None],
     )
     if vectors is None and config.vector is not None:

@@ -43,6 +43,37 @@ def normalize_fact_component(
     return normalized
 
 
+_WORD_RE = re.compile(r"[^\W_]+")
+
+
+def _words(label: Any) -> list[str]:
+    """A label's runs of letters and digits, case and width folded."""
+    return _WORD_RE.findall(unicodedata.normalize("NFKC", str(label or "")).casefold())
+
+
+def fact_frame(subject: Any, predicate: Any) -> str:
+    """What a subject and its relation say together: their letters and digits in order, case and width folded.
+
+    An extraction model writes these labels afresh for every message, so one slot comes back as "launch date" and
+    "launch_date", divided as ("Atlas beta", "launch date") and ("Atlas", "beta launch date"), or with the words that
+    open the relation also closing the subject, ("Atlas beta launch", "launch date"); those words are read once.
+    Equal frames only nominate claims for a same-slot judgement (``claims.slot_reading``).  A frame is never a stored
+    identity: ``claims.claim_slot`` keeps the labels as written.
+
+    Labels undergo Unicode NFKC then casefold; runs of letters and digits are concatenated. Non-segmented scripts
+    are not tokenized by language: overlap removal compares complete runs, never substrings within a run.
+    Empty frames carry no candidate identity and must be excluded from loose matching.
+    """
+    named, relation = _words(subject), _words(predicate)
+    # The slot lookup runs this on every claim of a scope, and few labels repeat a word across the two.
+    if named and named[-1] in relation:
+        for size in range(min(len(named), len(relation)), 0, -1):
+            if named[-size:] == relation[:size]:
+                relation = relation[size:]
+                break
+    return "".join(named + relation)
+
+
 def _digest(kind: str, components: list[str]) -> str:
     material = json.dumps(
         {

@@ -10,16 +10,16 @@ from ..runtime.embedding_models import EMBED_RESERVE_FLOOR
 from ..runtime.model_budget import default_budget_policy
 
 # One hundred user/assistant exchanges across four idle-ended sessions, with a
-# completed task, six adoptions and one explicit query per exchange. Importance
+# completed task, six adoptions, four corrections with label drift and one explicit query per exchange. Importance
 # is returned in extraction and adoption descriptions, with no separate call.
 # Tokens count request message contents, using the runtime's token estimator.
 MEASURED_100 = {
-    "extraction": (109, 534916, 10098),
-    "entity_resolution": (9, 19109, 351),
-    "embedding": (230, 72917, 0),
-    "session_summary": (16, 43119, 1078),
+    "extraction": (113, 537312, 11642),
+    "entity_resolution": (16, 40303, 624),
+    "embedding": (241, 72586, 0),
+    "session_summary": (16, 42347, 1081),
     "task_summary": (2, 3426, 132),
-    "locate_adoption": (96, 48943, 1110),
+    "locate_adoption": (96, 48439, 1110),
     "describe_adoption": (6, 2508, 216),
     "adoption_support": (6, 4678, 234),
 }
