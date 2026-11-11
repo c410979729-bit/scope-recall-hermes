@@ -28,6 +28,7 @@ from scope_recall.adapters.hermes import (
     HermesIdentityError,
     ScopeRecallHermesAdapter,
     bind_hermes_identity,
+    hooks,
     install_hermes_scope_recall,
     unbound_sessions,
 )
@@ -530,6 +531,68 @@ def test_what_is_said_in_a_desktop_conversation_of_the_transport_is_captured_as_
         with sqlite3.connect(hermes_home / "scope-recall" / "memory.sqlite3") as connection:
             rows = connection.execute("SELECT origin, scope_id FROM source_events WHERE role='user'").fetchall()
         assert rows and set(rows) == {("human_direct", provider._identity.owner_private_scope_id)}
+    finally:
+        provider.shutdown()
+
+
+def test_the_pre_model_hook_of_a_conversation_of_the_transport_reaches_its_session(
+    hermes_home, initialize_kwargs, this_account
+):
+    """Hermes names a turn's sender to its hooks as it named the session's user to the provider: for a conversation
+    of the transport, the account.  The session was bound as the person at this machine, and that hook is still its
+    own: the message is stored before the model is called, where a tool call of the same turn can cite it.  A hook
+    that names another account is not this session's."""
+    _binding, core = _install(hermes_home, initialize_kwargs, local_platforms=("desktop",))
+    provider = ScopeRecallHermesAdapter(core=core)
+    provider.initialize(CONVERSATION, **_conversation(initialize_kwargs, "desktop"))
+    hooks._register_adapter_instance(provider)
+    before_model = hooks._global_callback("pre_llm_call")
+    turn = dict(session_id=CONVERSATION, turn_id="TEST-turn-1", platform="desktop")
+    try:
+        before_model(**turn, sender_id=OTHER_ACCOUNT, user_message="TEST 另一个账号发来的话。")
+        assert not provider.diagnostics.current_source_refs
+        said = "TEST 桌面端的字号调大一号。"
+        before_model(**turn, sender_id=THIS_ACCOUNT, user_message=said)
+        assert len(provider.diagnostics.current_source_refs) == 1
+        with sqlite3.connect(hermes_home / "scope-recall" / "memory.sqlite3") as connection:
+            assert connection.execute("SELECT content FROM source_events WHERE role='user'").fetchall() == [(said,)]
+    finally:
+        provider.shutdown()
+        hooks._unregister_adapter_instance(provider)
+
+
+@pytest.mark.parametrize("platform", ["desktop", "tui"])
+@pytest.mark.parametrize("tool", ["revise", "forget"])
+def test_approved_local_surfaces_still_refuse_mutation_tools(
+    hermes_home, initialize_kwargs, monkeypatch, platform, tool
+):
+    """Approving a local surface for capture and recall does not grant CLI mutation tools."""
+    _binding, core = _install(hermes_home, initialize_kwargs, local_platforms=(platform,))
+    provider = ScopeRecallHermesAdapter(core=core)
+    provider.initialize("TEST-local-tools", **_session(initialize_kwargs, platform))
+    try:
+        assert provider._identity.runtime_audience.includes_owner_private
+        assert not provider._identity.read_only
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("a local surface must be refused before reaching the core mutation")
+
+        monkeypatch.setattr(core, tool, unexpected)
+        request = (
+            dict(
+                target_ref="PRIVATE-CLAIM",
+                expected_revision=1,
+                new_value="TEST-value",
+                conditions=[],
+                source_evidence_refs=[],
+                valid_from=None,
+            )
+            if tool == "revise"
+            else dict(target_refs=["PRIVATE-CLAIM"], mode="delete", expected_revisions={"PRIVATE-CLAIM": 1})
+        )
+        reply = json.loads(provider.handle_tool_call(tool, dict(protocol_version="1.1", **request)))
+        assert reply["error"] == {"code": "ACCESS_DENIED", "field": "origin"}
+        assert "PRIVATE-CLAIM" not in json.dumps(reply)
     finally:
         provider.shutdown()
 

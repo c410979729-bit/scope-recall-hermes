@@ -11,15 +11,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from scope_recall.adapters.clients import CodexHookHandler
 from scope_recall.adapters.hermes import HermesIdentityError, ScopeRecallHermesAdapter, bind_hermes_identity
 from scope_recall.adapters.hermes.identity import switch_hermes_identity
 from scope_recall.adapters.hermes.installation import build_installation_manifest, write_installation_manifest
 from scope_recall.adapters.hermes.shared_entries import (
     attach_shared_entry,
+    attach_shared_record,
+    client_entry_record,
     load_binding_for_home,
     new_shared_payload,
     read_shared_payload,
@@ -27,6 +31,8 @@ from scope_recall.adapters.hermes.shared_entries import (
 )
 from scope_recall.core.claims import Qualification
 from scope_recall.maintenance.shared_import import import_entry
+from scope_recall.runtime.instance import build_runtime_instance
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from test_denial_values import NEGATED_STATES
 
 NOW = "2026-09-22T20:00:00Z"
@@ -214,6 +220,277 @@ def test_a_deletion_through_one_entry_is_gone_for_every_entry(root, entries, slo
     )
     assert layers["sqlite_active"] == "removed" and layers["vector_active"] == "removed", layers
     assert _query(root, "SELECT count(*) FROM source_events WHERE content LIKE '%4471%'") == [(0,)]
+
+
+# One owner and two agents: what they tell one and then change through the other.
+
+ORIGINAL = "We're launching the Atlas beta on March 3."
+CHANGE = "Change of plan: the Atlas beta launch date is now March 17."
+#: What a consolidation model made of each statement: the same relation, spelled as two requests spelled it.
+LAUNCH_CLAIMS = {
+    ORIGINAL: ("launch_date", "March 3", ORIGINAL),
+    CHANGE: ("launch date", "March 17", "the Atlas beta launch date is now March 17"),
+}
+DESKTOP_SESSION = "TEST-desktop-session"
+
+
+@pytest.fixture
+def desk_and_codex(tmp_path, root):
+    """A Hermes entry whose installer approved Hermes Desktop, and a Codex entry attached with its owner grants."""
+    desk = _home(tmp_path, "desk", local_platforms=("desktop",))
+    attach_shared_entry(root, desk, entry_id="desk", display_name="TEST desk", now=NOW)
+    owner = next(row for row in read_shared_payload(root)["entries"][0]["audiences"] if row["kind"] == "owner_private")
+    codex = tmp_path / "TEST-codex-home"
+    attach_shared_record(
+        root,
+        client_entry_record(
+            host="codex",
+            home=codex,
+            entry_id="codex",
+            display_name="Codex",
+            attached_at=NOW,
+            allowed_scope_ids=owner["allowed_scope_ids"],
+            writable_scope_ids=owner["writable_scope_ids"],
+            capture_scope_id=owner["capture_scope_id"],
+        ),
+        now=NOW,
+    )
+    return desk.hermes_home, codex
+
+
+def _desktop(home):
+    """The owner's session on Hermes Desktop, which names no user."""
+    provider = ScopeRecallHermesAdapter()
+    unnamed = {key: value for key, value in _kwargs(home, platform="desktop").items() if key != "user_id"}
+    provider.initialize(DESKTOP_SESSION, **unnamed)
+    return provider
+
+
+def test_first_person_claims_across_entries_currently_remain_separate(root, desk_and_codex, monkeypatch):
+    """First-person subjects keep each entry's raw principal even when both routes approve one owner."""
+    from scope_recall.core.evidence_support import using_support
+    from scope_recall.core.semantic_proposals import prepare_publication
+
+    desk, codex = desk_and_codex
+    _tell_codex(codex, "我喜欢茶。", monkeypatch, turn="TEST-self-codex")
+    desktop = _desktop(desk)
+    try:
+        _say(desktop, "我喜欢咖啡。", session=DESKTOP_SESSION, turn="TEST-self-desktop")
+        ctx = desktop._identity.trusted_context()
+        for text, value in (("我喜欢茶。", "茶"), ("我喜欢咖啡。", "咖啡")):
+            with desktop._core.storage.read(ctx) as tx:
+                ref, revision = (
+                    tx._check()
+                    .execute("SELECT event_id,source_revision FROM source_events WHERE content=?", (text,))
+                    .fetchone()
+                )
+            proposal = dict(
+                kind="preference",
+                subject="我",
+                predicate="喜欢",
+                value_text=value,
+                conditions=[],
+                statement_kind="assertion",
+                valid_from=None,
+                valid_to=None,
+                evidence_spans=[
+                    dict(
+                        source_ref=ref,
+                        source_revision=revision,
+                        quote=value,
+                        start=text.index(value),
+                        end=text.index(value) + len(value),
+                    )
+                ],
+            )
+            body = dict(
+                protocol_version="1.1",
+                source_refs=[f"{ref}@{revision}"],
+                claim_proposals=[proposal],
+                resume_proposals=[],
+                reference_proposals=[],
+            )
+            source = desktop._core.source(ctx, ref, revision)
+            verdicts = prepare_publication(
+                desktop._core.storage,
+                ctx,
+                body,
+                (source,),
+                lambda *a, **k: json.dumps(
+                    dict(support="supported", action="new", target_ref=None, target_revision=None)
+                ),
+            )
+            with using_support(verdicts):
+                result = desktop._core.records.accept_claim_proposals(
+                    ctx, body, scope_id=desktop._identity.local_scope_id
+                )
+            assert result.items[0].state == "active", desktop._core.claim_history(ctx, result.items[0].ref)[-1].reason
+        rows = _query(root, "SELECT subject FROM claims WHERE kind='preference'")
+        assert len(rows) == 2 and len(set(rows)) == 2
+    finally:
+        desktop.shutdown()
+
+
+def _tell_codex(codex, text, monkeypatch, *, turn):
+    hook = CodexHookHandler.from_home(str(codex), "codex")
+    monkeypatch.setattr(hook, "ensure_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hook, "launch_worker", lambda *args, **kwargs: None)
+    try:
+        hook.handle_payload(
+            dict(
+                hook_event_name="UserPromptSubmit",
+                session_id="TEST-codex-session",
+                turn_id=turn,
+                cwd=str(codex),
+                prompt=text,
+            )
+        )
+        assert hook.diagnostics.capture_stage == "source_committed"
+    finally:
+        hook.close()
+
+
+class _LaunchPort:
+    """Extract the synthetic messages and judge a matching stored launch value by content."""
+
+    def propose(self, messages, **kwargs):
+        body = json.loads(messages[-1]["content"])
+        if "proposal" in body:
+            choices = [
+                c
+                for c in body["candidates"]
+                if c["payload"]["subject"] == "Atlas beta" and c["payload"]["value_text"] == "March 3"
+            ]
+            target = choices[0] if len(choices) == 1 else None
+            return json.dumps(
+                dict(
+                    support="supported",
+                    action="update" if target else "new",
+                    target_ref=target["ref"] if target else None,
+                    target_revision=target["revision"] if target else None,
+                )
+            )
+        claims = []
+        for source in body["sources"]:
+            found = LAUNCH_CLAIMS.get(source["content"].strip())
+            if found is None:
+                continue
+            predicate, value, quote = found
+            claims.append(
+                dict(
+                    kind="decision",
+                    subject="Atlas beta",
+                    predicate=predicate,
+                    value_text=value,
+                    conditions=[],
+                    statement_kind="decision",
+                    valid_from=None,
+                    valid_to=None,
+                    evidence_spans=[
+                        dict(source_ref=source["source_ref"], source_revision=source["source_revision"], quote=quote)
+                    ],
+                )
+            )
+        return json.dumps(
+            dict(
+                protocol_version="1.1",
+                source_refs=body["source_refs"],
+                claim_proposals=claims,
+                resume_proposals=[],
+                reference_proposals=[],
+            )
+        )
+
+
+def _consolidate(home):
+    """Passes of the store's worker, built as its own process builds it, over what was said so far."""
+    from scope_recall.core.worker_consolidation import build_consolidation_model
+
+    binding = load_binding_for_home(home).to_binding()
+    # A pass claims model work only while it still covers one whole request, so the request bound stays well under
+    # the pass.
+    config = RuntimeInstanceConfig(
+        binding=binding,
+        session_id="shared-background",
+        allowed_scope_ids=binding.scope_ids,
+        host_adapter="hermes",
+        owner_id="shared-scope-recall-worker",
+        request_seconds=3.0,
+    )
+    with closing(build_runtime_instance(config)) as runtime:
+        for _ in range(3):
+            runtime.drain(consolidation=build_consolidation_model(_LaunchPort()), max_items=8, remaining_seconds=30)
+
+
+def _launch_dates(root):
+    return _query(
+        root,
+        "SELECT c.predicate, v.revision, v.state, json_extract(v.payload_json,'$.value_text'), v.replaces_revision "
+        "FROM claims c JOIN claim_versions v USING(claim_id) WHERE c.subject='Atlas beta' "
+        "ORDER BY c.claim_id, v.revision",
+    )
+
+
+@pytest.mark.parametrize("first", ["codex", "desktop"])
+@pytest.mark.parametrize("second_person", [False, True])
+def test_a_change_of_mind_told_to_another_agent_is_the_same_fact_s_next_version(
+    root, desk_and_codex, monkeypatch, first, second_person
+):
+    """The same approved owner advances a fact across entries; another verified speaker stays beside it.
+
+    Both routes use different predicate spellings and preserve the original version.
+    """
+    desk, codex = desk_and_codex
+    desktop = _desktop(desk)
+    original_codex_context = CodexHookHandler.context
+    try:
+        statements = [ORIGINAL, CHANGE]
+        for turn, text in enumerate(statements, start=1):
+            if turn == 2 and second_person:
+                from scope_recall.contracts import TrustedSourcePrincipal
+
+                visitor = TrustedSourcePrincipal("human", "verified", "principal:TEST-visitor")
+                if first == "codex":
+                    original_context = desktop._identity.trusted_context
+                    monkeypatch.setattr(
+                        type(desktop._identity),
+                        "trusted_context",
+                        lambda self, *a, _context=original_context, _visitor=visitor, **k: replace(
+                            _context(*a, **k), source_principal=_visitor
+                        ),
+                    )
+                else:
+                    monkeypatch.setattr(
+                        CodexHookHandler,
+                        "context",
+                        lambda self, *a, _visitor=visitor, **k: replace(
+                            original_codex_context(self, *a, **k), source_principal=_visitor
+                        ),
+                    )
+            through_codex = (first == "codex") == (text is ORIGINAL)
+            if through_codex:
+                _tell_codex(codex, text, monkeypatch, turn=f"TEST-codex-turn-{turn}")
+            else:
+                _say(desktop, text, session=DESKTOP_SESSION, turn=f"TEST-desktop-turn-{turn}")
+            _consolidate(desk)
+    finally:
+        desktop.shutdown()
+
+    assert _launch_dates(root) == [
+        ("launch_date", 1, "active", "March 3", None),
+        ("launch_date", 2, "proposed" if second_person else "active", "March 17", None if second_person else 1),
+    ]
+    binding = load_binding_for_home(desk).to_binding()
+    with closing(
+        build_runtime_instance(
+            RuntimeInstanceConfig(
+                binding=binding, session_id="TEST-read", allowed_scope_ids=binding.scope_ids, host_adapter="hermes"
+            )
+        )
+    ) as runtime:
+        [(ref,)] = _query(root, "SELECT claim_id FROM claims WHERE subject='Atlas beta'")
+        head = runtime.core.current_claim(runtime.config.context(), ref)
+        assert head.payload["value_text"] == ("March 3" if second_person else "March 17")
 
 
 def test_an_entry_attached_later_leaves_a_running_one_bound_as_it_was(tmp_path, root, entries):

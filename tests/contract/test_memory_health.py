@@ -382,6 +382,34 @@ def test_claims_split_only_by_lossy_labels_need_semantic_judgement_before_repair
     assert core.current_claim(ctx, second.ref).payload["value_text"] == "March 17"
 
 
+def test_a_relation_stored_under_two_spellings_requires_semantic_judgement(app):
+    """Separator variants are merge candidates, while health repairs require strict slot equality."""
+    core, ctx = app
+    heads = []
+    for predicate, value in (("launch_date", "March 3"), ("launch date", "March 17")):
+        source = capture(core, ctx, f"TEST-Atlas {predicate} {value}.")
+        proposal = draft(
+            source, value, kind="fact", statement_kind="assertion", subject="TEST-Atlas", predicate=predicate
+        )
+        with core.storage.write(ctx) as tx:
+            heads.append(
+                tx.claims.append(
+                    "TEST-scope",
+                    proposal,
+                    Qualification("active", "direct_report", "synthetic"),
+                    recorded_at=core.clock.utc_now(),
+                )
+            )
+    old, new = heads
+    api = owner(app)
+    page = api.health(limit=20, deadline_seconds=5)
+    assert not any({old.ref, new.ref} == {v["ref"] for v in issue["facts"]} for issue in page["contradictions"])
+    with pytest.raises(ContractError, match="fact_pair"):
+        api.health_choose_fact(new.ref, new.revision, old.ref, old.revision)
+    assert core.current_claim(ctx, old.ref).payload["value_text"] == "March 3"
+    assert core.current_claim(ctx, new.ref).payload["value_text"] == "March 17"
+
+
 def test_capacity_rotated_history_does_not_prove_fact_unused(app):
     core, ctx = app
     item = separate_fact(core, ctx, "TEST-Lighthouse", "blue")

@@ -61,7 +61,7 @@ def _active_adapter(kwargs: dict[str, Any]) -> Any | None:
                 continue
             if platform and identity.scope.platform != platform:
                 continue
-            if sender_id and identity.scope.user_id != sender_id:
+            if sender_id and not identity.is_sender(sender_id):
                 continue
             matches.append(adapter)
         if not matches:

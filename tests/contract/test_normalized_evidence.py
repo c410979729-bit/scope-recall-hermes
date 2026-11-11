@@ -464,13 +464,21 @@ def restated(source, value, **labels):
 
 @pytest.mark.parametrize("kind,predicate", [("fact", "launch_date"), ("decision", "launch date")])
 @pytest.mark.parametrize("speaker", ["TEST-B", None, "TEST-A"])
-def test_verified_import_preserves_speaker_when_revising_a_human_decision(app, kind, predicate, speaker):
+@pytest.mark.parametrize("owner_proof", [False, True])
+def test_verified_import_preserves_speaker_when_revising_a_human_decision(app, kind, predicate, speaker, owner_proof):
     from dataclasses import replace
 
     from scope_recall.contracts import TrustedSourcePrincipal
     from scope_recall.core.semantic_proposals import prepare_publication
 
     core, ctx = app
+    if owner_proof:
+        ctx = replace(
+            ctx,
+            owner_resolver=lambda entry, principal, memo: (
+                "TEST-owner" if principal and principal.get("principal_ref") == "principal:TEST-A" else None
+            ),
+        )
     owner = replace(ctx, source_principal=TrustedSourcePrincipal("human", "verified", "principal:TEST-A"))
     first = capture(core, owner, "TEST-project launch date March 3.", when="2026-09-03T12:00:00Z")
     old = accept(core, owner, draft(first, "March 3", predicate="launch date")).items[0]
@@ -543,7 +551,8 @@ def _supported_date_insert(core, ctx, source, proposal):
         ("2026-11-10", "2026-11-05", "TEST-project 从2026-11-11起上线日期改为2026-11-05。"),
     ],
 )
-def test_date_valued_correction_uses_source_order_and_preserves_validity(app, old_value, value, text):
+@pytest.mark.parametrize("offset", ["Z", "+08:00", "-08:00", "+14:00", "-12:00"])
+def test_date_valued_correction_uses_source_order_and_preserves_validity(app, old_value, value, text, offset):
     from dataclasses import replace
 
     from scope_recall.contracts import TrustedSourcePrincipal
@@ -554,17 +563,20 @@ def test_date_valued_correction_uses_source_order_and_preserves_validity(app, ol
     ctx = replace(ctx, source_principal=TrustedSourcePrincipal("human", "verified", "principal:TEST-date-owner"))
     core.clock.now = "2026-11-11T12:00:00Z"
     first = capture(core, ctx, f"TEST-project launch date {old_value}.", when="2026-11-10T12:00:00Z")
+    start = f"2026-11-05T00:00:00{offset}"
+    # Include the UTC calendar day too so grounding and timezone ordering are exercised independently.
+    text += f" UTC record {canonical_time(start)[:10]}."
     # Capture before inserting the predecessor so the literal capture shortcut cannot bypass model publication.
     source = capture(core, ctx, text, when=core.clock.now)
     stored = restated(first, old_value, kind="fact", predicate="launch date", valid_from="2026-11-10T00:00:00Z")
     old = _supported_date_insert(core, ctx, first, stored)
-    proposal = decoded_date_proposal(source, value, predicate="launch_date", valid_from="2026-11-05T00:00:00Z")
+    proposal = decoded_date_proposal(source, value, predicate="launch_date", valid_from=start)
     verdicts = prepare_publication(core.storage, ctx, envelope(proposal), (source,), _date_update(old, old_value))
     with using_support(verdicts):
         result = accept(core, ctx, proposal).items[0]
     head = core.current_claim(ctx, old.ref)
     assert (result.ref, result.state, head.payload["value_text"]) == (old.ref, "active", value)
-    assert head.valid_from == canonical_time("2026-11-05T00:00:00Z")
+    assert head.valid_from == canonical_time(start)
     assert head.reason != "late_historical_evidence"
 
 
@@ -959,3 +971,257 @@ def test_a_changed_plan_stays_one_claim_across_differently_labelled_extractions(
         (3, "active", "March 24, 2027"),
     ]
     assert len({row[0] for row in versions}) == 1
+
+
+OWNER_AT_CODEX = "principal:TEST-owner-at-codex"
+OWNER_AT_DESKTOP = "principal:TEST-owner-at-desktop"
+ORIGINAL = "We're launching the Atlas beta on March 3."
+CHANGE = "Change of plan: the Atlas beta launch date is now March 17."
+CHANGE_QUOTE = "the Atlas beta launch date is now March 17"
+
+
+def one_owner(entry_id, principal, memo):
+    """A shared store's ownership proof: both routes are approved as the one owner's."""
+    return "TEST-installation" if principal["principal_ref"] in {OWNER_AT_CODEX, OWNER_AT_DESKTOP} else None
+
+
+def speaker(ctx, principal, session, proof=None):
+    from dataclasses import replace
+
+    from scope_recall.contracts import TrustedSourcePrincipal
+
+    person = TrustedSourcePrincipal("human", "verified", principal)
+    return replace(ctx, session_id=session, source_principal=person, owner_resolver=proof)
+
+
+def launch(source, value, quote, **changes):
+    """A positioned proposal for the Atlas beta's launch date, quoting ``quote`` from ``source``."""
+    proposal = draft(
+        source, value, subject="Atlas beta", predicate="launch_date", quote_override=quote, valid_from=None
+    )
+    start = source.event["content"].index(quote)
+    proposal["evidence_spans"][0].update(start=start, end=start + len(quote))
+    proposal.update(changes)
+    return proposal
+
+
+def distinct(messages, **kwargs):
+    """Judge the synthetic launch relation by candidate content; ambiguous pairs remain separate."""
+    body = json.loads(messages[-1]["content"])
+    choices = [
+        c
+        for c in body["candidates"]
+        if c["payload"]["subject"] == "Atlas beta"
+        and c["payload"]["predicate"] in {"launch_date", "launch date"}
+        and c["payload"]["value_text"] == "March 3"
+    ]
+    target = choices[0] if len(body["candidates"]) == len(choices) == 1 else None
+    return json.dumps(
+        dict(
+            support="supported",
+            action="update" if target else "new",
+            target_ref=target["ref"] if target else None,
+            target_revision=target["revision"] if target else None,
+        )
+    )
+
+
+def publish(core, person, source, proposal):
+    from scope_recall.core.semantic_proposals import prepare_publication
+
+    with using_support(prepare_publication(core.storage, person, envelope(proposal), (source,), distinct)):
+        return accept(core, person, proposal).items[0]
+
+
+def told_through_codex(core, ctx, proof=None):
+    """The owner tells Codex the launch date; returns the stored claim."""
+    codex = speaker(ctx, OWNER_AT_CODEX, "TEST-codex-session", proof)
+    source = capture(core, codex, ORIGINAL, when="2026-09-03T12:00:00Z")
+    stored = publish(core, codex, source, launch(source, "March 3", ORIGINAL))
+    assert (stored.revision, stored.state) == (1, "active")
+    return stored
+
+
+def changed_through(core, ctx, principal, session, proof=None, **changes):
+    """The change of plan said later by ``principal``; returns what publishing its claim wrote."""
+    person = speaker(ctx, principal, session, proof)
+    source = capture(core, person, CHANGE, when="2026-09-05T12:00:00Z")
+    return publish(core, person, source, launch(source, "March 17", CHANGE_QUOTE, **changes))
+
+
+def test_the_owner_s_later_word_through_another_entry_replaces_the_value(app):
+    core, ctx = app
+    stored = told_through_codex(core, ctx, one_owner)
+
+    changed = changed_through(core, ctx, OWNER_AT_DESKTOP, "TEST-desktop-session", one_owner)
+
+    assert (changed.ref, changed.revision, changed.disposition, changed.state) == (stored.ref, 2, "inserted", "active")
+    assert core.current_claim(ctx, stored.ref).payload["value_text"] == "March 17"
+    history = core.claim_history(ctx, stored.ref)
+    assert [(v.revision, v.payload["value_text"], v.replaces_revision) for v in history] == [
+        (1, "March 3", None),
+        (2, "March 17", 1),
+    ]
+
+
+def test_another_person_s_later_word_stays_a_proposal_beside_the_value(app):
+    """The proof names the first speaker the owner and says nothing of the second: two people."""
+    core, ctx = app
+
+    def only_codex(entry_id, principal, memo):
+        return "TEST-installation" if principal["principal_ref"] == OWNER_AT_CODEX else None
+
+    stored = told_through_codex(core, ctx, only_codex)
+
+    said = changed_through(core, ctx, "principal:TEST-visitor", "TEST-visitor-session", only_codex)
+
+    assert (said.ref, said.disposition, said.state) == (stored.ref, "historical", "proposed")
+    assert core.claim_history(ctx, stored.ref)[-1].reason == "different_source_principal"
+    assert core.current_claim(ctx, stored.ref).payload["value_text"] == "March 3"
+
+
+def test_two_routes_with_no_ownership_proof_stay_two_people(app):
+    core, ctx = app
+    stored = told_through_codex(core, ctx)
+
+    said = changed_through(core, ctx, OWNER_AT_DESKTOP, "TEST-desktop-session")
+
+    assert (said.ref, said.state) == (stored.ref, "proposed")
+    assert core.current_claim(ctx, stored.ref).payload["value_text"] == "March 3"
+
+
+def test_a_pass_outside_a_host_session_reads_one_owner_from_the_proof_it_is_given(app):
+    """The worker's context carries no ownership proof of its own; its pass is given the store's."""
+    from scope_recall.core.claim_normalization import using_owner_proof
+
+    core, ctx = app
+    stored = told_through_codex(core, ctx)
+
+    with using_owner_proof(one_owner):
+        changed = changed_through(core, ctx, OWNER_AT_DESKTOP, "TEST-desktop-session")
+
+    assert (changed.ref, changed.revision, changed.state) == (stored.ref, 2, "active")
+    assert core.current_claim(ctx, stored.ref).payload["value_text"] == "March 17"
+
+
+@pytest.mark.parametrize("spelling", ["launch date", "Launch-Date", "LAUNCH_DATE", "launch  date"])
+def test_a_relation_spelled_another_way_takes_the_slot_that_holds_it(app, spelling):
+    core, ctx = app
+    stored = told_through_codex(core, ctx)
+
+    changed = changed_through(core, ctx, OWNER_AT_CODEX, "TEST-codex-session", predicate=spelling)
+
+    assert (changed.ref, changed.revision, changed.state) == (stored.ref, 2, "active")
+    current = core.current_claim(ctx, stored.ref)
+    assert (current.payload["predicate"], current.payload["value_text"]) == ("launch_date", "March 17")
+    with core.storage.read(ctx) as tx:
+        assert tx._check().execute("SELECT count(*) FROM claims WHERE subject='Atlas beta'").fetchone()[0] == 1
+
+
+def test_another_relation_of_the_same_subject_keeps_a_slot_of_its_own(app):
+    core, ctx = app
+    stored = told_through_codex(core, ctx)
+
+    other = changed_through(core, ctx, OWNER_AT_CODEX, "TEST-codex-session", predicate="launch_window")
+
+    assert other.ref != stored.ref and (other.revision, other.state) == (1, "active")
+    assert core.current_claim(ctx, stored.ref).payload["value_text"] == "March 3"
+
+
+def test_a_spelling_two_stored_slots_already_share_is_given_to_neither(app):
+    """A store can hold one relation as two claims that differ only in spelling.  A third spelling of it names
+    neither claim, and choosing one is left to the owner."""
+    from scope_recall.core.claims import Qualification
+
+    core, ctx = app
+    stored = told_through_codex(core, ctx)
+    codex = speaker(ctx, OWNER_AT_CODEX, "TEST-codex-session")
+    source = capture(core, codex, "The Atlas beta launch date is March 10.", when="2026-09-04T12:00:00Z")
+    twin = launch(source, "March 10", source.event["content"], predicate="launch date")
+    with core.storage.write(codex) as tx:
+        second = tx.claims.append(
+            "TEST-scope",
+            twin,
+            Qualification("active", "direct_report", "synthetic_twin"),
+            recorded_at="2026-09-04T12:00:00Z",
+        )
+
+    third = changed_through(core, ctx, OWNER_AT_CODEX, "TEST-codex-session", predicate="Launch-Date")
+
+    assert third.ref not in {stored.ref, second.ref} and third.revision == 1
+    assert core.current_claim(ctx, stored.ref).payload["value_text"] == "March 3"
+    assert core.current_claim(ctx, second.ref).payload["value_text"] == "March 10"
+
+
+def test_merge_lookup_nominates_the_slot_of_a_relation_spelled_another_way(app):
+    from scope_recall.core.semantic_proposals import merge_candidates
+
+    core, ctx = app
+    stored = told_through_codex(core, ctx)
+    codex = speaker(ctx, OWNER_AT_CODEX, "TEST-codex-session")
+    source = capture(core, codex, CHANGE, when="2026-09-05T12:00:00Z")
+    proposal = launch(source, "March 17", CHANGE_QUOTE, predicate="launch date")
+
+    with core.storage.read(codex) as tx:
+        choices = merge_candidates(tx, proposal, "TEST-scope", now=core.clock.utc_now())
+
+    assert [(item["ref"], item["payload"]["predicate"]) for item in choices] == [(stored.ref, "launch_date")]
+
+
+@pytest.mark.parametrize(
+    "start,echo",
+    [
+        ("2026-11-05T00:00:00+08:00", True),
+        ("2026-11-05T00:00:00-08:00", True),
+        ("2026-11-05T00:00:00+14:00", True),
+        ("2026-11-05T23:59:59-12:00", True),
+        ("2026-11-03T00:00:00Z", False),
+    ],
+)
+def test_date_echo_covers_any_timezone_but_excludes_two_days_earlier(start, echo):
+    from scope_recall.core.claims import canonical_time
+    from scope_recall.core.mutate import _historical_start
+
+    proposal = dict(valid_from=start, value_text="2026-11-05")
+    assert _historical_start(proposal) == (None if echo else canonical_time(start))
+
+
+def test_later_date_echo_from_imports_without_source_times_does_not_prove_order(app):
+    from dataclasses import replace
+
+    from scope_recall.contracts import TrustedSourcePrincipal
+    from scope_recall.core.semantic_proposals import prepare_publication
+
+    core, ctx = app
+    ctx = replace(ctx, source_principal=TrustedSourcePrincipal("human", "verified", "principal:TEST-date-owner"))
+    core.clock.now = "2026-12-01T12:00:00Z"
+    first = capture(
+        core,
+        ctx,
+        "TEST-project cutoff 2026-11-10.",
+        origin="imported",
+        when=None,
+        attested=True,
+        source_original_origin="human_direct",
+    )
+    old = _supported_date_insert(
+        core, ctx, first, restated(first, "2026-11-10", predicate="cutoff", valid_from="2026-11-10T00:00:00Z")
+    )
+    source = capture(
+        core,
+        ctx,
+        "TEST-project cutoff 2026-11-20.",
+        origin="imported",
+        when=None,
+        attested=True,
+        source_original_origin="human_direct",
+    )
+    proposal = restated(source, "2026-11-20", predicate="cutoff", valid_from="2026-11-20T00:00:00Z")
+    with using_support(
+        prepare_publication(core.storage, ctx, envelope(proposal), (source,), _date_update(old, "2026-11-10"))
+    ):
+        result = accept(core, ctx, proposal).items[0]
+    assert result.state == "disputed"
+    latest = core.claim_history(ctx, old.ref)[-1]
+    assert latest.reason == "conflicting_evidence_order_unknown"
+    assert latest.valid_from == "2026-11-20T00:00:00.000000+00:00"

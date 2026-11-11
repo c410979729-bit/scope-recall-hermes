@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from ..contracts import (
@@ -377,10 +378,17 @@ def _historical_start(proposal):
     """Return a validity start usable for historical ordering, without changing the stored assertion.
 
     A complete calendar-date value echoed into valid_from supplies no independent order: only the source's time
-    can establish that such evidence is historical. Validity-based reads still use the original interval.
+    can establish that such evidence is historical. The possible calendar day spans UTC+14 through UTC-12;
+    validity-based reads still use the original interval.
     """
     start = canonical_time(proposal["valid_from"])
-    return None if start and date_value(proposal["value_text"]) == date_value(start[:10]) else start
+    day = date_value(proposal["value_text"])
+    if start and day:
+        # Compare timedeltas to avoid overflowing at the first and last representable calendar dates.
+        offset = datetime.fromisoformat(start) - datetime(*day, tzinfo=UTC)
+        if -timedelta(hours=14) <= offset < timedelta(days=1, hours=12):
+            return None
+    return start
 
 
 def _order_against_head(tx, proposal, roots, previous, qualification, scope_id):
@@ -402,7 +410,8 @@ def _order_against_head(tx, proposal, roots, previous, qualification, scope_id):
             qualification = Qualification(previous.state, previous.basis, previous.reason)
         return qualification, True, ()
     old_roots = tx.claims.roots(evidence_refs(previous.payload))
-    new_owner, old_owner = human_owner(roots), human_owner(old_roots)
+    proof_memo: dict = {}
+    new_owner, old_owner = human_owner(roots, tx=tx, memo=proof_memo), human_owner(old_roots, tx=tx, memo=proof_memo)
     new_order, old_order = source_order(tx, roots), source_order(tx, old_roots)
     ingestion_ordered = (
         new_owner is not None
@@ -411,11 +420,9 @@ def _order_against_head(tx, proposal, roots, previous, qualification, scope_id):
         and old_order is not None
         and all(r.occurred_at is None for r in (*roots, *old_roots))
     )
-    new_start, old_start = canonical_time(proposal["valid_from"]), canonical_time(previous.valid_from)
+    new_start, old_start = _historical_start(proposal), _historical_start(previous.payload)
     new_times, old_times = _said_times(roots), _said_times(old_roots)
-    late = _dated_before(_historical_start(proposal), old_start, new_times, old_times) or (
-        ingestion_ordered and new_order < old_order
-    )
+    late = _dated_before(new_start, old_start, new_times, old_times) or (ingestion_ordered and new_order < old_order)
     if new_owner is not None and old_owner is not None and new_owner != old_owner:
         return Qualification("proposed", "inferred_suggestion", "different_source_principal"), False, ()
     if late:
