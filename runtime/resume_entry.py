@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from ..core.process_environment import configure_numeric_threads
+
+    configure_numeric_threads()
+
 import argparse
 import json
 from datetime import datetime, timezone
