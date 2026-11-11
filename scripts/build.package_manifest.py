@@ -4,8 +4,8 @@
     python scripts/build.package_manifest.py --check   # what is stale
     python scripts/build.package_manifest.py --write   # bring it in line
 
-Change the version in ``_version.py`` and run ``--write``; the two plugin.yaml
-manifests and the packaging allowlist follow.  The
+Change the version in ``_version.py`` and run ``--write``; the adapter manifest
+and packaging allowlist follow, as does the catalog manifest for a release. The
 packaging tier fails when anything here is stale, so ``--check`` is what that
 failure is telling you to run.
 

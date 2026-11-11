@@ -665,8 +665,13 @@ def test_non_pypi_home_declarations_pin_exact_version(tmp_path, monkeypatch, ver
     assert any(change.action == "restart" and "UV_FIND_LINKS" in change.detail for change in plan.changes)
     project = tomllib.loads(install_hermes.wrapper_pyproject(version))
     assert project["project"]["dependencies"] == [f"hermes-scope-recall[vectors]=={version}"]
-    template = "name: scope-recall\n"
-    assert install_hermes.wrapper_manifest(template, version) == template
+    template = "name: scope-recall\nversion: 1.0.0\n"
+    from scope_recall._version import manifest_version
+
+    assert (
+        install_hermes.wrapper_manifest(template, version)
+        == f"name: scope-recall\nversion: {manifest_version(version)}\n"
+    )
 
 
 def test_the_home_plugin_directory_declares_the_core_with_its_vector_extra(tmp_path, released):
@@ -2156,12 +2161,14 @@ def test_a_released_wrapper_declares_its_core_and_a_candidate_declares_nothing()
     resolve fails its whole build, so only a release on PyPI is declared."""
     import yaml
     from packaging.requirements import Requirement
+    from scope_recall._version import manifest_version
     from scope_recall.maintenance.install_hermes import wrapper_manifest
 
     template = (
         "name: scope-recall\nversion: 3.3.0\nprovider_entry: register:register\n"
         'pip_dependencies:\n  - "hermes-scope-recall[vectors]==3.3.0"\n'
     )
+    assert wrapper_manifest(template, "3.3.0") == template
     (spec,) = yaml.safe_load(wrapper_manifest(template, "3.3.0"))["pip_dependencies"]
     requirement = Requirement(spec)
     assert (requirement.name, requirement.extras, str(requirement.specifier)) == (
@@ -2170,7 +2177,10 @@ def test_a_released_wrapper_declares_its_core_and_a_candidate_declares_nothing()
         "==3.3.0",
     )
     for build in ("3.3.0rc4", "3.3.0.dev1", "3.3.0+local"):
-        assert wrapper_manifest(template, build) == template.split("pip_dependencies:")[0]
+        expected = template.split("pip_dependencies:")[0].replace(
+            "version: 3.3.0", f"version: {manifest_version(build)}"
+        )
+        assert wrapper_manifest(template, build) == expected
 
 
 def test_remote_release_candidate_manifest_is_converted_once(tmp_path, monkeypatch):

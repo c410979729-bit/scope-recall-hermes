@@ -3,6 +3,8 @@ name: Hermes catalog install
 # A fresh Hermes on Linux and macOS installs Scope Recall the way the plugin catalog does, runs setup, and is checked
 # for recall in a new session and a correction against a loopback model. Runs when the Hermes install path changes,
 # and on demand.
+# During development the catalog manifest pins a released core, testing the installation offered by the default branch.
+# On a release PR it pins the new version, supplied by WHEELS.
 on:
   pull_request:
     paths:
