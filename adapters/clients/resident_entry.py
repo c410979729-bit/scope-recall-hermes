@@ -6,6 +6,11 @@ request's normal handler. An idle, disabled, replaced or stuck process releases 
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from ...core.process_environment import configure_numeric_threads
+
+    configure_numeric_threads()
+
 import argparse
 import json
 import os

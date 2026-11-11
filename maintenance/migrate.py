@@ -7,7 +7,11 @@ entry point so existing callers do not acquire a second migration engine.
 
 from __future__ import annotations
 
-from .migrate_v2 import (
+from scope_recall.core.process_environment import configure_numeric_threads
+
+configure_numeric_threads()
+
+from .migrate_v2 import (  # noqa: E402
     LEGACY_BASELINE,
     MigrationError,
     main,

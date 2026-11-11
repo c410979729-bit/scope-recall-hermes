@@ -2,7 +2,11 @@
 configurations hold (see this package):
 ``python -m scope_recall.adapters.codex.resident_entry``.  The code is ``adapters/clients/resident_entry.py``."""
 
-from ..clients.resident_entry import main
+from ...core.process_environment import configure_numeric_threads
+
+configure_numeric_threads()
+
+from ..clients.resident_entry import main  # noqa: E402
 
 if __name__ == "__main__":
     raise SystemExit(main())

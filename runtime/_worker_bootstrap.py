@@ -20,6 +20,10 @@ def main() -> int:
     ):
         return 125
     sys.stdin.close()
+    from scope_recall.core.process_environment import configure_numeric_threads
+
+    configure_numeric_threads()
+
     from scope_recall.runtime.scheduling import operator_paused
     from scope_recall.runtime.worker_entry import run_backup_worker, run_upgrade_worker, run_worker
 

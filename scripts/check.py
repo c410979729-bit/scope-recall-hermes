@@ -172,6 +172,7 @@ GIT_TESTS = ["tests/integration/test_guard_git.py"]
 SUITES = {
     "unit": [
         "tests/unit/test_file_access.py",
+        "tests/unit/test_numeric_threads.py",
         "tests/unit/test_host_memory_status.py",
         "tests/unit/test_host_memory_context.py",
         "tests/unit/test_setup_discovery.py",
@@ -403,6 +404,7 @@ SUITES = {
         "tests/migration/test_upgrade_policy.py",
     ],
     "packaging": [
+        "tests/storage_native/test_process_numeric_threads.py",
         "tests/packaging/test_hermes_catalog_setup.py",
         "tests/packaging/test_setup.py",
         "tests/packaging/test_setup_repairs.py",

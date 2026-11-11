@@ -40,6 +40,10 @@ ALLOWLIST_PATH = REPO_ROOT / "packaging" / "v11-module-allowlist.json"
 #: imports needs no edit at all.
 ENTRY_POINTS = (
     "__init__.py",
+    "adapters/clients/hook_entry.py",
+    "adapters/clients/mcp_entry.py",
+    "adapters/clients/remote_server.py",
+    "adapters/clients/resident_entry.py",
     "adapters/codex/hook_entry.py",
     "adapters/codex/mcp_entry.py",
     "adapters/codex/remote_client.py",
