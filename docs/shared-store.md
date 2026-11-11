@@ -276,6 +276,10 @@ and the shared worker's registration.
 
 ## Changing an entry's grants
 
+`owner_principals` declares that these identities belong to one and the same owner. It is not a list of different
+people who share administrative access. First-person facts under the listed identities are read together in
+`profile` and `entity`, within existing read scopes and publication checks.
+
 An entry keeps the grants it was attached with: its owner principals, the capture scope of each
 audience kind, and its exact audience rows. An `attach` run again from the entry's home keeps them
 too, a change made here included, with or without other entries attached, and needs none of the
@@ -356,14 +360,27 @@ autostart and start its gateway.
 Each entry, and each surface of a Hermes entry, names the owner by a principal of its own. The store's manifest
 approves those principals as one person's. Within the same authorized scope, a correction that can be recognized as
 the same fact can become its next version, preserving the earlier value as history. First-person subjects remain
-bound to each entry's original principal, so first-person facts across entries currently remain separate. Existing
-split facts are not automatically merged. The shared
+bound to each entry's original principal, and stored split facts are not automatically merged. The read-only
+`profile` and `entity` views read those principals together when the manifest approves them as the same owner,
+within the caller's existing scopes and publication checks. Each fact retains its subject, evidence and entry label.
+An accepted, source-verified alias to an approved owner principal uses the same read equivalence; a name alone does
+not establish it. Ambiguous names retain separate readable audience groups rather than joining their identities.
+Only the local stdio MCP entry for an attached Codex, Claude Code, WorkBuddy or dsh client explicitly enables the
+current-owner fallback. It uses the same installed-owner approval and human identity as that entry's captured user
+input, and rechecks the manifest approval. The program does not compare the process's OS account with an installer
+account. OS file permissions determine who can start the entry and read its configuration and store. Sharing an OS
+account or granting another account access to the entry directories also shares its approved owner identity.
+This does not bind a conversation, grant scopes or authorize mutations. Generic contexts, including hooks, handoffs,
+private-state checks and remote HTTP, have owner equivalences without this fallback. Hermes surfaces keep their
+existing speaker rules. See [profile and entity views](profile-entity.zh-CN.md)
+for the word list and response fields. The shared
 worker reads the approvals from the manifest each time it orders a new statement against a stored one. A principal
 no entry approves as the owner's is somebody else, and that person's differing statement stays a proposal beside the
 fact (`different_source_principal`).
 
-`local` attests the running account or the user of an approved surface, not a natural person. People sharing one
-system account, container, or remote desktop with that account are treated as the same owner.
+`local` identifies the approved local owner, not a verified natural person. Hermes's account-bound local transport
+retains its existing peer-account checks. Owner approvals are rechecked only through the last identity resolution;
+they are not an atomic snapshot with the database and do not cover later manifest changes.
 
 These corrections are stated in conversation and take effect through background consolidation. On a Hermes entry,
 the `revise` and `forget` tools remain available only at the CLI; Desktop, TUI, gateway routes and A2A peers cannot
