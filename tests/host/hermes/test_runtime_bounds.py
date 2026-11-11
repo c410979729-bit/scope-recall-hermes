@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextvars import copy_context
 from types import SimpleNamespace
 
 import pytest
@@ -434,7 +435,7 @@ def _in_thread(call):
         finally:
             done.set()
 
-    thread = threading.Thread(target=run, daemon=True)
+    thread = threading.Thread(target=copy_context().run, args=(run,), daemon=True)
     thread.start()
     return done, box, thread
 

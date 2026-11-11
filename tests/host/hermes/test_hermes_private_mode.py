@@ -67,11 +67,10 @@ def test_masked_retry_keeps_safe_context_count_and_gaps_through_disk_and_inbox(a
     with provider._lock:
         receipt = provider._writer.write(
             ctx,
-            pending.event,
+            pending,
             identity=key,
             gaps=(),
             scope_id=bound.local_scope_id,
-            replay=True,
         )
     assert receipt.durability == "queued" and receipt.masked_secret_count == 2
     with provider._core.storage.read(ctx) as tx:
@@ -104,9 +103,7 @@ def test_a_long_masked_retry_keeps_its_parts_marked_truncated(adapter):
     pending = provider._writer._snapshot(ctx, event, key, (), bound.local_scope_id, bound)
     provider._retry.captures[key] = pending
     with provider._lock:
-        receipt = provider._writer.write(
-            ctx, pending.event, identity=key, gaps=(), scope_id=bound.local_scope_id, replay=True
-        )
+        receipt = provider._writer.write(ctx, pending, identity=key, gaps=(), scope_id=bound.local_scope_id)
     assert receipt.durability == "persisted" and receipt.masked_secret_count == 2
     stored = [provider._core.source(ctx, write.ref, write.revision).event for write in receipt.event_refs]
     assert [part["segment"] for part in stored] == [part["segment"] for part in first.events]
@@ -222,7 +219,7 @@ def test_private_retry_and_disk_preservation_drop_original_events(adapter, monke
     clock.now = "2026-09-06T13:00:00Z"
     owner.private_off(target="session", session=ctx.session_id)
     with provider._lock:
-        provider._writer.write(ctx, event, identity=key, gaps=(), scope_id=identity.local_scope_id, replay=True)
+        provider._writer.write(ctx, pending, identity=key, gaps=(), scope_id=identity.local_scope_id)
     assert provider._retry.captures == {}
     disk = Mock(return_value=True)
     monkeypatch.setattr(kept_captures, "keep", disk)
@@ -253,7 +250,7 @@ def test_loaded_kept_capture_is_discarded_by_original_event_time(adapter, monkey
     with provider._lock:
         provider._retry.load_kept()
         assert key in provider._retry.captures
-        provider._writer.write(ctx, pending.event, identity=key, gaps=(), scope_id=pending.scope_id, replay=True)
+        provider._writer.write(ctx, pending, identity=key, gaps=(), scope_id=pending.scope_id)
     assert provider._retry.captures == {}
     assert list(kept_captures.folder(ctx.binding).glob("*.json")) == []
     assert _contents(provider, ctx) == []

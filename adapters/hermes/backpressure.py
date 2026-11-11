@@ -44,13 +44,7 @@ class HostBackpressure:
         """
         holder = self._adapter._holder
         if kind == "pre_llm_call":
-            self._adapter._skipped_turn_id = str((kwargs or {}).get("turn_id") or "").strip() or None
-            if self._adapter._skipped_turn_id:
-                self._adapter._turns.note_opener(
-                    self._adapter._skipped_turn_id,
-                    (kwargs or {}).get("conversation_history"),
-                    (kwargs or {}).get("user_message"),
-                )
+            self._adapter._turns.note_skipped(kwargs or {})
         self.count(kind)
         _log.warning(
             "scope-recall: %s not taken: this session has been busy in %s for %.1f s",

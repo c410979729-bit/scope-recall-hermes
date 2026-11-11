@@ -63,7 +63,9 @@ class Prefetch:
                 )
                 record_unbound_attempt(self._adapter._require_core(), context, query)
                 return ""
-            if self._adapter._current_source_refs_overflow:
+            with self._adapter._said_lock:
+                overflow = self._adapter._current_source_refs_overflow
+            if overflow:
                 # The overflow already reported its gap; an unfenced recall could
                 # inject this turn's own sources back as memory.
                 record_refusal(
@@ -88,11 +90,12 @@ class Prefetch:
                     compaction_seq=generation,
                     compaction_epoch=self._adapter._brief_epoch,
                 )
-            current_refs = tuple(self._adapter._current_source_refs)
+            with self._adapter._said_lock:
+                current_refs = tuple(self._adapter._current_source_refs)
+                turn = self._adapter._active_turn_id
+                removed = self._adapter._private_span_receipts.get((context.session_id, turn), 0)
             request = self._request(query, effective_session)
             core = self._adapter._require_core()
-            turn = self._adapter._active_turn_id
-            removed = self._adapter._private_span_receipts.get((context.session_id, turn), 0)
         finally:
             self._adapter._lock.release()
         started = core.clock.monotonic()
@@ -176,7 +179,7 @@ class Prefetch:
                 context, request, current_source_refs=current_refs, zone=display_zone(), **host_context
             )
             preparation = core.prepare_recall_render(context, packet)
-        with self._adapter._lock:
+        with self._adapter._lock, self._adapter._said_lock:
             if self._adapter._active_turn_id == turn:
                 # A turn begun meanwhile, after Hermes gave up on this call, keeps its own state.
                 self._adapter._diagnostics.last_prefetch_request_id = packet["request_id"]
@@ -184,7 +187,6 @@ class Prefetch:
                 self._adapter._diagnostics.last_prefetch_skip_reason = next(
                     (gap.split(":", 1)[1] for gap in packet["gaps"] if gap.startswith("auto_recall_skipped:")), None
                 )
-                self._adapter._pre_llm_pending = False
         rendered = render_host_recall_context(
             preparation.canonical_text,
             context=preparation.context,
@@ -232,8 +234,9 @@ class Prefetch:
     def _confirm(self, core, context, session, turn, briefing, text, started, *, request_id=None):
         """Mark the delivered response after rendering, retaining a pending compaction on failure."""
         with self._adapter._lock:
-            if self._adapter._active_turn_id != turn:
-                return ""
+            with self._adapter._said_lock:
+                if self._adapter._active_turn_id != turn:
+                    return ""
             try:
                 briefing = core.prepare_session_injection(
                     context, text, brief=briefing, request_id=request_id, remaining_seconds=0.2
@@ -276,7 +279,8 @@ class Prefetch:
 
     def _request(self, query: str, session_id: str) -> RecallRequest:
         self._adapter._require_identity()
-        request_id = f"hermes-prefetch:{session_id}:{self._adapter._turn_counter}"
+        with self._adapter._said_lock:
+            request_id = f"hermes-prefetch:{session_id}:{self._adapter._turn_counter}"
         payload: RecallRequest = {
             "protocol_version": "1.1",
             "request_id": request_id[:100],

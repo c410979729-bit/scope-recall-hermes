@@ -228,12 +228,11 @@ class CaptureRetry:
                 try:
                     self._adapter._writer.write(
                         context,
-                        pending.event,
+                        pending,
                         identity=key,
                         gaps=pending.gaps,
                         scope_id=pending.scope_id,
                         remaining_seconds=remaining,
-                        replay=True,
                         bound=identity,
                         release=release,
                     )

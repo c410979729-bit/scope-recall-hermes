@@ -45,6 +45,7 @@ HOSTS = {
             {
                 "on_turn_start",
                 "pre_llm_call",
+                "pre_api_request",
                 "post_tool_call",
                 "api_request_error",
                 "post_llm_call",
@@ -57,6 +58,7 @@ HOSTS = {
         ),
         hook_observers=(
             ("pre_llm_call", "observe_pre_llm"),
+            ("pre_api_request", "observe_pre_api_request"),
             ("api_request_error", "observe_api_request_error"),
             ("post_tool_call", "observe_post_tool_call"),
             ("post_llm_call", "observe_post_llm_call"),

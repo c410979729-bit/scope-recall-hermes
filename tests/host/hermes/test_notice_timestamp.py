@@ -75,7 +75,7 @@ class NoticeTimestampTests(unittest.TestCase):
                     "conversation_history": [notice_row()],
                 },
             )
-        self.assertEqual(adapter._skipped_turn_id, "TEST-busy")
+        self.assertEqual(adapter._turns._opening.turn_id, "TEST-busy")
         self.assertTrue(capture.opened_by_host("TEST-busy", NOTICE))
 
 
