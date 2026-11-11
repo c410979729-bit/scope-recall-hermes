@@ -9,6 +9,7 @@ import re
 from ..contracts import ContractError
 from .claims import canonical_time
 from .source_qualification import AUTHORITY_QUESTION, CONDITIONAL, preserves_qualifiers
+from .source_records import source_origin as source_origin
 
 TOPIC_BREAK = re.compile(r"换个话题|另一个话题|转去|转到|接下来讨论|switch (?:topic|to)|new topic", re.I)
 #: A condition or supposition (``CONDITIONAL``), uncertainty or someone else's words: a source that says what would
@@ -71,16 +72,6 @@ def source_watermark(refs) -> str:
         "watermark-"
         + hashlib.sha256(json.dumps(list(refs), ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
     )
-
-
-def source_origin(source) -> str:
-    if source.event["origin"] == "imported":
-        return (
-            source.event.get("source_original_origin", "origin_unknown")
-            if source.import_provenance_sha256
-            else "origin_unknown"
-        )
-    return source.event["origin"]
 
 
 def _said_state(raw: str) -> str | None:

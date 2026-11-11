@@ -171,6 +171,7 @@ SCRIPT_GATE_TESTS = [
 GIT_TESTS = ["tests/integration/test_guard_git.py"]
 SUITES = {
     "unit": [
+        "tests/unit/test_codex_cli_identity.py",
         "tests/unit/test_file_access.py",
         "tests/unit/test_host_memory_status.py",
         "tests/unit/test_host_memory_context.py",
@@ -278,6 +279,9 @@ SUITES = {
         "tests/contract/test_injection_revision.py",
         "tests/contract/test_injection_screening.py",
         "tests/contract/test_injection_merged.py",
+        "tests/contract/test_owner_quote_policy.py",
+        "tests/contract/test_source_review_batch.py",
+        "tests/contract/test_source_review_repairs.py",
     ],
     "claims": [
         "tests/test_denial_values.py",
@@ -1203,6 +1207,10 @@ def pytest_command(selected: list[str], junit: Path) -> list[str]:
         "-p",
         "no:cacheprovider",
         "--durations=10",
+        # Healthy Windows tests take up to about 122 seconds. Five minutes
+        # leaves headroom while dumping every thread well before the integration watchdog.
+        "-o",
+        "faulthandler_timeout=300",
         # Keep generated fixture paths short while retaining the same owned boundary.
         f"--basetemp={junit.parent / 't'}",
         f"--junitxml={junit}",
@@ -1270,7 +1278,10 @@ def _execute(args, selected: list[str], selection: dict) -> int:
             )
         except subprocess.TimeoutExpired as exc:
             result = subprocess.CompletedProcess(
-                command, 124, _as_text(exc.stdout), f"TEST_TIMEOUT after {watchdog_seconds} seconds\n"
+                command,
+                124,
+                _as_text(exc.stdout),
+                _as_text(exc.stderr) + f"\nTEST_TIMEOUT after {watchdog_seconds} seconds\n",
             )
         elapsed = time.perf_counter() - start
         output_parts.extend((_as_text(result.stdout), _as_text(result.stderr)))

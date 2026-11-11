@@ -58,6 +58,8 @@ class DoctorReport:
     worker_status: dict[str, Any] = field(default_factory=dict)
     injection_quarantined: int = 0
     injection_pending_review: int = 0
+    #: Pending versions by rule and verified origin, their oldest scan and arrivals in the last day.
+    injection_review: dict[str, Any] = field(default_factory=dict)
     injection_scan_deadlines: int = 0
     sources: int | None = None
     #: Bytes of memory.sqlite3 with its journal, and of everything under vectors/.

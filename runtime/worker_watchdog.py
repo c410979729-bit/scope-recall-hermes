@@ -227,7 +227,7 @@ def _spawn_worker(
     return subprocess.Popen(
         command,
         cwd=str(Path(__file__).resolve().parents[1]),
-        env=os.environ.copy(),
+        # launch_worker selects this watchdog's environment once; every pass inherits that same boundary.
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

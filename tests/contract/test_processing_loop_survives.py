@@ -269,7 +269,10 @@ def test_only_configured_cooled_work_types_get_streaks(tmp_path, monkeypatch, en
     _, control, _ = _supervise(
         tmp_path, [0], monkeypatch=monkeypatch, enabled=enabled, payloads=[{"unavailable_work_types": kinds}]
     )
-    assert set(control.last["unavailable_streaks"]) == (set(kinds[:3]) if enabled else set())
+    # Local projection work is always capable and shares the routed cooldown;
+    # disabling external ports excludes only their three work types.
+    expected = {"rebuild_projection"} | (set(kinds[:3]) if enabled else set())
+    assert set(control.last["unavailable_streaks"]) == expected
 
 
 def test_unavailable_record_is_pure_bounded_and_type_specific():

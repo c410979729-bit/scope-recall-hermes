@@ -6,7 +6,7 @@ A line or two per release.  Each release's full notes are on its GitHub release 
 
 Between releases, `distribution/hermes/plugin.yaml` on the default branch keeps naming the newest release, so `hermes plugins install 410979729/scope-recall-hermes#distribution/hermes` goes on installing a core that is on PyPI.
 
-Fixes: a scope memory instruction reaches every consolidation request and an evidence quote without letters or digits is refused (#360); entity and adoption requests name JSON (#359); auxiliary budgets settle proven refusals at zero and kept reservations can be inspected and released (#366); failed summary pages record why (#363); an excluded Hermes recording-control message gives back its capture slot (#364).
+Fixes: a scope memory instruction reaches every consolidation request and an evidence quote without letters or digits is refused (#360); entity and adoption requests name JSON (#359); auxiliary budgets settle proven refusals at zero and kept reservations can be inspected and released (#366); failed summary pages record why (#363); an excluded Hermes recording-control message gives back its capture slot (#364); held sources can be reviewed in a batch, with an optional exception for the owner's own quotes (#361); the Codex CLI check recognizes a verified build by its image identity and gives its state start-up 15 s (#365); the Hermes worker child starts with a selected environment instead of the host's whole one.
 
 ## [4.0.3] - 2026-11-07
 

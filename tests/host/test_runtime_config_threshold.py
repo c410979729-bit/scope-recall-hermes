@@ -13,6 +13,79 @@ from scope_recall.runtime.vector_port import VectorIndexWriter, VectorRecord
 from v11_support import source_event
 
 
+def _worker_config_mapping(tmp_path, **extra):
+    return {
+        "binding": {
+            "agent_id": "TEST-worker",
+            "installation_id": "TEST-install",
+            "data_directory": str(tmp_path),
+            "scope_ids": ["TEST-scope"],
+            "test_mode": True,
+        },
+        "session_id": "TEST-session",
+        "allowed_scope_ids": ["TEST-scope"],
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    "names",
+    [[], ["TEST_LOCATION"], [f"TEST_LOCATION_{index}" for index in range(32)], ["TEST_LOCATION"] * 32, ["T" * 128]],
+)
+def test_worker_environment_names_round_trip(tmp_path, names):
+    from scope_recall.runtime.instance_config import configuration_value
+
+    config = RuntimeInstanceConfig.from_mapping(_worker_config_mapping(tmp_path, worker_environment_names=names))
+    assert config.worker_environment_names == tuple(names)
+    assert configuration_value(config)["worker_environment_names"] == names
+
+
+def test_worker_environment_names_default_is_empty(tmp_path):
+    config = RuntimeInstanceConfig.from_mapping(_worker_config_mapping(tmp_path))
+    assert config.worker_environment_names == ()
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        None,
+        "TEST_LOCATION",
+        {},
+        ["TEST*"],
+        ["1TEST"],
+        ["TEST=VALUE"],
+        [1],
+        [""],
+        [f"TEST_{index}" for index in range(33)],
+        ["TEST_LOCATION"] * 33,
+        ["T" * 129],
+        ["Ld_AuDiT"],
+        ["PyThOn_PrEsItE"],
+    ],
+)
+def test_worker_environment_names_reject_invalid_configuration(tmp_path, names):
+    with pytest.raises(ValueError, match="worker_environment_names|credential_env"):
+        RuntimeInstanceConfig.from_mapping(_worker_config_mapping(tmp_path, worker_environment_names=names))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONBREAKPOINT",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "LD_AUDIT",
+        "PYTHON_PRESITE",
+    ],
+)
+def test_worker_environment_names_reject_code_loading_overrides(tmp_path, name):
+    with pytest.raises(ValueError, match="worker_environment_names_forbidden"):
+        RuntimeInstanceConfig.from_mapping(_worker_config_mapping(tmp_path, worker_environment_names=[name]))
+
+
 def test_runtime_mapping_wires_frozen_vector_threshold(tmp_path):
     binding = InstanceBinding(
         "TEST-threshold-agent",

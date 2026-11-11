@@ -333,6 +333,342 @@ def _runtime_payload(tmp_path: Path, *, drain_seconds: float) -> tuple[Path, Pat
     return path, config.config_path
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_launch_worker_limits_environment_through_watchdog_and_child(tmp_path, monkeypatch, override):
+    """Probe real interpreters at both spawn boundaries without opening a model route."""
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["auxiliary"]["embedding"] = {"credential_env": "TEST_DECLARED_KEY"}
+    payload["auxiliary"]["consolidation"] = {
+        "model": "deepseek-v4-flash",
+        "endpoint": "https://example.test/v1/chat/completions",
+        "credential_env": "TEST_MISSING_KEY",
+        "output_limit_field": "max_tokens",
+        "max_output_tokens": 512,
+    }
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.delenv("TEST_MISSING_KEY", raising=False)
+    values = {
+        "TEST_UNRELATED_KEY": "synthetic-unrelated",
+        "TEST_DECLARED_KEY": "synthetic-parent-route",
+        "HTTP_PROXY": "http://proxy.example.test:8080",
+        "HTTPS_PROXY": "http://proxy.example.test:8080",
+        "ALL_PROXY": "http://proxy.example.test:8080",
+        "NO_PROXY": "localhost,example.test",
+        "SSL_CERT_FILE": str(tmp_path / "TEST-ca.pem"),
+        "SSL_CERT_DIR": str(tmp_path / "TEST-certificates"),
+        "REQUESTS_CA_BUNDLE": str(tmp_path / "TEST-requests.pem"),
+        "CURL_CA_BUNDLE": str(tmp_path / "TEST-curl.pem"),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "NUMPY_MADVISE_HUGEPAGE": "0",
+        "OPENBLAS_MAIN_FREE": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "CODEX_HOME": str(tmp_path / "TEST-cli-home"),
+        "SCOPE_RECALL_TEST_ENV_MARKER": "synthetic-plugin-setting",
+    }
+    if os.name != "nt":
+        values.update({name.lower(): value for name, value in values.items() if name.endswith("_PROXY")})
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    required = ("SYSTEMROOT", "WINDIR", "COMSPEC", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP")
+    if os.name != "nt":
+        required = ("HOME", "TMPDIR", "LANG", "LC_ALL", "TZ")
+        for name in required:
+            if name not in os.environ:
+                monkeypatch.setenv(
+                    name, {"TMPDIR": str(tmp_path), "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}.get(name, str(tmp_path))
+                )
+    expected = {name: os.environ[name] for name in (*values, *required, "PATH")}
+    del expected["TEST_UNRELATED_KEY"]
+    inherited = os.environ.get("PYTHONPATH")
+    expected["PYTHONPATH"] = str(Path(worker_launch.__file__).resolve().parents[1]) + (
+        os.pathsep + inherited if inherited else ""
+    )
+    environment = None
+    if override:
+        environment = {
+            "TEST_DECLARED_KEY": "synthetic-profile-route",
+            "TEST_UNRELATED_OVERRIDE": "synthetic",
+            "PYTHONPATH": (inherited + os.pathsep if inherited else "") + str(tmp_path),
+        }
+        expected["TEST_DECLARED_KEY"] = environment["TEST_DECLARED_KEY"]
+        expected["PYTHONPATH"] = (
+            str(Path(worker_launch.__file__).resolve().parents[1]) + os.pathsep + environment["PYTHONPATH"]
+        )
+    names = [*expected, "TEST_UNRELATED_KEY", "TEST_UNRELATED_OVERRIDE", "TEST_MISSING_KEY"]
+    probe = (
+        "import json,os,sys; print(json.dumps({n:os.environ[n] for n in json.loads(sys.argv[1]) if n in os.environ}))"
+    )
+    wrapper = tmp_path / "TEST-worker-environment.py"
+    wrapper.write_text(
+        "import json,os,subprocess,sys,time\nfrom pathlib import Path\n"
+        "from scope_recall.runtime import worker_watchdog\n"
+        f"names = {names!r}\nprobe = {probe!r}\n"
+        "owner = {n:os.environ[n] for n in names if n in os.environ}\n"
+        "real_popen = subprocess.Popen\n"
+        "def spawn(command, **kwargs):\n"
+        "    return real_popen([command[0], '-c', probe, json.dumps(names)], **kwargs)\n"
+        "worker_watchdog.subprocess.Popen = spawn\n"
+        "child = worker_watchdog._spawn_worker(Path(sys.argv[1]), Path(sys.executable), time.monotonic()+30)\n"
+        "out, err = child.communicate(timeout=15)\n"
+        "assert child.returncode == 0, err\n"
+        "print(json.dumps({'watchdog': owner, 'worker': json.loads(out)}))\n",
+        encoding="utf-8",
+    )
+    real_popen = subprocess.Popen
+
+    def spawn(command, **kwargs):
+        return real_popen([command[0], str(wrapper), str(config)], **kwargs)
+
+    monkeypatch.setattr(worker_launch.subprocess, "Popen", spawn)
+    child = launch_worker(config, environment=environment)
+    out, err = child.communicate(timeout=30)
+    assert child.process.returncode == 0, err
+    observed = json.loads(out)
+    assert observed["watchdog"] == expected
+    assert observed["worker"] == expected
+    assert os.environ["TEST_DECLARED_KEY"] == "synthetic-parent-route"
+
+
+@pytest.mark.parametrize(
+    "locations",
+    [
+        {
+            name: "TEST-windows-location"
+            for name in (
+                "SYSTEMROOT",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "TEMP",
+                "TMP",
+            )
+        },
+        {name: "TEST-posix-location" for name in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ")},
+    ],
+)
+def test_worker_environment_preserves_platform_locations(tmp_path, locations):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    selected = worker_launch._worker_environment(config, locations)
+    assert {name: selected[name] for name in locations} == locations
+
+
+def _environment_probe(config, monkeypatch, environment=None):
+    """Read interpreter flags and environment from a real launcher's child."""
+    real_popen = subprocess.Popen
+    selected = {}
+    probe = (
+        "import json,os,sys; print(json.dumps({'environment':dict(os.environ),"
+        "'no_user_site':sys.flags.no_user_site,'safe_path':sys.flags.safe_path,"
+        "'write_bytecode':sys.dont_write_bytecode,'warnings':sys.warnoptions,"
+        "'https_proxy_lower':os.environ.get('https_proxy')}))"
+    )
+
+    def spawn(command, **kwargs):
+        selected.update(kwargs["env"])
+        return real_popen([command[0], "-c", probe], **kwargs)
+
+    monkeypatch.setattr(worker_launch.subprocess, "Popen", spawn)
+    child = launch_worker(config, environment=environment)
+    out, err = child.communicate(timeout=30)
+    assert child.process.returncode == 0, err
+    return selected, json.loads(out)
+
+
+@pytest.mark.parametrize("value", ["", "TEST-timezone-directory"])
+def test_worker_preserves_python_timezone_path(tmp_path, monkeypatch, value):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    monkeypatch.setenv("PYTHONTZPATH", value)
+    _selected, observed = _environment_probe(config, monkeypatch)
+    assert observed["environment"].get("PYTHONTZPATH") == value
+
+
+def test_worker_preserves_disabled_user_site(tmp_path, monkeypatch):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
+    _selected, observed = _environment_probe(config, monkeypatch)
+    assert observed["no_user_site"] == 1
+    assert observed["environment"].get("PYTHONNOUSERSITE") == "1"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows environment names are case-insensitive")
+@pytest.mark.parametrize("name", ["HTTPS_PROXY", "https_proxy"])
+def test_windows_worker_proxy_override_is_unique_and_reaches_child(tmp_path, monkeypatch, name):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    monkeypatch.setenv("HTTPS_PROXY", "http://parent.example.test:8080")
+    value = "http://override.example.test:9090"
+    selected, observed = _environment_probe(config, monkeypatch, {name: value})
+    assert observed["environment"]["HTTPS_PROXY"] == value
+    assert [key for key in selected if key.upper() == "HTTPS_PROXY"] == ["HTTPS_PROXY"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows environment names are case-insensitive")
+@pytest.mark.parametrize("names", [("HTTPS_PROXY", "https_proxy"), ("https_proxy", "HTTPS_PROXY")])
+def test_windows_worker_explicit_alias_order_and_lowercase_lookup(tmp_path, monkeypatch, names):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    monkeypatch.setenv("HTTPS_PROXY", "http://parent.example.test:8080")
+    environment = {names[0]: "http://first.example.test:8081", names[1]: "http://last.example.test:8082"}
+    selected, observed = _environment_probe(config, monkeypatch, environment)
+    assert [key for key in selected if key.upper() == "HTTPS_PROXY"] == ["HTTPS_PROXY"]
+    assert observed["environment"]["HTTPS_PROXY"] == environment[names[1]]
+    assert observed["https_proxy_lower"] == environment[names[1]]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONBREAKPOINT",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "LD_AUDIT",
+        "PYTHON_PRESITE",
+    ],
+)
+def test_declared_credentials_cannot_reintroduce_code_loading_overrides(tmp_path, monkeypatch, name):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["auxiliary"]["embedding"] = {"credential_env": name}
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv(name, "TEST-parent-code-reference")
+    selected = worker_launch._worker_environment(config, {name: "TEST-explicit-code-reference"})
+    assert name not in selected
+
+
+def test_posix_worker_keeps_environment_name_case_distinct(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    monkeypatch.setattr(
+        worker_launch, "os", SimpleNamespace(name="posix", environ={"HTTPS_PROXY": "upper", "https_proxy": "lower"})
+    )
+    selected = worker_launch._worker_environment(config, {"HTTPS_PROXY": "override"})
+    assert selected["HTTPS_PROXY"] == "override"
+    assert selected["https_proxy"] == "lower"
+
+
+def test_worker_preserves_python_behavior_and_deployment_locations(tmp_path, monkeypatch):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    values = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONWARNINGS": "ignore::UserWarning",
+        "PYTHONSAFEPATH": "1",
+        "LD_LIBRARY_PATH": str(tmp_path),
+        "DYLD_LIBRARY_PATH": str(tmp_path),
+        "DYLD_FALLBACK_LIBRARY_PATH": str(tmp_path),
+        "SQLITE_TMPDIR": str(tmp_path),
+        "OPENSSL_CONF": str(tmp_path / "TEST-openssl.cnf"),
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    for name in (
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONBREAKPOINT",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+    ):
+        monkeypatch.setenv(name, "TEST-excluded")
+    selected, observed = _environment_probe(config, monkeypatch)
+    assert {name: observed["environment"].get(name) for name in values} == values
+    assert observed["write_bytecode"] and observed["safe_path"]
+    assert "ignore::UserWarning" in observed["warnings"]
+    assert (
+        not {"PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"}
+        & selected.keys()
+    )
+
+
+def test_worker_extra_environment_names_are_selected_with_overrides(tmp_path, monkeypatch):
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["worker_environment_names"] = ["TEST_DEPLOYMENT_LOCATION", "TEST_ABSENT_LOCATION"]
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("TEST_DEPLOYMENT_LOCATION", "parent-location")
+    monkeypatch.delenv("TEST_ABSENT_LOCATION", raising=False)
+    selected, observed = _environment_probe(config, monkeypatch, {"TEST_DEPLOYMENT_LOCATION": "override-location"})
+    assert observed["environment"]["TEST_DEPLOYMENT_LOCATION"] == "override-location"
+    assert "TEST_ABSENT_LOCATION" not in selected
+
+
+def test_filtered_environment_runs_real_bootstrap_with_monthly_timezone_and_native_dependencies(tmp_path, monkeypatch):
+    """Use a synthetic TZif file absent from system data, then execute the unmodified worker bootstrap."""
+    import struct
+    import zoneinfo
+
+    config, _ = _runtime_payload(tmp_path, drain_seconds=30)
+    zone_root = tmp_path / "TEST-zoneinfo"
+    zone_file = zone_root / "TEST" / "Worker"
+    zone_file.parent.mkdir(parents=True)
+    zone_file.write_bytes(
+        b"TZif\x00"
+        + b"\x00" * 15
+        + struct.pack(">6l", 0, 0, 0, 0, 1, 4)
+        + struct.pack(">lbb", -18000, 0, 0)
+        + b"TST\x00"
+    )
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["auxiliary"]["budget"] = {
+        "period": "monthly",
+        "time_zone": "TEST/Worker",
+        "approved_models": [],
+        "pricing": {},
+    }
+    payload["supervisor_enabled"] = False
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("PYTHONTZPATH", str(zone_root))
+    original_tzpath = zoneinfo.TZPATH
+    try:
+        zoneinfo.reset_tzpath()
+        zoneinfo.ZoneInfo.clear_cache()
+        environment = worker_launch._worker_environment(config, None)
+    finally:
+        zoneinfo.reset_tzpath(original_tzpath)
+        zoneinfo.ZoneInfo.clear_cache()
+    environment["PYTHONPATH"] = (
+        str(Path(worker_launch.__file__).resolve().parents[1]) + os.pathsep + environment.get("PYTHONPATH", "")
+    )
+    bootstrap = Path(worker_watchdog.__file__).with_name("_worker_bootstrap.py")
+    probe = (
+        "import json,runpy,sqlite3,sys,zoneinfo; import numpy as np; from datetime import datetime; "
+        "from scope_recall.runtime.worker_entry import load_config; "
+        "cfg=load_config(sys.argv[2]); zone=zoneinfo.ZoneInfo(cfg.auxiliary.budget.time_zone); "
+        "connection=sqlite3.connect(':memory:'); "
+        "print(json.dumps({'offset':datetime(2026,1,1,tzinfo=zone).utcoffset().total_seconds(),"
+        "'tzpath':list(zoneinfo.TZPATH),'numpy':int(np.array([1,2,3]).sum()),"
+        "'sqlite':connection.execute('select 42').fetchone()[0]}),flush=True); connection.close(); "
+        "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-B", "-c", probe, str(bootstrap), str(config)],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=worker_launch.detached_creationflags(),
+    )
+    try:
+        out, err = child.communicate(input=b"\x01", timeout=30)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+    assert child.returncode == 0, err.decode("utf-8", errors="replace")
+    native, receipt = [json.loads(line) for line in out.splitlines()]
+    assert native == {"offset": -18000, "tzpath": [str(zone_root)], "numpy": 6, "sqlite": 42}
+    assert receipt["status"] == "idle" and receipt["processed"] == 0
+
+
 def test_schema_child_observes_pause_after_delayed_wake(tmp_path, monkeypatch, capsys):
     import hashlib
     import sqlite3

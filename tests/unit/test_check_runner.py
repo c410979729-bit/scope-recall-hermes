@@ -29,6 +29,15 @@ def test_pytest_temp_path_stays_short_inside_owned_run(tmp_path: Path) -> None:
     assert f"--basetemp={tmp_path / 't'}" in command
 
 
+def test_pytest_command_dumps_slow_test_threads_without_exiting(tmp_path: Path) -> None:
+    """Slow-test diagnostics keep the guard and leave failure policy to the watchdog."""
+    command = check.pytest_command(["tests/unit/pass_test.py"], tmp_path / "junit.xml")
+
+    assert command[command.index("-o") + 1] == "faulthandler_timeout=300"
+    assert command[command.index("-p") + 1] == "v11_guard"
+    assert not any("faulthandler_exit_on_timeout" in argument for argument in command)
+
+
 def test_history_probes_trust_only_the_checkout_in_their_process(tmp_path: Path) -> None:
     environment = check._test_environment("unit", tmp_path)
 
@@ -61,7 +70,7 @@ class ControlledDirectory:
         shutil.rmtree(self.name)
 
 
-def _run_check(monkeypatch, tmp_path: Path, *, fail_cleanup: bool) -> tuple[int, dict, str]:
+def _run_check(monkeypatch, tmp_path: Path, *, fail_cleanup: bool, timed_out=False) -> tuple[int, dict, str]:
     (tmp_path / "tests" / "unit").mkdir(parents=True)
     (tmp_path / "tests" / "unit" / "pass_test.py").write_text("def test_pass():\n    assert True\n", encoding="utf-8")
     (tmp_path / "tests" / "v11_guard.py").write_text("", encoding="utf-8")
@@ -74,6 +83,10 @@ def _run_check(monkeypatch, tmp_path: Path, *, fail_cleanup: bool) -> tuple[int,
         if "hash-object" in command:
             blob = "0" * 40
             return check.subprocess.CompletedProcess(command, 0, (blob + "\n").encode("ascii"), b"")
+        if timed_out:
+            raise check.subprocess.TimeoutExpired(
+                command, 180, output=b"pytest progress\n", stderr=b"Timeout (0:05:00)!\nThread TEST-stack\n"
+            )
         _write_fixed_junit(command)
         return check.subprocess.CompletedProcess(command, 0, "fixed pytest output\n", "")
 
@@ -106,6 +119,17 @@ def _run_check(monkeypatch, tmp_path: Path, *, fail_cleanup: bool) -> tuple[int,
     receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
     log = (tmp_path / receipt["log"]).read_text(encoding="utf-8")
     return exit_code, receipt, log
+
+
+def test_watchdog_preserves_thread_dump_and_progress(monkeypatch, tmp_path: Path) -> None:
+    """TimeoutExpired can carry bytes even when the child uses text output."""
+    exit_code, receipt, log = _run_check(monkeypatch, tmp_path, fail_cleanup=False, timed_out=True)
+
+    assert exit_code == receipt["pytest_exit_code"] == 124
+    assert receipt["cleanup"]["state"] == "succeeded"
+    assert "pytest progress" in log
+    assert "Timeout (0:05:00)!\nThread TEST-stack" in log
+    assert f"TEST_TIMEOUT after {receipt['watchdog_seconds']} seconds" in log
 
 
 def test_cleanup_failure_is_recorded_and_nonzero(monkeypatch, tmp_path: Path) -> None:
