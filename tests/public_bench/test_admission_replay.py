@@ -22,7 +22,7 @@ from replay import (
     summarize,
 )
 from run import run_case
-from scope_recall.core.recall_policy import EMBEDDING_SPACE, RecallPolicy
+from scope_recall.core.recall_policy import BUILTIN_VECTOR_THRESHOLD, EMBEDDING_SPACE, RecallPolicy
 
 
 def test_benchmark_result_records_the_effective_vector_threshold(tmp_path, monkeypatch):
@@ -39,7 +39,8 @@ def test_benchmark_result_records_the_effective_vector_threshold(tmp_path, monke
 def test_builtin_benchmark_route_uses_product_default_and_explicit_override():
     route = {key: EMBEDDING_SPACE[key] for key in ("model", "dimensions", "endpoint")}
     route.update(dialect="gemini", credential_env="TEST_UNUSED_KEY")
-    assert benchmark_policy({"embedding": route}).vector_threshold == RecallPolicy().vector_threshold == 0.70
+    default = RecallPolicy().vector_threshold
+    assert benchmark_policy({"embedding": route}).vector_threshold == default == BUILTIN_VECTOR_THRESHOLD
     assert benchmark_policy({"embedding": route, "vector_threshold": 0.75}).vector_threshold == 0.75
     assert benchmark_policy({"embedding": {**route, "model": "TEST-other-model"}}).vector_threshold is None
 

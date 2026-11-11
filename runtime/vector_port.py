@@ -597,6 +597,8 @@ class VectorPurgePort:
 class VectorPort:
     """Read-only Vector candidate source for :class:`RetrievalPipeline`."""
 
+    reports_searched_scopes = True
+
     def __init__(
         self,
         store: Any,
@@ -621,6 +623,7 @@ class VectorPort:
         limit: int,
         remaining_seconds: float,
         _prepared_query: tuple[str, Sequence[float]] | None = None,
+        searched_scopes: set[str] | None = None,
     ) -> tuple[CandidateRef, ...]:
         """Search each trusted physical partition and return only validated metadata.
 
@@ -628,6 +631,9 @@ class VectorPort:
         derived from trusted identity, never a model-controlled predicate.
         Post-filtering stays mandatory because a faulty or test store may
         ignore that predicate.
+
+        ``searched_scopes`` receives only logical scopes whose physical partitions
+        all completed. A partial scan can return hits without excluding unchecked sources.
         """
         if not isinstance(context, SearchContext):
             raise TypeError("context must be SearchContext")
@@ -642,7 +648,13 @@ class VectorPort:
         # Store waits and scans share the caller's clock and cannot extend a parent request.
         with using_request_deadline(bound):
             query_vector = self._query_vector(context, deadline, _prepared_query)
-            hits = self._partition_hits(context, query_vector, limit, deadline) if query_vector else []
+            hits = (
+                self._partition_hits(
+                    context, query_vector, limit, deadline, searched_scopes if searched_scopes is not None else set()
+                )
+                if query_vector
+                else []
+            )
         return _ranked(hits, limit)
 
     def _embed_query(self, query: str, remaining_seconds: float) -> Sequence[float]:
@@ -685,6 +697,7 @@ class VectorPort:
         query_vector: list[float],
         limit: int,
         deadline: float,
+        searched_scopes: set[str],
     ) -> list[CandidateRef]:
         """Query every trusted (scope, project, branch) partition, in one request where the store allows.
 
@@ -709,25 +722,29 @@ class VectorPort:
                     candidate = self._candidate_from_row(row, trusted, partition, logical[partition])
                     if candidate is not None:
                         hits.append(candidate)
+            searched_scopes.update(logical.values())
             return hits
         # The slowest completed partition is the reserve the next one needs:
         # request-local, so concurrent requests are not coupled and no fixed
         # timeout is invented.
         reserve = 0.0
-        searched = False
+        completed: set[str] = set()
         for partition, logical_scope_id in logical.items():
             if deadline - request_clock(self._clock)() <= reserve:
-                if not searched:
+                if not completed:
                     raise TimeoutError("vector store request deadline exhausted before the search")
-                return hits
-            searched = True
+                break
             started = request_clock(self._clock)()
             rows = self._search_rows(self._store.search, query_vector, scope_id=partition, limit=limit)
+            completed.add(partition)
             reserve = max(reserve, request_clock(self._clock)() - started)
             for row in rows or ():
                 candidate = self._candidate_from_row(row, trusted, partition, logical_scope_id)
                 if candidate is not None:
                     hits.append(candidate)
+        # One scope may span project/branch and global partitions. A completed
+        # subset cannot rule out sources in the remainder of that same scope.
+        searched_scopes.update(set(logical.values()).difference(logical[p] for p in logical.keys() - completed))
         return hits
 
     def _search_rows(self, search, vector, **kwargs):

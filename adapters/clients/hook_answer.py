@@ -70,7 +70,7 @@ class HookDiagnostics:
     #: that to the model and nowhere else: without this a client could recall without its vector search for as long
     #: as anyone could tell, and no log would show it.
     recall_vector_gap: str | None = None
-    #: Whether the recall ran its vector search: what a hook asks of its server's answer (``_resident_answer``).
+    #: Whether the recall completed its vector search: what a hook asks of its server's answer (``_resident_answer``).
     recall_vectors: bool | None = None
     #: Fixed execution flags, phase codes and elapsed milliseconds for the chosen recall.
     recall_trace: dict | None = None
@@ -144,11 +144,13 @@ def error_detail(code: object) -> str | None:
 
 
 #: Gaps by which a recall packet says its vector search did not run or did not finish, in the order one is named:
-#: the search failed, was unavailable, or had no time, or the whole search failed before it.  A search that ran and
+#: the search failed, was unavailable, finished only partly, or had no time, or the whole search failed before it.
+#: A search that ran and
 #: had candidates refused (``vector_rejected:*``, ``vector_old_or_mismatched_space``) is not among them.
 _WITHOUT_VECTORS = (
     lambda gap: gap.startswith("vector_error:"),
     lambda gap: gap == "vector_unavailable",
+    lambda gap: gap == "vector_search_incomplete",
     lambda gap: gap in ("deadline_exceeded", "deadline_exceeded_collect", "deadline_exceeded_vector"),
     lambda gap: gap.startswith("sqlite_unavailable"),
 )
@@ -187,7 +189,10 @@ def server_own_vector_fault(gap: object) -> bool:
 
 
 def recall_without_vectors(gaps) -> str | None:
-    """The gap that says a recall ran without its vector search, or None when the search ran."""
+    """Why a vector search was absent or incomplete; None means the search completed.
+
+    ``vector_search_incomplete`` preserves partial-search diagnostics rather than advertising full coverage.
+    """
     listed = [gap for gap in gaps if isinstance(gap, str)]
     for matches in _WITHOUT_VECTORS:
         found = next((gap for gap in listed if matches(gap)), None)
@@ -229,5 +234,7 @@ def emit_result(result: dict[str, Any], *, diagnostics: HookDiagnostics | None =
         sys.stderr.write("CODEX_CAPTURE:" + json.dumps(detail, ensure_ascii=True, separators=(",", ":")) + "\n")
     if diagnostics is not None and diagnostics.recall_error_detail:
         sys.stderr.write(f"CODEX_RECALL:{diagnostics.recall_error_detail}\n")
-    if diagnostics is not None and diagnostics.recall_vector_gap:
+    # An absent query route is normal, including installations that deliberately keep only lexical recall.
+    # Failed enabled routes carry vector_error or deadline diagnostics and remain visible to the operator.
+    if diagnostics is not None and diagnostics.recall_vector_gap not in (None, "vector_unavailable"):
         sys.stderr.write(f"CODEX_RECALL_VECTOR:{diagnostics.recall_vector_gap}\n")

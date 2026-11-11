@@ -22,10 +22,12 @@ _DEFAULT_PACKAGING_UV = ""
 DEFAULT_WATCHDOG_SECONDS = 180
 RELEASE_WATCHDOG_SECONDS = 600
 #: GitHub's Windows runner executes the integration baseline roughly an order
-#: of magnitude slower than the Linux runners; the selection needs tens of
-#: minutes of real work there. Cap the integration tier so the watchdog bounds
-#: a hang, not a slow-but-healthy suite.
-INTEGRATION_WATCHDOG_SECONDS = 2700
+#: of magnitude slower than the Linux runners, and one instance differs from the
+#: next: the same selection of about 190 files has completed there in 35 to 45
+#: minutes, and a slower instance was 84% through after 45.  The budget is twice
+#: the slowest complete run, so the watchdog bounds a hang, not a
+#: slow-but-healthy suite.
+INTEGRATION_WATCHDOG_SECONDS = 5400
 #: Headroom granted per selected test file, on top of the 180s floor.  A flat
 #: 180s times out a tier of 1,048 tests across 66 files with nothing hung, only
 #: a bigger suite, and a gate that reports a timeout instead of a result is not
@@ -80,7 +82,7 @@ def pytest_watchdog_seconds(
 ) -> int:
     """Bounded suite watchdog, scaled to how much this run selected.
 
-    Release and integration keep fixed budgets of 600s and 2700s respectively.
+    Release and integration keep fixed budgets of 600s and 5400s respectively.
     Every other tier keeps 180s as a floor and adds twenty seconds per selected
     file, capped at the integration budget so no run -- hung or merely large --
     waits forever; each of ``selected_paths`` that builds a whole store then
@@ -203,6 +205,7 @@ SUITES = {
         "tests/contract/test_adoption_outline.py",
         "tests/contract/test_importance_summaries.py",
         "tests/contract/test_injection_formats.py",
+        "tests/contract/test_fact_display.py",
         "tests/contract/test_summary_repairs.py",
         "tests/contract/test_summary_truncation_boundary.py",
         "tests/contract/test_summary_merge.py",
@@ -307,6 +310,7 @@ SUITES = {
         "tests/public_bench/test_public_bench.py",
         "tests/public_bench/test_real_hosts.py",
         "tests/contract/test_retrieval_pipeline.py",
+        "tests/contract/test_lexical_ranking.py",
         "tests/contract/test_recall_restatement.py",
         "tests/contract/test_recall_overflow.py",
         "tests/contract/test_evidence_followup.py",
@@ -314,6 +318,7 @@ SUITES = {
         "tests/contract/test_auto_recall_gate.py",
         "tests/contract/test_retrieval_history_state.py",
         "tests/contract/test_vector_timeout_fallback.py",
+        "tests/contract/test_vector_search_coverage.py",
         "tests/contract/test_auto_query_echo.py",
         "tests/contract/test_vector_retention.py",
         "tests/contract/test_recall_scope.py",
@@ -377,6 +382,7 @@ SUITES = {
         "tests/host/codex/test_lifecycle_worker_wakeup.py",
         "tests/host/codex/test_handoff_tools.py",
         "tests/host/codex/test_mcp.py",
+        "tests/host/codex/test_automatic_revisions.py",
         "tests/host/codex/test_runtime_wiring.py",
         "tests/host/codex/test_shared_client.py",
         "tests/host/codex/test_setup_entries.py",

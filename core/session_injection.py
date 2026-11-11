@@ -19,12 +19,18 @@ from .entry_control import context_fence
 from .recall_budget import canonical_render_json, estimate_tokens
 from .retrieval import SearchContext, SearchLimits
 from .review_policy import PENDING, PENDING_OBSERVATION
-from .secret_patterns import contains_secret_like_text
+from .secret_patterns import contains_secret_like_text, structure_contains_secret_like_text
 from .visibility import check_claim_release
 from .writer_lease import TruthWriterBusyError
 
 NOTICE_TOKEN_CAP = 300
 NOTICE_ITEM_CAP = 3
+#: Stands in a notice for text left out to fit the budget, an omitted condition included.
+NOTICE_ELLIPSIS = "\u2026"
+#: A shortened notice keeps at least this many characters of its body, and a shortened fact of its value.
+NOTICE_MIN_KEPT_CHARS = 48
+#: Characters one shortening step takes off a notice that is not a fact statement.
+NOTICE_TRIM_CHARS = 17
 
 
 def _tokens(text):
@@ -81,9 +87,15 @@ def _markers(row):
     return json.loads(value)
 
 
+def _notice_text(ref, revision, value):
+    """One notice line: the corrected current value, or a withdrawal that repeats no content."""
+    return f"{ref}@{revision}: " + (f"corrected; current value: {value}" if value else "withdrawn; do not rely on it.")
+
+
 def _make_notice(tx, row, key, replacement):
     kind, ref, revision = row["object_kind"], row["object_ref"], row["revision"]
     value = None
+    statement = None
     if replacement is not None and replacement.temporal_status == "current":
         if replacement.kind in {"claim", "procedure"}:
             claim = tx.claims.version(replacement.ref, replacement.revision)
@@ -92,7 +104,16 @@ def _make_notice(tx, row, key, replacement):
                     check_claim_release(tx, claim, history=False, owner_review=False)
                 except ContractError:
                     return None
-            value = claim.payload["value_text"] if claim and claim.state == "active" else None
+            if claim and claim.state == "active" and claim.payload["value_text"]:
+                statement = {
+                    key: claim.payload[key]
+                    for key in ("subject", "predicate", "value_text", "conditions")
+                    if key in claim.payload
+                }
+                if not structure_contains_secret_like_text(statement):
+                    value = formats.item_content(
+                        dict(kind=replacement.kind, content=json.dumps(statement, ensure_ascii=False))
+                    )
         else:
             value = replacement.content
     if value and contains_secret_like_text(value):
@@ -111,17 +132,17 @@ def _make_notice(tx, row, key, replacement):
     saved = _markers(row)
     if marker == saved.get(key):
         return None
-    text = f"{ref}@{revision}: " + (f"corrected; current value: {value}" if value else "withdrawn; do not rely on it.")
     return {
         "kind": kind,
         "ref": ref,
         "revision": revision,
         "marker": marker,
         "corrected": bool(value),
+        "_statement": statement if value else None,
         "current": dict(kind=replacement.kind, ref=replacement.ref, revision=replacement.revision)
         if value and replacement
         else None,
-        "text": text,
+        "text": _notice_text(ref, revision, value),
         "targets": [(kind, ref, revision, key)],
     }
 
@@ -220,6 +241,43 @@ def _delivery_rows(tx, context):
     )
 
 
+def _shrink_statement_notice(notice):
+    """Shorten the longest subject, predicate or condition before shortening the value.
+
+    Keep the value until last because it states the correction. Stop if no field can shrink, the rendered text
+    would not be shorter, or the shortened statement looks secret; the caller then omits it if it cannot fit.
+    """
+    statement = dict(notice["_statement"])
+    shown = {
+        key: str(statement.get(key) or "").rstrip(NOTICE_ELLIPSIS) for key in ("subject", "predicate", "value_text")
+    }
+    candidates = [key for key in ("subject", "predicate") if len(shown[key]) > 2]
+    if statement.get("conditions") and len("; ".join(map(str, statement["conditions"]))) > len(NOTICE_ELLIPSIS):
+        candidates.append("conditions")
+    if candidates:
+        key = max(candidates, key=lambda name: len(str(statement[name])))
+        if key == "conditions":
+            statement[key] = [NOTICE_ELLIPSIS]
+        else:
+            statement[key] = shown[key][: max(1, len(shown[key]) // 2)] + NOTICE_ELLIPSIS
+    elif len(shown["value_text"]) > NOTICE_MIN_KEPT_CHARS + len(NOTICE_ELLIPSIS):
+        value = shown["value_text"]
+        statement["value_text"] = value[: max(NOTICE_MIN_KEPT_CHARS, len(value) // 2)] + NOTICE_ELLIPSIS
+    else:
+        return False
+    if structure_contains_secret_like_text(statement):
+        return False
+    content = formats.item_content(dict(kind="claim", content=json.dumps(statement, ensure_ascii=False)))
+    if contains_secret_like_text(content):
+        return False
+    raw = _notice_text(notice["ref"], notice["revision"], content)
+    text = formats.notice(dict(notice, text=raw), notice.get("_format", "json"))
+    if len(text) >= len(notice["text"]):
+        return False
+    notice.update(_statement=statement, text=text)
+    return True
+
+
 def _select_notices(candidates, limit):
     selected = []
     for notice in candidates:
@@ -231,9 +289,13 @@ def _select_notices(candidates, limit):
             continue
         prefix = notice.get("_text_prefix", f"{notice['ref']}@{notice['revision']}: ")
         while _tokens("\n".join(["Memory updates:", *(n["text"] for n in selected), notice["text"]])) > limit:
-            if len(notice["text"]) <= len(prefix) + 48:
+            if notice.get("_statement"):
+                if not _shrink_statement_notice(notice):
+                    break
+                continue
+            if len(notice["text"]) <= len(prefix) + NOTICE_MIN_KEPT_CHARS:
                 break
-            notice["text"] = notice["text"][:-17] + "\u2026"
+            notice["text"] = notice["text"][:-NOTICE_TRIM_CHARS] + NOTICE_ELLIPSIS
         if _tokens("\n".join(["Memory updates:", *(n["text"] for n in selected), notice["text"]])) <= limit:
             selected.append(notice)
     return selected
@@ -246,7 +308,10 @@ def _notices(tx, search, limit, *, batch=None, reveal=None, style="json"):
     rows = _delivery_rows(tx, search.trusted_context)
     candidates = (notice for row in rows for notice in _row_notices(tx, search, row, batch, reveal))
     return _select_notices(
-        (dict(n, text=formats.notice(n, style), _text_prefix=formats.notice_prefix(n, style)) for n in candidates),
+        (
+            dict(n, text=formats.notice(n, style), _text_prefix=formats.notice_prefix(n, style), _format=style)
+            for n in candidates
+        ),
         limit,
     )
 

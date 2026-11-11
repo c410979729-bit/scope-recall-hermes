@@ -154,6 +154,10 @@ def _representatives(tx, reader, result, context, packet, clock):
         if not readable_sources(tx, obj, policy):
             continue
         source = tx.source(candidate.ref, candidate.revision)
+        # Full assistant answers compete for ordinary evidence slots. Ambient
+        # excerpts retain non-assistant sources instead of adding further replies.
+        if context.automatic_injection and source.event["role"] == "assistant":
+            continue
         session = _session(source)
         try:
             duplicate = context.automatic_injection and host_memory_duplicate(obj, context.host_memory_entries)
@@ -282,7 +286,9 @@ def append_overflow(storage, context: SearchContext, result, packet: RecallPacke
             note_superseded_evidence(tx, gaps, seen)
             if gaps != packet["gaps"]:
                 packet = {**packet, "gaps": gaps}
-        if len(rows) < 3 or clock.monotonic() >= context.deadline:
+        # One non-assistant record can supply evidence omitted by the full packet.
+        # Explicit lookups retain their matching-list breadth threshold.
+        if len(rows) < (1 if context.automatic_injection else 3) or clock.monotonic() >= context.deadline:
             return packet
         extended, chosen = _fit(packet, rows, context)
         if not chosen:

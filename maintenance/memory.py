@@ -349,15 +349,27 @@ def execute(api, args):
     return _preview(api, args)
 
 
-def table(rows, columns, *, max_width: int | None = 72):
-    """Print a plain-text table, optionally retaining every metadata character."""
+#: Width of an overview column: a longer cell is cut, so a row stays on one screen line.
+_COLUMN_WIDTH = 72
+
+
+def table(rows, columns, *, max_width: int | None = _COLUMN_WIDTH, unbounded: tuple[str, ...] = ()):
+    """Print a plain-text table.
+
+    ``max_width`` cuts the cells of every column to that many characters; ``None`` keeps every character.  A column
+    named in ``unbounded`` is neither cut nor padded: it belongs last, where a long cell lengthens only its own line.
+    """
     values = [[str(row.get(key, "")) for key in columns] for row in rows]
     widths = [max([len(key), *(len(row[i]) for row in values)]) for i, key in enumerate(columns)]
     if max_width is not None:
         widths = [min(max_width, width) for width in widths]
-    print("  ".join(key.upper().ljust(widths[i]) for i, key in enumerate(columns)))
+
+    def cell(text, i):
+        return text if columns[i] in unbounded else text[: widths[i]].ljust(widths[i])
+
+    print("  ".join(cell(key.upper(), i) for i, key in enumerate(columns)))
     for row in values:
-        print("  ".join(value.replace("\n", " ")[: widths[i]].ljust(widths[i]) for i, value in enumerate(row)))
+        print("  ".join(cell(value.replace("\n", " "), i) for i, value in enumerate(row)))
 
 
 def _render_scan(data):
@@ -380,6 +392,16 @@ def _render_scan(data):
         print("Repeat the same command with --cursor " + data["next_cursor"])
 
 
+def _row_content(item):
+    """An inventory row's content cell.
+
+    A fact is one statement whose value comes last, so it is kept whole; any other kind is an overview cut at the
+    column width.
+    """
+    content = str(item.get("content", json.dumps(item.get("value", {}), ensure_ascii=False)))
+    return content if item.get("kind") == "claim" else content.replace("\n", " ")[:_COLUMN_WIDTH]
+
+
 def _render_items(data):
     """Render inventory and history rows with their respective continuation."""
     if any("source" in item for item in data["items"]):
@@ -391,11 +413,11 @@ def _render_items(data):
             kind=item.get("kind", ""),
             ref=item.get("ref", ""),
             revision=item.get("revision", ""),
-            content=item.get("content", json.dumps(item.get("value", {}), ensure_ascii=False)),
+            content=_row_content(item),
         )
         for item in data["items"]
     ]
-    table(rows, ("kind", "ref", "revision", "content"))
+    table(rows, ("kind", "ref", "revision", "content"), unbounded=("content",))
     _render_scan(data)
     if data.get("next_before") is not None:
         print("Next history page: --before " + str(data["next_before"]))

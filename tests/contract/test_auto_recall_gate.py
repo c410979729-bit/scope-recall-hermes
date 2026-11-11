@@ -1,6 +1,7 @@
 """Automatic injection needs channel evidence and a prompt that needs memory."""
 
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -12,7 +13,7 @@ from scope_recall.core.retrieval import CandidateRef, SearchContext
 from tests.contract.test_autonomous_context import app, task
 from tests.contract.test_recall_admission import _app, _candidate, _capture, recall
 from tests.contract.test_recall_dating_and_order import _say
-from tests.v11_support import recall_request
+from tests.v11_support import recall_request, source_event
 
 
 def test_explicit_recall_never_sends_inline_private_text_to_vector_port(tmp_path):
@@ -341,3 +342,74 @@ def test_session_probe_interrupts_an_inflight_statement(tmp_path):
                 "继续", tx=tx, context=ctx, deadline=3.0, clock=SimpleNamespace(monotonic=lambda: next(ticks))
             )
         assert SlowProbe().execute().fetchone()[0] == 5000050000
+
+
+def _said_as(core, ctx, key, content, *, role):
+    origin = "assistant_visible" if role == "assistant" else "human_direct"
+    event = source_event(source_event_key=key, origin=origin, role=role, content=content)
+    saved = core.record_event(
+        replace(ctx, actor_origin=origin), event, scope_id=next(iter(ctx.allowed_scope_ids)), remaining_seconds=10
+    )
+    assert saved.durability == "persisted"
+    return core.source(ctx, saved.event_refs[0].ref, 1)
+
+
+def _embedded(core, *sources):
+    """Finish the sources' embedding work, as the worker does once their vectors are written."""
+    with closing(sqlite3.connect(core.storage.path)) as conn:
+        conn.executemany(
+            "UPDATE work_items SET state='done' WHERE work_type='embed' AND subject_ref=?",
+            [(source.ref,) for source in sources],
+        )
+        conn.commit()
+
+
+SEEDLINGS = "What watering schedule did we settle on for the tomato seedlings?"
+
+
+def _passed_over(tmp_path, *, role="assistant", embedded=True, note=""):
+    """A message whose words match ``SEEDLINGS`` and a vector search that ranked only something else, below the
+    threshold."""
+    core, ctx, vectors = _app(tmp_path)
+    content = f"Tomato seedlings do best on a steady watering schedule.{note}"
+    said = _said_as(core, ctx, "TEST-seedlings", content, role=role)
+    other = _capture(core, ctx, "TEST-unrelated", "TEST an unrelated note about invoices.")
+    if embedded:
+        _embedded(core, said, other)
+    vectors.candidates = (_candidate(other, score=0.3),)
+    return core, ctx, vectors, said
+
+
+def test_an_embedded_reply_the_vector_search_passed_over_stays_out_of_automatic_injection(tmp_path):
+    core, ctx, _vectors, reply = _passed_over(tmp_path)
+
+    automatic = core.recall_packet(ctx, recall_request(query=SEEDLINGS))
+    explicit = recall(core, ctx, query=SEEDLINGS, mode="current")
+
+    assert reply.ref not in {item["ref"] for item in automatic["items"]}
+    assert reply.ref in {item.ref for item in explicit.items}
+
+
+@pytest.mark.parametrize("case", ["not_embedded", "owner_message", "vector_unavailable", "identifier"])
+def test_a_passed_over_lexical_hit_stays_when_meaning_could_not_judge_it(tmp_path, case):
+    """A reply said a moment ago has no vector yet, the owner's own messages answer aggregate questions, a failed
+    vector search ranked nothing, and an identifier is found by its words."""
+    core, ctx, vectors, said = _passed_over(
+        tmp_path,
+        role="user" if case == "owner_message" else "assistant",
+        embedded=case != "not_embedded",
+        note=" SR4127 tracks it." if case == "identifier" else "",
+    )
+    query = SEEDLINGS
+    if case == "vector_unavailable":
+
+        def unavailable(*_args, **_kwargs):
+            raise TimeoutError("TEST vector search timed out")
+
+        vectors.search = unavailable
+    if case == "identifier":
+        query = "What watering schedule did SR4127 set for the tomato seedlings?"
+
+    automatic = core.recall_packet(ctx, recall_request(query=query))
+
+    assert said.ref in {item["ref"] for item in automatic["items"]}, automatic["gaps"]

@@ -179,7 +179,8 @@ def test_the_retrieval_tier_s_watchdog_carries_the_recall_bench_s_own_allowance(
     assert check.pytest_watchdog_seconds("retrieval", len(rest), rest) == 180 + 20 * len(rest)
     assert check.pytest_watchdog_seconds("retrieval", len(selected), selected) == 180 + 20 * len(selected) + heavy
     assert check.pytest_watchdog_seconds("retrieval", 1, [bench]) == 800
-    assert check.pytest_watchdog_seconds("retrieval", 200, [bench]) == check.INTEGRATION_WATCHDOG_SECONDS + 600
+    past_the_cap = check.INTEGRATION_WATCHDOG_SECONDS // check.WATCHDOG_SECONDS_PER_FILE + 1
+    assert check.pytest_watchdog_seconds("retrieval", past_the_cap, [bench]) == check.INTEGRATION_WATCHDOG_SECONDS + 600
 
 
 def test_release_wrapper_records_actual_600s_watchdog(monkeypatch, tmp_path: Path) -> None:
