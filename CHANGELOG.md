@@ -6,13 +6,7 @@ A line or two per release.  Each release's full notes are on its GitHub release 
 
 Between releases, `distribution/hermes/plugin.yaml` on the default branch keeps naming the newest release, so `hermes plugins install 410979729/scope-recall-hermes#distribution/hermes` goes on installing a core that is on PyPI.
 
-A scope's memory instruction now reaches every consolidation request: batches and pages of long messages are sized with it, so it is no longer dropped when it does not fit; an instruction longer than about 1,650 UTF-8 bytes is still left out. An evidence quote with no letters or digits is refused and only that claim is dropped (#360). Entity and adoption requests name JSON in their text; providers that require the word for JSON mode, such as DeepSeek, otherwise answer HTTP 400 (#359).
-
-Auxiliary model budgets settle explicit HTTP refusals (400, 401, 402, 403, 404, 405, 413, 415, 422, 429) and failures before the request was sent at zero tokens and cost; a request that may have run upstream keeps its reservation as before. Doctor reports the reservations kept for unknown usage, their share of each cap, and when the remaining headroom no longer admits one reservation. `scope-recall release-budget-reservations` previews kept records older than a given time and releases them with `--apply`; the CLI route's daily subscription ledger follows the same rules with `--subscription` (#366).
-
-A summary page that fails validation records the failing field in its work's error detail on every attempt, and doctor counts partial summary groups by reason, asking for attention when at least 20 groups are partial and they are more than a tenth of all groups. `docs/background-work.md` says how such pages are retried (#363).
-
-In Hermes, a recording-control message that is left out of the store no longer keeps its capture slot; after 64 of them in one binding, ordinary messages were not captured (#364).
+Fixes: a scope memory instruction reaches every consolidation request and an evidence quote without letters or digits is refused (#360); entity and adoption requests name JSON (#359); auxiliary budgets settle proven refusals at zero and kept reservations can be inspected and released (#366); failed summary pages record why (#363); an excluded Hermes recording-control message gives back its capture slot (#364).
 
 ## [4.0.3] - 2026-11-07
 
