@@ -86,8 +86,10 @@ class SourceObservationLedger:
         while len(self._confirmed) > 1024:
             self._confirmed.pop(next(iter(self._confirmed)))
 
-    def rollback(self, identity: SourceIdentity) -> None:
-        self._pending.discard(identity)
+    def rollback(self, identity: SourceIdentity | None) -> None:
+        """Release an uncommitted observation; an identityless capture reserved no slot."""
+        if identity is not None:
+            self._pending.discard(identity)
 
     def pending_identities(self) -> tuple[SourceIdentity, ...]:
         return tuple(sorted(self._pending))

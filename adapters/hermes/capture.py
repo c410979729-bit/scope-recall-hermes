@@ -122,6 +122,9 @@ class CaptureWriter:
             and not event.get("artifact_refs")
             and not gaps
         ):
+            # Control text is intentionally omitted, so no write will settle its
+            # observation. Release the slot for subsequent ordinary messages.
+            adapter._ledger.rollback(identity)
             return None
         if event is None:
             if gaps:

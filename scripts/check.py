@@ -329,6 +329,7 @@ SUITES = {
     "host": [
         "tests/host/hermes/test_memory_write.py",
         "tests/host/hermes/test_capture_retry_properties.py",
+        "tests/host/hermes/test_capture_boundaries.py",
         "tests/host/hermes/test_upgrade_capture.py",
         "tests/host/test_memory_ui.py",
         "tests/host/test_recall_log.py",
