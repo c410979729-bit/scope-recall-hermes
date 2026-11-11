@@ -9,7 +9,9 @@ outside the trusted context.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import sqlite3
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -61,6 +63,18 @@ _LEXICAL_DF_FLOOR = 64
 #: terms separate the most, and a question's own few are never cut.
 _LEXICAL_POSTING_BUDGET = 20_000
 _LEXICAL_MIN_TERMS = 16
+#: An ordinary-message allowance preserves hit/recency order; further byte steps discount larger bodies.
+#: These numeric scales carry forward the development/regression replay's empirical length choices.
+_LEXICAL_UNDISCOUNTED_BYTES = 4_000
+_LEXICAL_LENGTH_STEP_BYTES = 1_000
+#: octet_length obtains bytes from record metadata. Choose once for this linked SQLite engine;
+#: older engines keep hit order rather than reading every matching body before LIMIT.
+_LEXICAL_RANK = (
+    f"hits / (1.0 + MAX(0, octet_length(e.content) - {_LEXICAL_UNDISCOUNTED_BYTES})"
+    f" / {float(_LEXICAL_LENGTH_STEP_BYTES)})"
+    if sqlite3.sqlite_version_info >= (3, 43, 0)
+    else "hits"
+)
 
 
 def scope_digest(context) -> str:
@@ -497,6 +511,26 @@ class RetrievalStorage(RetrievalHydration):
     def _remaining(self, context: SearchContext) -> float:
         return context.deadline - self.clock.monotonic()
 
+    def embedded_replies(self, tx, candidates, *, searched_scopes: set[str]) -> frozenset[tuple[str, str, int]]:
+        """The keys of the event ``candidates`` the assistant wrote whose embedding is done, so the vector search
+        could have ranked them, restricted to fully searched logical scopes.
+
+        One look-up per candidate on the queue's unique key; the state is compared outside the index so the planner
+        does not walk every finished item instead.
+        """
+        wanted = [[candidate.ref, candidate.revision] for candidate in candidates if candidate.kind == "event"]
+        if not wanted or not searched_scopes:
+            return frozenset()
+        rows = tx._check().execute(
+            "SELECT i.subject_ref,i.subject_revision FROM json_each(?) w CROSS JOIN work_items i "
+            "ON i.work_type='embed' AND i.subject_ref=json_extract(w.value,'$[0]') "
+            "AND i.subject_revision=json_extract(w.value,'$[1]') "
+            "JOIN source_events e ON e.event_id=i.subject_ref AND e.source_revision=i.subject_revision "
+            f"WHERE +i.state='done' AND e.role='assistant' AND e.scope_id IN ({_marks(searched_scopes)})",
+            (json.dumps(wanted), *sorted(searched_scopes)),
+        )
+        return frozenset(("event", ref, revision) for ref, revision in rows)
+
     def epoch(self, tx) -> int:
         return tx.memory_epoch()
 
@@ -515,9 +549,15 @@ class RetrievalStorage(RetrievalHydration):
         within: tuple[tuple[str, str], ...] = (),
         among: frozenset[str] | None = None,
     ) -> tuple[CandidateRef, ...]:
-        """Sources holding the query's terms, those holding most first.  With ``within``, only those said within one
-        of its UTC ``[start, end)`` windows; with ``among``, only the terms it holds of those the plain statement
-        searches (``dated``), so no posting it would not group."""
+        """Sources ranked by query hits, discounting unusually large encoded bodies.
+
+        Bodies within the byte allowance retain their hit-count and recency order. Each further byte step increases
+        the divisor by one. Multibyte text reaches that allowance in fewer characters; distinct query hits, including
+        CJK bigrams, remain the admission signal.
+
+        ``within`` restricts sources to its UTC ``[start, end)`` windows. ``among`` keeps only the named terms of the
+        ordinary lexical search, so dated lookups group no additional postings.
+        """
         terms = meaningful_query_terms(context.query)
         if not terms:
             return ()
@@ -591,7 +631,8 @@ class RetrievalStorage(RetrievalHydration):
                         OR (e.origin='imported' AND e.source_original_origin='memory_reinjection')
                     ) THEN 1 ELSE 0
                 END,
-                {identifier_order}hits DESC,e.occurred_at DESC,e.event_id,e.source_revision DESC
+                {identifier_order}{_LEXICAL_RANK} DESC,
+                e.occurred_at DESC,e.event_id,e.source_revision DESC
                 LIMIT ?""",
                 (*credits, *credits, *identifiers, *params, limit),
             )

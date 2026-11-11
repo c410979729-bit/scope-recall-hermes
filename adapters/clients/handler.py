@@ -1045,7 +1045,7 @@ class CodexHookHandler:
     def has_vectors(self) -> bool:
         """Whether this hook's own runtime has a vector search to recall with."""
         runtime = self._host_runtime.runtime if self._host_runtime is not None else None
-        return runtime is not None and getattr(runtime.config, "vector", None) is not None
+        return runtime is not None and getattr(runtime, "query_vectors_available", False)
 
     def resident_recall_for(
         self, payload: dict[str, Any], current_refs: tuple[str, ...], gaps: tuple[str, ...], remaining: float

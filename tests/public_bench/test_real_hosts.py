@@ -17,6 +17,7 @@ from real_host_scale import scale_metrics
 from real_host_session import Session, answer_text, injected, recalled
 from real_hosts import IDS, arguments, record
 from scenario_report import brief, merge_real
+from scope_recall.core.recall_policy import BUILTIN_VECTOR_THRESHOLD
 
 TEST_CHAT_ENDPOINT = "http://127.0.0.1:9/v1/chat/completions"
 
@@ -248,7 +249,7 @@ def test_route_recipe_validates_and_names_environment_variables_only():
     assert recipe["auxiliary"]["embedding"]["model"] == "gemini-embedding-2"
     assert recipe["auxiliary"]["consolidation"]["credential_env"] == "TEST_SR_CHAT_KEY"
     assert recipe["vector"]["backend"] == "sqlite"
-    assert recipe["vector_threshold"] == 0.70
+    assert recipe["vector_threshold"] == BUILTIN_VECTOR_THRESHOLD
 
 
 def test_template_budget_prices_paid_embedding_and_unbilled_local_chat():
@@ -281,8 +282,10 @@ def test_template_explicit_embedding_space_has_a_usable_floor(tmp_path):
         report = DoctorReport(host="codex", status="degraded")
         _check_vector_threshold(report, config.binding, scenes.store)
         assert "vector_threshold_unconfigured" not in report.capability_gaps
-        assert config.recall_policy().vector_threshold == 0.70
-        assert report.checks[-1] == dict(name="vector_threshold", result="configured", detail="0.7")
+        assert config.recall_policy().vector_threshold == BUILTIN_VECTOR_THRESHOLD
+        assert report.checks[-1] == dict(
+            name="vector_threshold", result="configured", detail=str(BUILTIN_VECTOR_THRESHOLD)
+        )
     finally:
         scenes.close()
 
