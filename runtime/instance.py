@@ -131,12 +131,19 @@ class _LazyVectorPort:
     Construction opens no vector files.  The first real SearchContext opens only
     an existing companion under that request's absolute deadline, then keeps
     the trusted identity and scope supplied by that context all the way to
-    ``VectorPort``.  A disabled query embedding route returns no vector
-    candidates; it never exposes the raw native store as a Core port.
+    ``VectorPort``. A disabled query embedding route reports the channel as
+    unavailable; it never exposes the raw native store as a Core port.
     """
+
+    reports_searched_scopes = True
 
     def __init__(self, instance: RuntimeInstance) -> None:
         self._instance = instance
+
+    @property
+    def available(self) -> bool:
+        """Whether the configured query route can attempt a vector search, without opening the store."""
+        return self._instance.query_vectors_available
 
     def _embedding_adapter(self) -> VectorPort | None:
         embedding = getattr(self._instance.auxiliary, "query_embedding", None)
@@ -194,8 +201,15 @@ class _LazyVectorPort:
         return pending
 
     def search(
-        self, context: SearchContext, *, limit: int, remaining_seconds: float, prefetched: _QueryEmbedding | None = None
+        self,
+        context: SearchContext,
+        *,
+        limit: int,
+        remaining_seconds: float,
+        prefetched: _QueryEmbedding | None = None,
+        searched_scopes: set[str] | None = None,
     ):
+        """Search the configured query route and report only fully checked logical scopes."""
         if not isinstance(context, SearchContext):
             raise TypeError("context must be SearchContext")
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -248,6 +262,7 @@ class _LazyVectorPort:
                 allow_create=False, deadline=deadline, during_open=embed_while_opening
             )
             if port is None:
+                # No query route means no scope was checked. Core reports the absent capability before calling.
                 return ()
             if failed:
                 raise failed[0]
@@ -262,8 +277,14 @@ class _LazyVectorPort:
                 # nothing, and the recall would look as if it had searched by meaning.
                 raise TimeoutError("vector store request deadline exhausted before the search")
             if prepared:
-                return port.search(context, limit=limit, remaining_seconds=remaining, _prepared_query=prepared[0])
-            return port.search(context, limit=limit, remaining_seconds=remaining)
+                return port.search(
+                    context,
+                    limit=limit,
+                    remaining_seconds=remaining,
+                    _prepared_query=prepared[0],
+                    searched_scopes=searched_scopes,
+                )
+            return port.search(context, limit=limit, remaining_seconds=remaining, searched_scopes=searched_scopes)
 
 
 def _open_store(resource: Any, *, allow_create: bool, deadline: RequestDeadline | float | None, during_open) -> None:
@@ -327,6 +348,15 @@ class RuntimeInstance:
     #: Work types this drain left alone, each with the held model and when its
     #: hold ends (runtime/model_budget.py ``provider_holds``).
     provider_holds: dict = field(default_factory=dict)
+
+    @property
+    def query_vectors_available(self) -> bool:
+        """Whether both the vector configuration and an actual query embedding route are present.
+
+        Source embedding and an existing vector index do not enable query embedding. Runtime failures on an
+        enabled route remain search failures, so callers can diagnose and recover from them.
+        """
+        return self.config.vector is not None and getattr(self.auxiliary, "query_embedding", None) is not None
 
     def _ensure_open(self) -> None:
         if self._closed:

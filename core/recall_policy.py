@@ -41,7 +41,18 @@ EMBEDDING_SPACE = {
 _SPACE_BYTES = json.dumps(EMBEDDING_SPACE, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 SPACE_ID = hashlib.sha256(_SPACE_BYTES).hexdigest()
 VECTOR_SCORE_TOLERANCE = 1e-6
-BUILTIN_VECTOR_THRESHOLD = 0.70
+#: The score a recall's best vector hit must reach before the vector channel admits anything.  Gemini embedding 2
+#: scores sit between 0.6 and 0.8: on LongMemEval-S a question's best hit in its own history has a median of 0.72-0.74,
+#: its best hit in another question's history a median of 0.62 and a 75th percentile of 0.65, and over half of the
+#: turns holding an answer score below 0.70.  On the 150-question tuning replay, 0.66 found 0.78 of the answer turns
+#: against 0.69 at 0.70, and 0.64 only 0.01 more while injecting into 4 % more unrelated histories.
+BUILTIN_VECTOR_THRESHOLD = 0.66
+#: Once the best hit reaches the threshold, the hits ranked in the channel's first ``BUILTIN_VECTOR_NEAR_RANK`` are
+#: admitted down to ``BUILTIN_VECTOR_MARGIN`` below the threshold.  The turns holding an answer rank in a question's
+#: first six 80-89 % of the time, yet half of them score below 0.70.  Rank rather than distance from the best hit,
+#: because an earlier copy of the question itself scores near 1 and would push every other hit out of a margin.
+BUILTIN_VECTOR_NEAR_RANK = 6
+BUILTIN_VECTOR_MARGIN = 0.10
 
 _WEAK_QUERY = frozenset({"那次", "那件", "那个", "这个", "怎样", "如何", "what", "that", "it"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,239}")
@@ -251,7 +262,11 @@ def _finite_score(value: object) -> float | None:
 class RecallPolicy:
     """Resolve the built-in space's floor; explicit thresholds override it."""
 
+    #: The score the best vector hit must reach (``BUILTIN_VECTOR_THRESHOLD`` in the built-in space).
     vector_threshold: float | None = None
+    #: Ranked hits admitted below the threshold once the best reaches it, and how far below (``BUILTIN_VECTOR_*``).
+    vector_near_rank: int = BUILTIN_VECTOR_NEAR_RANK
+    vector_margin: float = BUILTIN_VECTOR_MARGIN
     #: Automatic injection needs independent lexical coverage or vector evidence;
     #: fusion ranks admitted evidence but cannot turn a weak hit into a strong one.
     auto_lexical_min_coverage: float = 0.20
@@ -273,12 +288,14 @@ class RecallPolicy:
         threshold = _finite_score(self.vector_threshold)
         if self.vector_threshold is not None and (threshold is None or not -1.0 <= threshold <= 1.0):
             raise ContractError("INPUT_INVALID", "vector_threshold")
-        for name, low in (("auto_lexical_min_coverage", 0.0), ("auto_vector_threshold", -1.0)):
+        for name, low in (("auto_lexical_min_coverage", 0.0), ("auto_vector_threshold", -1.0), ("vector_margin", 0.0)):
             value = _finite_score(getattr(self, name))
             if value is None or not low <= value <= 1.0:
                 raise ContractError("INPUT_INVALID", name)
         if type(self.auto_lexical_min_terms) is not int or self.auto_lexical_min_terms < 2:
             raise ContractError("INPUT_INVALID", "auto_lexical_min_terms")
+        if type(self.vector_near_rank) is not int or self.vector_near_rank < 0:
+            raise ContractError("INPUT_INVALID", "vector_near_rank")
         if type(self.lexical_min_terms) is not int or self.lexical_min_terms < 1:
             raise ContractError("INPUT_INVALID", "lexical_min_terms")
         if type(self.rrf_k) is not int or self.rrf_k < 1:
@@ -324,7 +341,28 @@ class RecallPolicy:
             for hits, count in _matched_substantive_clauses(query, matched)
         )
 
-    def vector_admission(self, candidate: CandidateRef) -> tuple[bool, str | None]:
+    def vector_best(self, candidates) -> float | None:
+        """The best valid score among ``candidates`` in this policy's space; None when there is none."""
+        scores = [
+            score
+            for candidate in candidates
+            if candidate.source == "vector"
+            and candidate.embedding_space == self.embedding_space_id
+            and (score := _finite_score(candidate.vector_score)) is not None
+            and -1.0 - VECTOR_SCORE_TOLERANCE <= score <= 1.0 + VECTOR_SCORE_TOLERANCE
+        ]
+        return max(scores, default=None)
+
+    def vector_admission(
+        self, candidate: CandidateRef, *, best: float | None = None, rank: int | None = None
+    ) -> tuple[bool, str | None]:
+        """Admit a vector hit that reaches the threshold, or that ranks ``rank`` within ``vector_near_rank`` and scores
+        no more than ``vector_margin`` below the threshold when the best hit of its recall (``best``) reaches it.
+
+        The threshold says whether the store holds anything this close to the question; rank keeps the hits that
+        stand with the best rather than only the ones that clear a fixed line.  Without ``best`` and ``rank`` a hit
+        is judged alone, against the threshold.
+        """
         if candidate.source != "vector":
             return False, "not_vector"
         if type(candidate.vector_id) is not str or not candidate.vector_id:
@@ -341,9 +379,16 @@ class RecallPolicy:
             return False, "vector_score_invalid"
         if self.vector_threshold is None:
             return False, "vector_threshold_unconfigured"
-        if score + VECTOR_SCORE_TOLERANCE < self.vector_threshold:
-            return False, "vector_below_threshold"
-        return True, None
+        near = (
+            best is not None
+            and rank is not None
+            and rank <= self.vector_near_rank
+            and best + VECTOR_SCORE_TOLERANCE >= self.vector_threshold
+            and score + VECTOR_SCORE_TOLERANCE >= self.vector_threshold - self.vector_margin
+        )
+        if near or score + VECTOR_SCORE_TOLERANCE >= self.vector_threshold:
+            return True, None
+        return False, "vector_below_threshold"
 
     def lexical_admission(self, candidate: CandidateRef, query: str, *, exact: bool = False) -> tuple[bool, str | None]:
         if candidate.source == "exact_ref" or exact:

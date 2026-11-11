@@ -989,3 +989,66 @@ def test_a_query_s_terms_are_worked_out_once_however_often_a_recall_asks(monkeyp
     varied = "".join(chr(0x4E00 + (index * 7919) % 20000) for index in range(8000))
     assert len({query_terms(varied) for _ in range(200)}) == 1
     assert len(worked) <= 1
+
+
+def _ranked_sources(core, ctx, *scores):
+    sources = [
+        _capture(core, ctx, f"TEST-ranked-{index}", f"TEST ranked memory number {index}.")
+        for index in range(len(scores))
+    ]
+    return sources, tuple(_candidate(source, score=score) for source, score in zip(sources, scores, strict=True))
+
+
+def test_a_vector_hit_below_the_threshold_joins_automatic_injection_when_it_ranks_with_a_best_hit_at_it(tmp_path):
+    """The threshold (0.8 here) says whether the store holds anything close; once its best hit reaches it, hits ranked
+    in the first ``vector_near_rank`` join it down to ``vector_margin`` below the threshold."""
+    core, ctx, vectors = _app(tmp_path)
+    (best, near, far), vectors.candidates = _ranked_sources(core, ctx, 0.85, 0.75, 0.65)
+
+    refs = {_item_ref(item) for item in recall(core, ctx, query="量子生物学无关主题。").items}
+
+    assert best.ref in refs and near.ref in refs
+    assert far.ref not in refs
+
+
+def test_ranked_vector_hits_need_a_best_hit_at_the_threshold(tmp_path):
+    core, ctx, vectors = _app(tmp_path)
+    _sources, vectors.candidates = _ranked_sources(core, ctx, 0.78, 0.76)
+
+    result = recall(core, ctx, query="量子生物学无关主题。")
+
+    assert result.items == ()
+
+
+def test_an_explicit_search_admits_vector_hits_at_the_threshold_only(tmp_path):
+    core, ctx, vectors = _app(tmp_path)
+    (best, near), vectors.candidates = _ranked_sources(core, ctx, 0.85, 0.75)
+
+    refs = {_item_ref(item) for item in recall(core, ctx, query="量子生物学无关主题。", mode="current").items}
+
+    assert best.ref in refs
+    assert near.ref not in refs
+
+
+def test_the_current_message_sets_neither_the_best_vector_hit_nor_a_rank(tmp_path):
+    core, ctx, vectors = _app(tmp_path)
+    (current, near), vectors.candidates = _ranked_sources(core, ctx, 0.99, 0.75)
+
+    result = recall(core, ctx, query="量子生物学无关主题。", current_source_refs=(f"{current.ref}@{current.revision}",))
+
+    assert result.items == ()
+
+
+def test_a_vector_hit_ranked_past_the_near_rank_waits_for_the_threshold():
+    policy = RecallPolicy(vector_threshold=0.8, vector_near_rank=2)
+    hit = CandidateRef(
+        "event", "TEST-hit", 1, "vector", vector_score=0.75, vector_id="TEST-vector:hit", embedding_space=SPACE_ID
+    )
+
+    assert policy.vector_admission(hit, best=0.85, rank=2) == (True, None)
+    assert policy.vector_admission(hit, best=0.85, rank=3) == (False, "vector_below_threshold")
+    assert policy.vector_admission(hit) == (False, "vector_below_threshold")
+    with pytest.raises(ContractError):
+        RecallPolicy(vector_threshold=0.8, vector_near_rank=-1)
+    with pytest.raises(ContractError):
+        RecallPolicy(vector_threshold=0.8, vector_margin=1.5)

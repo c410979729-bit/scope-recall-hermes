@@ -1965,6 +1965,7 @@ def test_what_counts_as_a_recall_without_its_vector_search():
     )
     assert recall_without_vectors(["deadline_exceeded_collect"]) == "deadline_exceeded_collect"
     assert recall_without_vectors(["sqlite_unavailable:INPUT_INVALID"]) == "sqlite_unavailable:INPUT_INVALID"
+    assert recall_without_vectors(["vector_search_incomplete"]) == "vector_search_incomplete"
 
 
 @pytest.fixture
@@ -2748,12 +2749,114 @@ def test_a_hook_knows_whether_its_own_runtime_has_a_vector_search(store):
             (None, False),
             (SimpleNamespace(runtime=None), False),
             (SimpleNamespace(runtime=SimpleNamespace(config=SimpleNamespace(vector=None))), False),
-            (SimpleNamespace(runtime=SimpleNamespace(config=SimpleNamespace(vector=object()))), True),
+            (SimpleNamespace(runtime=SimpleNamespace(query_vectors_available=False)), False),
+            (SimpleNamespace(runtime=SimpleNamespace(query_vectors_available=True)), True),
         ):
             hook._host_runtime = runtime
             assert hook.has_vectors is expected
     finally:
         hook._host_runtime = None
+        hook.close()
+
+
+@pytest.mark.parametrize("route", ["unconfigured", "enabled", "disabled", "timeout"])
+def test_query_route_capability_controls_real_hook_recall_fallback_and_error_output(store, monkeypatch, capsys, route):
+    """A normal disabled route recalls once; a real query timeout retains diagnostics and local fallback."""
+    from dataclasses import asdict, replace
+
+    from scope_recall.adapters.clients.hook_answer import emit_result
+    from scope_recall.adapters.runtime_wiring import TrustedHostRuntime
+    from scope_recall.core.recall_policy import SPACE_ID
+    from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
+    from scope_recall.runtime.instance import build_runtime_instance
+    from scope_recall.runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
+
+    from tests.v11_support import source_event
+
+    _root, _homes, client, scope = store
+    config = load_shared_client(client, "claude-code")
+    runtime_config = RuntimeInstanceConfig(
+        binding=config.to_binding(),
+        session_id="TEST-query-route",
+        allowed_scope_ids=config.scope_ids,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
+        vector=VectorRuntimeConfig(
+            backend="sqlite-bruteforce",
+            storage_dir=config.to_binding().data_directory / "vectors" / SPACE_ID,
+            table_name="TEST-index",
+            dimensions=3072,
+        ),
+    )
+    if route == "unconfigured":
+        runtime_config = replace(runtime_config, vector=None)
+    backend = SimpleNamespace(open_existing=lambda: None, search=lambda *a, **k: (), close=lambda: None)
+    instance = build_runtime_instance(runtime_config, vector_factory=lambda _: backend)
+    if route == "timeout":
+
+        def timeout(*args, **kwargs):
+            raise TimeoutError("TEST-query-timeout")
+
+        instance.auxiliary = replace(
+            instance.auxiliary, query_embedding=SimpleNamespace(embed_query=timeout, close=lambda: None)
+        )
+    elif route == "enabled":
+        instance.auxiliary = replace(
+            instance.auxiliary,
+            query_embedding=SimpleNamespace(embed_query=lambda *a, **k: (1.0,) * 3072, close=lambda: None),
+        )
+    host_runtime = TrustedHostRuntime(instance.core, _runtime=instance)
+    hook = CodexHookHandler(config, host_runtime=host_runtime)
+    server = CodexHookHandler(config, host_runtime=host_runtime)
+    monkeypatch.setattr(hook, "launch_worker", lambda *a, **k: None)
+    calls = []
+    recall = instance.core.recall_packet
+
+    def counted(*args, **kwargs):
+        packet = recall(*args, **kwargs)
+        calls.append(packet)
+        return packet
+
+    monkeypatch.setattr(instance.core, "recall_packet", counted)
+
+    def resident(payload, refs, gaps, remaining):
+        result = server.resident_recall_for(payload, refs, gaps, remaining)
+        return result, asdict(server.diagnostics)
+
+    hook.resident_recall = resident
+    try:
+        instance.core.initialize()
+        actor = hook.context(hook.audience_of(_prompt("TEST")), "TEST-past-assistant", "assistant_visible")
+        saved = instance.core.record_event(
+            actor,
+            source_event(
+                role="assistant",
+                origin="assistant_visible",
+                content="Tomato seedlings need a steady watering schedule before sunrise.",
+            ),
+            scope_id=scope,
+            remaining_seconds=10,
+        ).event_refs[0]
+        with instance.core.storage.write(actor) as tx:
+            tx._check(write=True).execute(
+                "UPDATE work_items SET state='done' WHERE work_type='embed' AND subject_ref=?", (saved.ref,)
+            )
+        result = hook.handle_payload(_prompt("What watering schedule did we settle on for the tomato seedlings?"))
+        emit_result(result, diagnostics=hook.diagnostics)
+        captured = capsys.readouterr()
+        assert (saved.ref in captured.out) is (route != "enabled")
+        assert len(calls) == (2 if route == "timeout" else 1), [packet["gaps"] for packet in calls]
+        assert hook.diagnostics.recall_vectors is (route == "enabled")
+        assert all(("vector_unavailable" in packet["gaps"]) is (route != "enabled") for packet in calls)
+        if route != "timeout":
+            assert not any(gap.startswith("vector_error:") for packet in calls for gap in packet["gaps"])
+            assert "CODEX_RECALL_VECTOR:" not in captured.err
+            assert "CODEX_RECALL:" not in captured.err
+        else:
+            assert all(any(gap.startswith("vector_error:TimeoutError") for gap in packet["gaps"]) for packet in calls)
+            assert "CODEX_RECALL_VECTOR:vector_error:TimeoutError" in captured.err
+    finally:
+        # Both handlers share the same synthetic runtime; one owner closes it.
+        server._host_runtime = None
         hook.close()
 
 

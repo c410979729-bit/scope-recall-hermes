@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
+from ..core.recall_policy import BUILTIN_VECTOR_THRESHOLD
 from ..runtime.auxiliary import AuxiliaryRuntimeConfig
 from ..runtime.instance_config import VectorRuntimeConfig
 from .setup_configuration import validate_models
@@ -80,6 +81,6 @@ def configure_models() -> dict:
         dict(
             auxiliary=auxiliary,
             vector=vector,
-            vector_threshold=float(_ask("Calibrated vector similarity threshold", "0.70")),
+            vector_threshold=float(_ask("Calibrated vector similarity threshold", str(BUILTIN_VECTOR_THRESHOLD))),
         )
     )

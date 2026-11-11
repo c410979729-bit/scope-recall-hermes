@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from scope_recall.contracts import ContractError
 from scope_recall.core.recall_policy import (
+    BUILTIN_VECTOR_THRESHOLD,
     EMBEDDING_SPACE,
     SPACE_ID,
     VECTOR_SCORE_TOLERANCE,
@@ -396,7 +397,7 @@ def test_builtin_space_admits_vectors_without_an_explicit_threshold():
         embedding_space=SPACE_ID,
         vector_score=0.71,
     )
-    assert RecallPolicy(vector_threshold=None).vector_threshold == 0.70
+    assert RecallPolicy(vector_threshold=None).vector_threshold == BUILTIN_VECTOR_THRESHOLD
     assert RecallPolicy(vector_threshold=None).vector_admission(candidate) == (True, None)
     assert RecallPolicy(vector_threshold=0.75).vector_admission(candidate) == (False, "vector_below_threshold")
     assert RecallPolicy(vector_threshold=0.675).vector_admission(replace(candidate, vector_score=0.69)) == (True, None)

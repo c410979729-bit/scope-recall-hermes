@@ -69,7 +69,7 @@ with one also gives the shared worker its routes, and its spend ledger moves to 
 directory. Every later entry must use the same embedding model as the worker: a
 query vector from another model searches a directory the worker never fills, so `attach`
 refuses with `embedding_space_differs`. An entry attached without a runtime config recalls
-lexically only (`vector_recall_unavailable`). The entry keeps the `vector_threshold` of the config it was attached from. An omitted value uses `0.70` for the built-in embedding space; a custom space needs an explicit threshold; automatic recall also applies `auto_vector_threshold`
+lexically only (`vector_recall_unavailable`). The entry keeps the `vector_threshold` of the config it was attached from. An omitted value uses `0.66` for the built-in embedding space: the best vector hit must reach it, and automatic recall then also admits the hits ranked in its first six down to 0.10 below it; a custom space needs an explicit threshold; automatic recall also applies `auto_vector_threshold`
 ([configuration.md](configuration.md#vector_threshold)).
 
 Then give the shared worker its credentials in `<root>\.env` and register it once, with an
