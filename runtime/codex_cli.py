@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import threading
@@ -22,6 +23,7 @@ from contextlib import closing
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from ..core.private import require_outbound
 from .consolidation_models import validate_chat_messages
@@ -36,6 +38,11 @@ VERIFIED_BINARIES = frozenset(
         "960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc",
     }
 )
+# Windows x64 CLI 0.167.0-alpha.3.2: distribution signatures change file hashes, so pin the shared image.
+VERIFIED_PE_IMAGES = frozenset({"583ed1f42412daf9ac61a74788f077bfe8d178a1f4acd6a39bdd4e171fa6ba4f"})
+# The Windows x64 0.167.0-alpha.3.2 CLI took 5.1 to 6.5 seconds to initialize an empty state and exit;
+# fifteen leaves room for a loaded machine and still fits a call's deadline.
+STATE_INIT_TIMEOUT_SECONDS = 15.0
 MAX_OUTPUT_BYTES = 1048576
 _DISABLED = (
     "apps",
@@ -474,13 +481,113 @@ def _run(
             diag["elapsed_seconds"] = round(time.monotonic() - started, 6)
 
 
+def _pe_read_at(stream: BinaryIO, offset: int, size: int, limit: int) -> bytes:
+    """Read a bounded PE header range, rejecting truncated or out-of-file data."""
+    if offset < 0 or offset + size > limit:
+        raise ValueError("pe_header_bounds")
+    stream.seek(offset)
+    data = stream.read(size)
+    if len(data) != size:
+        raise ValueError("pe_short_read")
+    return data
+
+
+def _pe_image_ranges(stream: BinaryIO) -> tuple[tuple[int, int], ...]:
+    """Locate PE hash ranges with a layout-valid terminal certificate-table range.
+
+    Raw sections must be contiguous after SizeOfHeaders. Gaps or overlapping
+    sections would make a linear exclusion hash differ from Authenticode's
+    section walk. Overlay bytes before the terminal certificate remain hashed.
+    Certificate contents, signature validity and signer identity are not checked;
+    the checksum, certificate directory entry and certificate range are excluded
+    from image identity protection.
+    """
+    length = os.fstat(stream.fileno()).st_size
+    dos = _pe_read_at(stream, 0, 64, length)
+    pe_offset = struct.unpack_from("<I", dos, 60)[0]
+    if dos[:2] != b"MZ" or pe_offset < 64:
+        raise ValueError("pe_dos_header")
+    coff = _pe_read_at(stream, pe_offset, 24, length)
+    sections, optional_size = struct.unpack_from("<H", coff, 6)[0], struct.unpack_from("<H", coff, 20)[0]
+    if coff[:4] != b"PE\0\0" or not 1 <= sections <= 96:
+        raise ValueError("pe_coff_header")
+    optional_offset = pe_offset + 24
+    optional = _pe_read_at(stream, optional_offset, optional_size, length)
+    magic = struct.unpack_from("<H", optional)[0]
+    directories = {0x10B: 96, 0x20B: 112}.get(magic)
+    if directories is None or optional_size < directories + 40:
+        raise ValueError("pe_optional_header")
+    directory_count = struct.unpack_from("<I", optional, directories - 4)[0]
+    if not 5 <= directory_count <= (optional_size - directories) // 8:
+        raise ValueError("pe_directory_bounds")
+    security = optional_offset + directories + 32
+    certificate, certificate_size = struct.unpack_from("<II", optional, directories + 32)
+    headers = struct.unpack_from("<I", optional, 60)[0]
+    table_offset = optional_offset + optional_size
+    table = _pe_read_at(stream, table_offset, sections * 40, length)
+    if not table_offset + len(table) <= headers <= certificate:
+        raise ValueError("pe_header_extent")
+    if certificate % 8 or certificate_size < 8 or certificate + certificate_size != length:
+        raise ValueError("pe_certificate_extent")
+    raw_sections = [struct.unpack_from("<II", table, index * 40 + 16) for index in range(sections)]
+    end = headers
+    for offset, size in sorted((offset, size) for size, offset in raw_sections if size):
+        if offset != end or offset + size > certificate:
+            raise ValueError("pe_section_extent")
+        end = offset + size
+    checksum = optional_offset + 64
+    return ((0, checksum), (checksum + 4, security), (security + 8, certificate))
+
+
+def _pe_stream_sha256(stream: BinaryIO) -> str | None:
+    """Hash PE image ranges on an open file, seeking without closing the handle."""
+    try:
+        ranges = _pe_image_ranges(stream)
+        digest = hashlib.sha256()
+        for start, stop in ranges:
+            stream.seek(start)
+            remaining = stop - start
+            while remaining:
+                block = stream.read(min(remaining, 1048576))
+                if not block:
+                    raise ValueError("pe_short_read")
+                digest.update(block)
+                remaining -= len(block)
+        return digest.hexdigest()
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def pe_image_sha256(path: Path) -> str | None:
+    """Hash a PE with a layout-valid terminal certificate-table range, in 1 MiB reads.
+
+    Return None for unsupported, ambiguous, truncated or unreadable files,
+    including files without a certificate table. Certificate contents, signature
+    validity and signer identity are not checked. The checksum, certificate
+    directory entry and certificate range are not protected by image identity.
+    The candidate is neither executed nor modified.
+    """
+    try:
+        with path.open("rb") as stream:
+            return _pe_stream_sha256(stream)
+    except (OSError, ValueError):
+        return None
+
+
 def _prepare_catalog(
     route: CodexCliRouteConfig, directory: Path, *, seconds: float, diagnostics: dict | None = None
 ) -> Path:
+    deadline = time.monotonic() + seconds
     with route.executable.open("rb") as stream:
+        # Both identities use this handle; the later launch still uses the executable path.
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    if digest != route.executable_sha256 or digest not in VERIFIED_BINARIES:
-        raise AuxiliaryModelError("codex_unverified_binary")
+        if digest != route.executable_sha256 or (
+            digest not in VERIFIED_BINARIES and _pe_stream_sha256(stream) not in VERIFIED_PE_IMAGES
+        ):
+            raise AuxiliaryModelError("codex_unverified_binary")
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise AuxiliaryModelError("timeout")
     # Bundled catalog is embedded public model metadata, not account/auth data.
     code, raw = _run(
         [str(route.executable), "debug", "models", "--bundled"],
@@ -546,7 +653,12 @@ def _prepare_state(
     for feature in _DISABLED:
         command += ["--disable", feature]
     code, _ = _run(
-        command, cwd=directory, prompt=b"", seconds=min(seconds, 5.0), diagnostics=diagnostics, environment=environment
+        command,
+        cwd=directory,
+        prompt=b"",
+        seconds=min(seconds, STATE_INIT_TIMEOUT_SECONDS),
+        diagnostics=diagnostics,
+        environment=environment,
     )
     try:
         (state_db,) = (directory / "state").glob("state_*.sqlite")
