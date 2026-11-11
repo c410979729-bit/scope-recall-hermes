@@ -29,9 +29,13 @@ scope-recall memory instruction-set --scope SCOPE-ID --text "Remember decisions 
 
 Instructions are limited to 2,000 characters and affect later extraction only.
 They cannot relax credential filtering, private mode, injection protection or
-evidence checks. Source messages remain searchable. Each request counts the
-instruction against its input budget; if the whole instruction does not fit,
-the request omits it and records `scope_instruction_omitted_input_budget`.
+evidence checks. Source messages remain searchable. Each extraction request
+counts the instruction against its input budget, and the worker sends fewer
+messages at a time, or a shorter page of a long message, to leave room for it.
+An instruction may take at most half of the room the extraction rules leave:
+one of up to about 1,650 UTF-8 bytes (about 550 Chinese characters) reaches
+every request, and a request without room for a longer one omits it and records
+`scope_instruction_omitted_input_budget`.
 
 ```sh
 scope-recall private on --session SESSION-ID --mode full --root /path/to/store

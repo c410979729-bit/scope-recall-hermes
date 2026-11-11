@@ -500,7 +500,10 @@ def process_consolidate(
         rootless_source = (
             checkpoint is None and source is not None and source_origin(source) not in DERIVATION_ROOT_ORIGINS
         )
-        read = _read_batch(tx, item, clock) if checkpoint is None and not rootless_source else None
+        instruction = _memory_instruction(tx, source.scope_id) if source is not None else None
+        # The batch is sized with the instruction it will be sent with.
+        with using_memory_instruction(instruction):
+            read = _read_batch(tx, item, clock) if checkpoint is None and not rootless_source else None
         entry_paused = source is not None and sources_paused(tx, (source,))
     if entry_paused:
         return hold_for_entry_state(storage, clock, context, item, started=started, budget=budget)
@@ -510,13 +513,29 @@ def process_consolidate(
         return finalize_work(
             storage, clock, context, item, "obsolete", NO_DERIVATION_ROOT_REASON, started=started, budget=budget
         )
-    return _process_ordinary(
-        storage, clock, context, item, (read, feedback), model=model, started=started, budget=budget
+    with using_memory_instruction(instruction):
+        return _process_ordinary(
+            storage, clock, context, item, (read, feedback), model=model, started=started, budget=budget
+        )
+
+
+def _memory_instruction(tx, scope_id: str) -> str | None:
+    """The scope's latest owner memory instruction, read in the snapshot its batch is read in."""
+    row = (
+        tx._check()
+        .execute(
+            "SELECT text FROM scope_memory_instructions WHERE scope_id=? ORDER BY version DESC LIMIT 1", (scope_id,)
+        )
+        .fetchone()
     )
+    return row[0] if row else None
 
 
 def _process_ordinary(storage, clock, context, item, prepared, *, model, started, budget):
-    """Run ordinary consolidation independently of any pending adoption stage."""
+    """Run ordinary consolidation independently of any pending adoption stage.
+
+    The caller binds the scope's memory instruction, so a long source's pages
+    are sized with it as well as the batch."""
     read, feedback = prepared
     finish = partial(finalize_work, storage, clock, context, item, started=started, budget=budget)
     # Do not open a write transaction while the read transaction above is
@@ -544,20 +563,7 @@ def _process_ordinary(storage, clock, context, item, prepared, *, model, started
             return hold_for_private_mode(storage, clock, context, item, started=started, budget=budget)
         if sources_paused_now(storage, context, roots, remaining_seconds=budget_left(started, clock, budget)):
             return hold_for_entry_state(storage, clock, context, item, started=started, budget=budget)
-        with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
-            row = (
-                tx._check()
-                .execute(
-                    "SELECT text FROM scope_memory_instructions WHERE scope_id=? ORDER BY version DESC LIMIT 1",
-                    (source.scope_id,),
-                )
-                .fetchone()
-            )
-            instruction = row[0] if row else None
-        with (
-            using_memory_instruction(instruction),
-            private.using_outbound_check(lambda: private.outbound_blocked(storage, clock, context, sources=roots)),
-        ):
+        with private.using_outbound_check(lambda: private.outbound_blocked(storage, clock, context, sources=roots)):
             raw = model.propose(
                 roots, episode_ref=episode_ref, remaining_seconds=budget_left(started, clock, budget), **repair
             )
