@@ -316,6 +316,7 @@ _NON_ACTIONABLE_GAPS = frozenset(
         "owner_words_from_host_request",
         "owner_words_unchecked",
         "owner_words_with_client_reminder",
+        "summary_partial",
         "vector_threshold_unconfigured",
         "work_failed_terminal_only",
         "work_needs_review",

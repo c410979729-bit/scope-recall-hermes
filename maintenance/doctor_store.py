@@ -434,6 +434,21 @@ def _derived_progress(report, transaction, binding):
         ).fetchone()[0],
     )
     report.summaries = dict(conn.execute("SELECT state,count(*) FROM summary_groups GROUP BY state"))
+    total = sum(report.summaries.values())
+    partial = report.summaries.get("partial", 0)
+    reasons = dict(
+        conn.execute(
+            "SELECT COALESCE(failure, '(unknown)'),count(*) FROM summary_groups WHERE state='partial' "
+            "GROUP BY COALESCE(failure, '(unknown)') ORDER BY 1"
+        )
+    )
+    report.summaries["partial_failures"] = reasons
+    if partial:
+        attention = partial >= 20 and partial * 10 > total
+        if attention:
+            report.capability_gaps.append("summary_partial")
+        detail = ", ".join(f"{reason}={count}" for reason, count in reasons.items())
+        record_check(report, "summaries", "attention" if attention else "partial", detail)
     report.summaries["importance_pending"] = conn.execute(
         "SELECT count(*) FROM claims WHERE importance_assigned=0"
     ).fetchone()[0]
