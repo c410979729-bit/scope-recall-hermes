@@ -15,6 +15,7 @@ from scope_recall.adapters.clients import CodexHookHandler
 from scope_recall.adapters.clients.config import load_shared_client
 from scope_recall.adapters.clients.identity import trusted_context
 from scope_recall.adapters.clients.mcp_server import CodexMCPServer
+from scope_recall.adapters.hermes.authorization import build_ingress_authorizer
 from scope_recall.adapters.hermes.installation import build_installation_manifest
 from scope_recall.adapters.hermes.shared_entries import (
     attach_shared_entry,
@@ -25,6 +26,7 @@ from scope_recall.adapters.hermes.shared_entries import (
     write_shared_payload,
 )
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.capture_inbox import replay_inbox
 
 HOSTS = ("codex", "claude-code", "workbuddy", "dsh")
 
@@ -156,6 +158,32 @@ class ScenarioStore:
             request_context(session), "1.1", query, mode, 10, budget, request_id=f"TEST-{uuid4().hex}"
         )
         return dict(output=value, ms=(time.perf_counter() - started) * 1000)
+
+    def flush_captures(self, host="codex", *, session=None):
+        """Commit this fixture's queued captures before sending a dependent turn.
+
+        The worker drain does not replay ingress. Keep replay outside the hook's
+        deadline and use the shared store's real authorization checks.
+        """
+        core, deadline = self.hooks[host].core, time.monotonic() + 120
+        context = self.context(host, session)
+        authorize = build_ingress_authorizer(core.storage.binding)
+        receipts = []
+        while self.rows(
+            "SELECT token FROM capture_inbox WHERE json_extract(payload_json,'$.context.entry_id')=? "
+            "AND project_id IS ? AND branch_id IS ?",
+            (context.entry_id, context.project_id, context.branch_id),
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"capture replay did not settle: {receipts}")
+            replayed = replay_inbox(
+                core.storage, self.clock, context, authorize=authorize, remaining_seconds=min(20, remaining)
+            )
+            receipts.extend(str(receipt) for receipt in replayed)
+            if not replayed:
+                raise AssertionError(f"capture replay made no progress: {receipts}")
+        return receipts
 
     def rows(self, sql="SELECT * FROM source_events", args=()):
         """Read fixture truth for provenance checks; SQL is authored by tests only."""
