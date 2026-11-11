@@ -10,6 +10,27 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import datetime
+
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%Y年%m月%d日",
+    "%B %d, %Y",
+    "%b %d, %Y",
+)
+
+
+def date_value(text: str) -> tuple[int, int, int] | None:
+    """Read a complete year/month/day value without inferring missing calendar components."""
+    for form in _DATE_FORMATS:
+        try:
+            date = datetime.strptime(text.strip(), form)
+            return (date.year, date.month, date.day)
+        except ValueError:
+            continue
+    return None
+
 
 _FUTURE_RE = re.compile(
     r"(?:\b(?:will|shall|next\s+(?:day|week|month|year|summer|winter|spring|fall|autumn)|"

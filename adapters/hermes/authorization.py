@@ -1,11 +1,14 @@
-"""Hermes-owned authorization for durable ingress replay."""
+"""What a worker asks of the host's installation: authorization for durable ingress replay, and which principals
+are a shared store's owner."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from functools import partial
 
-from scope_recall.contracts import ContractError, InstanceBinding
+from scope_recall.contracts import ContractError, InstanceBinding, SourcePrincipal
 
+from ..host_identity import entry_owner
 from .identity import HermesRuntimeScope, resolve_runtime_audience
 from .installation import (
     HermesIdentityError,
@@ -62,4 +65,17 @@ def build_ingress_authorizer(binding: InstanceBinding) -> Callable[[object], fro
     return authorize
 
 
-__all__ = ["build_ingress_authorizer"]
+def build_owner_proof(binding: InstanceBinding) -> Callable[[str, SourcePrincipal | None, dict], str | None] | None:
+    """A shared store's ownership proof for work that runs outside any host session.
+
+    It is what a host's context carries as ``owner_resolver``: for an entry's verified speaker it names the store's
+    owner when that entry's grants approve the principal as the owner's, read from the store's current manifest at
+    each request (``host_identity.entry_owner``).  ``None`` for a store of one installation, whose sources name
+    no entry.
+    """
+    if not isinstance(binding, InstanceBinding):
+        raise TypeError("binding must be InstanceBinding")
+    return partial(entry_owner, binding) if binding.installation_kind == "shared" else None
+
+
+__all__ = ["build_ingress_authorizer", "build_owner_proof"]

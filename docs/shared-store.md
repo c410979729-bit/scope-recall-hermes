@@ -351,6 +351,24 @@ return an instance to its own store, detach it, rename `scope-recall.local-backu
 `scope-recall`, install the package version that store was last opened with, re-enable its
 autostart and start its gateway.
 
+## One owner, several entries
+
+Each entry, and each surface of a Hermes entry, names the owner by a principal of its own. The store's manifest
+approves those principals as one person's. Within the same authorized scope, a correction that can be recognized as
+the same fact can become its next version, preserving the earlier value as history. First-person subjects remain
+bound to each entry's original principal, so first-person facts across entries currently remain separate. Existing
+split facts are not automatically merged. The shared
+worker reads the approvals from the manifest each time it orders a new statement against a stored one. A principal
+no entry approves as the owner's is somebody else, and that person's differing statement stays a proposal beside the
+fact (`different_source_principal`).
+
+`local` attests the running account or the user of an approved surface, not a natural person. People sharing one
+system account, container, or remote desktop with that account are treated as the same owner.
+
+These corrections are stated in conversation and take effect through background consolidation. On a Hermes entry,
+the `revise` and `forget` tools remain available only at the CLI; Desktop, TUI, gateway routes and A2A peers cannot
+use them.
+
 ## Repeated evidence in recall
 
 Automatic injection and current lookups prefer a matching first-hand statement or

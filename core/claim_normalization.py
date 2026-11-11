@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 
-from .claims import evidence_context, rejects_other_value
+from ..contracts import SourcePrincipal
+from .claims import effective_origin, evidence_context, rejects_other_value, verified_human_ref
 from .source_qualification import AUTHORITY_QUESTION, CONDITIONAL, REPORTED_SPEECH, UNASSERTED_UNCERTAINTY
 
 PROJECT_TAG = re.compile(r"项目[【\[][^【】\[\]\n]{1,120}[】\]]")
@@ -192,18 +196,44 @@ def expand_frames(proposal, roots):
     return result
 
 
-def human_owner(roots):
-    owners = {
-        (r.source_principal or {}).get("principal_ref")
-        for r in roots
-        if r.origin == "human_direct" and (r.source_principal or {}).get("resolution") == "verified"
-    }
+#: Ownership resolves identities only; it grants neither source access nor permission to mutate memory.
+OwnerProof = Callable[[str, SourcePrincipal | None, dict], str | None]
+_PASS_OWNER_PROOF: ContextVar[OwnerProof | None] = ContextVar("pass_owner_proof", default=None)
+
+
+@contextmanager
+def using_owner_proof(proof: OwnerProof | None):
+    """Supply a store's manifest proof to claim ordering in this worker pass, restoring it on exit."""
+    token = _PASS_OWNER_PROOF.set(proof)
+    try:
+        yield
+    finally:
+        _PASS_OWNER_PROOF.reset(token)
+
+
+def human_owner(roots, *, tx=None, memo=None):
+    """Return one verified speaker, resolving approved entry principals to their shared owner when a transaction
+    supplies a proof. Attested imports retain their original speaker; mixed or missing identities stay unknown.
+    Without a transaction the result remains the literal principal used for first-person subject binding.
+    """
+    proof = (tx.context.owner_resolver or _PASS_OWNER_PROOF.get()) if tx is not None else None
+    memo = {} if memo is None else memo
+    owners = set()
+    for root in roots:
+        if effective_origin(root) != "human_direct":
+            continue
+        person = verified_human_ref(root)
+        owner = None
+        if proof is not None and tx is not None and person is not None:
+            source = tx.source(root.ref, root.revision)
+            owner = proof(source.entry_id, root.source_principal, memo) if source is not None else None
+        owners.add(owner or person)
     return next(iter(owners)) if len(owners) == 1 and None not in owners else None
 
 
 def source_order(tx, roots):
     """Trusted ingestion order for live human sources with unknown event time."""
-    if not roots or any(r.origin != "human_direct" for r in roots) or human_owner(roots) is None:
+    if not roots or any(r.origin != "human_direct" for r in roots) or human_owner(roots, tx=tx) is None:
         return None
     rows = [
         tx._check()
