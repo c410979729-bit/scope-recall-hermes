@@ -201,7 +201,14 @@ def test_catalog_manifest_declares_hooks_and_pinned_core():
         assert "provides_hooks" in value and "hooks" not in value
     value = yaml.safe_load((root / "distribution/hermes/plugin.yaml").read_text("utf-8"))
     assert value["requires_hermes"] == ">=0.22.5"
-    assert value["pip_dependencies"] == [f"hermes-scope-recall[vectors]=={__version__}"]
+    if ".dev" in __version__:
+        import re
+
+        expected = str(value["version"])
+        assert re.fullmatch(r"\d+\.\d+\.\d+", expected)
+    else:
+        expected = __version__
+    assert value["pip_dependencies"] == [f"hermes-scope-recall[vectors]=={expected}"]
 
 
 @pytest.mark.parametrize("child", ["  honcho:\n    enabled: true\n", "  values:\n    - a\n", "  prompt: |\n    TEST\n"])

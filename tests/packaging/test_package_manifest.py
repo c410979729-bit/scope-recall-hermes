@@ -80,15 +80,35 @@ def test_stamping_a_manifest_preserves_everything_else(tmp_path):
     assert stamped == "name: scope-recall\nversion: 9.9.9-rc.1\ndescription: unchanged\n"
     with pytest.raises(RuntimeError):
         inventory.stamped_manifest("name: no-version-line\n", "9.9.9rc1")
+    assert inventory.stamped_manifest("version: 1.0.0\r\nname: example\r\n", "2.0.0") == (
+        "version: 2.0.0\r\nname: example\r\n"
+    )
 
 
-def test_core_dependency_pin_is_stamped_and_checked(tmp_path):
+def _version_tree(tmp_path, version):
     import shutil
 
     for relative in (*inventory.PLUGIN_MANIFESTS, "_version.py", "packaging/v11-module-allowlist.json"):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO_ROOT / relative, target)
+    (tmp_path / "_version.py").write_text(f'__version__ = "{version}"\n', encoding="utf-8")
+    adapter = tmp_path / "adapters/hermes/plugin.yaml"
+    adapter.write_text(inventory.stamped_manifest(adapter.read_text("utf-8"), "4.0.3"), encoding="utf-8")
+    catalog = tmp_path / "distribution/hermes/plugin.yaml"
+    catalog.write_text(
+        inventory.stamped_manifest(catalog.read_text("utf-8"), "4.0.3", core_dependency=True), encoding="utf-8"
+    )
+    allowlist = tmp_path / "packaging/v11-module-allowlist.json"
+    listed = json.loads(allowlist.read_text("utf-8"))
+    listed["package_version"] = "4.0.3"
+    allowlist.write_text(json.dumps(listed), encoding="utf-8")
+
+
+@pytest.mark.parametrize("version", ["4.0.4.dev0", "4.0.4"])
+def test_core_dependency_pin_is_stamped_and_checked(tmp_path, version):
+    _version_tree(tmp_path, version)
+    inventory.write_all(tmp_path)
     path = tmp_path / "distribution/hermes/plugin.yaml"
     text = path.read_text("utf-8")
     path.write_text(text.replace("hermes-scope-recall[vectors]==", "hermes-scope-recall[vectors]==0"), encoding="utf-8")
@@ -97,6 +117,55 @@ def test_core_dependency_pin_is_stamped_and_checked(tmp_path):
     assert not inventory.stale_version_files(tmp_path)
     stamped = inventory.stamped_manifest(text, "9.8.7", core_dependency=True)
     assert "version: 9.8.7\n" in stamped and "hermes-scope-recall[vectors]==9.8.7" in stamped
+
+
+def test_development_stamps_keep_the_released_catalog_manifest(tmp_path):
+    _version_tree(tmp_path, "4.0.4.dev0")
+    path = tmp_path / "distribution/hermes/plugin.yaml"
+    original = path.read_bytes()
+    changed = inventory.write_all(tmp_path)
+    assert path.read_bytes() == original
+    assert set(changed) == {"adapters/hermes/plugin.yaml", "packaging/v11-module-allowlist.json"}
+    assert not inventory.stale_version_files(tmp_path)
+    assert "version: 4.0.4-dev.0\n" in (tmp_path / "adapters/hermes/plugin.yaml").read_text("utf-8")
+    assert (
+        json.loads((tmp_path / "packaging/v11-module-allowlist.json").read_text("utf-8"))["package_version"]
+        == "4.0.4.dev0"
+    )
+
+
+def test_development_stamps_repair_catalog_pin_from_its_release_version(tmp_path):
+    _version_tree(tmp_path, "4.0.4.dev0")
+    path = tmp_path / "distribution/hermes/plugin.yaml"
+    original = path.read_text("utf-8")
+    path.write_text(
+        original.replace("hermes-scope-recall[vectors]==4.0.3", "hermes-scope-recall[vectors]==0.0.0"), encoding="utf-8"
+    )
+    assert "distribution/hermes/plugin.yaml" in inventory.stale_version_files(tmp_path)
+    inventory.write_all(tmp_path)
+    assert path.read_text("utf-8") == original
+    assert not inventory.stale_version_files(tmp_path)
+
+
+def test_development_stamps_report_but_do_not_guess_invalid_catalog_version(tmp_path):
+    _version_tree(tmp_path, "4.0.4.dev0")
+    path = tmp_path / "distribution/hermes/plugin.yaml"
+    text = path.read_text("utf-8").replace("version: 4.0.3", "version: 4.0.4-dev.0")
+    path.write_text(text, encoding="utf-8")
+    reason = inventory.stale_version_files(tmp_path)["distribution/hermes/plugin.yaml"]
+    assert "release" in reason.lower()
+    assert "distribution/hermes/plugin.yaml" not in inventory.write_all(tmp_path)
+    assert path.read_text("utf-8") == text
+
+
+def test_release_stamps_catalog_to_source_version(tmp_path):
+    _version_tree(tmp_path, "4.0.4")
+    path = tmp_path / "distribution/hermes/plugin.yaml"
+    assert "distribution/hermes/plugin.yaml" in inventory.stale_version_files(tmp_path)
+    assert "distribution/hermes/plugin.yaml" in inventory.write_all(tmp_path)
+    assert "version: 4.0.4\n" in path.read_text("utf-8")
+    assert "hermes-scope-recall[vectors]==4.0.4" in path.read_text("utf-8")
+    assert not inventory.stale_version_files(tmp_path)
 
 
 # --------------------------------------------------------------------------

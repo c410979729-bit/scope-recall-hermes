@@ -13,8 +13,8 @@ list somebody retypes.  The safety property holds -- a stray module still
 cannot enter the wheel silently, because it can only enter by being imported
 from an entry point, and the diff is shown to a human either way.
 
-The same reasoning covers the version string, which four files carry.
-``_version.py`` is the source; everything else is stamped from it.
+``_version.py`` supplies the version stamps. During development the catalog
+manifest keeps a released core so default-branch installs can resolve it.
 
 Not responsible for: building the wheel (``packaging_hooks/v11_build.py``) or
 deciding what the entry points are -- that list is right here, in the open,
@@ -28,7 +28,7 @@ import json
 import re
 from pathlib import Path
 
-from _version import manifest_version
+from _version import manifest_version, stamp_manifest_version
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST_PATH = REPO_ROOT / "packaging" / "v11-module-allowlist.json"
@@ -58,7 +58,8 @@ ENTRY_POINTS = (
     "runtime/worker_watchdog.py",
 )
 
-#: Files whose version line is stamped from ``_version.py``, in the spelling of ``manifest_version``.
+#: Manifests whose version line is stamped in the spelling of ``manifest_version``: the adapter's always from
+#: ``_version.py``, the catalog's from it too except during development (``expected_manifest``).
 PLUGIN_MANIFESTS = ("adapters/hermes/plugin.yaml", "distribution/hermes/plugin.yaml")
 
 
@@ -175,15 +176,7 @@ def expected_allowlist(repo_root: Path | None = None) -> dict:
 
 def stamped_manifest(text: str, version: str, *, core_dependency: bool = False) -> str:
     """Stamp the host SemVer derived from the distribution version, preserving other fields."""
-    lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if line.startswith("version:"):
-            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
-            lines[index] = f"version: {manifest_version(version)}{ending}"
-            break
-    else:
-        raise RuntimeError("plugin manifest has no version line")
-    stamped = "".join(lines)
+    stamped = stamp_manifest_version(text, version)
     pattern = r"(?m)^pip_dependencies:\r?\n(?:[ \t]+[^\n]*\n?)*"
     if core_dependency or re.search(pattern, stamped):
         dependency = f'pip_dependencies:\n  - "hermes-scope-recall[vectors]=={version}"\n'
@@ -195,14 +188,32 @@ def stamped_manifest(text: str, version: str, *, core_dependency: bool = False) 
     return stamped
 
 
+def expected_manifest(text: str, version: str, relative: str) -> str | None:
+    """Return the required manifest, or None when the catalog release cannot be determined.
+
+    Hermes installs the catalog directory from the default branch, so its core
+    must remain a published release while the source version is in development.
+    """
+    catalog = relative == "distribution/hermes/plugin.yaml"
+    if catalog and ".dev" in version:
+        match = re.search(r"(?m)^version: (\d+\.\d+\.\d+)\r?$", text)
+        if not match:
+            return None
+        version = match.group(1)
+    return stamped_manifest(text, version, core_dependency=catalog)
+
+
 def stale_version_files(repo_root: Path | None = None) -> dict[str, str]:
-    """Files whose stamped version no longer matches ``_version.py``."""
+    """Report stamps that do not follow the source and released catalog rules."""
     root = repo_root or REPO_ROOT
     version = source_version(root)
     stale: dict[str, str] = {}
     for relative in PLUGIN_MANIFESTS:
         text = (root / relative).read_text(encoding="utf-8")
-        if text != stamped_manifest(text, version, core_dependency=relative == "distribution/hermes/plugin.yaml"):
+        expected = expected_manifest(text, version, relative)
+        if expected is None:
+            stale[relative] = "during development the catalog manifest must keep the latest release version"
+        elif text != expected:
             stale[relative] = "version or core dependency pin differs"
     listed = json.loads((root / "packaging" / "v11-module-allowlist.json").read_text(encoding="utf-8"))
     if listed.get("package_version") != version:
@@ -218,8 +229,8 @@ def write_all(repo_root: Path | None = None) -> list[str]:
     for relative in PLUGIN_MANIFESTS:
         path = root / relative
         text = path.read_text(encoding="utf-8")
-        stamped = stamped_manifest(text, version, core_dependency=relative == "distribution/hermes/plugin.yaml")
-        if stamped != text:
+        stamped = expected_manifest(text, version, relative)
+        if stamped is not None and stamped != text:
             path.write_text(stamped, encoding="utf-8", newline="\n")
             changed.append(relative)
     allowlist_path = root / "packaging" / "v11-module-allowlist.json"
@@ -239,6 +250,7 @@ __all__ = [
     "PLUGIN_MANIFESTS",
     "REPO_ROOT",
     "expected_allowlist",
+    "expected_manifest",
     "manifest_version",
     "reachable_modules",
     "reachable_packages",

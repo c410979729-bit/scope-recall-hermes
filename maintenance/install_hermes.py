@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 from packaging.version import Version
-from scope_recall._version import __version__
+from scope_recall._version import __version__, stamp_manifest_version
 from scope_recall.adapters.hermes.audiences import (
     LOCAL_PLATFORMS,
     HermesIdentityError,
@@ -205,7 +205,7 @@ def adoptable_wrapper_files(target: Path) -> set[Path]:
 
 
 def wrapper_manifest(template: str, version: str = __version__) -> str:
-    """The wrapper's ``plugin.yaml``: the template, plus the core it runs on when that is a release on PyPI.
+    """Stamp the wrapper's own version and declare its core when that is a release on PyPI.
 
     Hermes Desktop rebuilds the Python environment it runs plugins in on updates, dropping a core installed
     there by hand, and Hermes installs what a memory provider's manifest declares
@@ -214,6 +214,7 @@ def wrapper_manifest(template: str, version: str = __version__) -> str:
     pre-release, development or local build declares no ``pip_dependencies`` here; its home plugin's
     ``pyproject.toml`` pins the build and its wheel source must be supplied during environment sync.
     """
+    template = stamp_manifest_version(template, version)
     if _non_pypi_version(version):
         return re.sub(r"(?m)^pip_dependencies:\r?\n(?:[ \t]+[^\n]*\n?)*", "", template)
     return template

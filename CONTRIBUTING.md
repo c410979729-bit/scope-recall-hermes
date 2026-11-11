@@ -138,7 +138,8 @@ commands are described in [Memory benchmarks](docs/benchmarks.md).
 
 - Wheels are built from a tagged commit on `main` (`v<major>.<minor>.<patch>`),
   one wheel and one sha256 per tag. The first commit after a tag moves
-  `_version.py` past it.
+  `_version.py` past it. During development, the default-branch Hermes catalog
+  manifest keeps the latest released core so its installation can resolve it.
 - Changes that belong together ship as one release once all of them are done
   and verified. A fix a user is waiting for goes out as one pull request with
   the fix, the version and its notes, and is tagged without a release candidate.
