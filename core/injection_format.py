@@ -25,7 +25,11 @@ def _summary(text):
     return text[:160] + ("... [summary]" if len(text) > 160 else "")
 
 
-def _content(item):
+def item_content(item):
+    """Return readable content from a recall item with ``kind`` and ``content`` keys.
+
+    Claim and procedure JSON objects use ordered fields; other content is returned unchanged.
+    """
     text = item["content"]
     if item["kind"] in {"claim", "procedure"}:
         try:
@@ -47,7 +51,7 @@ def question(payload, style):
     """Project canonical items without changing their identities, times or source labels."""
     lines = ["Recalled memory (" + style + "; inspect references for full content):"]
     for item in payload["items"]:
-        content = _content(item)
+        content = item_content(item)
         if style == "outline":
             content = _summary(content)
         identity = f"{item['ref']}@{item['revision']}"
@@ -122,6 +126,6 @@ def notice(value, style):
     if style == "json":
         return value["text"]
     _ref, _, message = value["text"].partition(": ")
-    if style == "outline" and value["corrected"]:
+    if style == "outline" and value["corrected"] and not value.get("_statement"):
         message = _summary(message)
     return notice_prefix(value, style) + _line(message)
