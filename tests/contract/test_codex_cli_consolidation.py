@@ -13,6 +13,8 @@ from contextlib import closing
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from scope_recall.contracts import InstanceBinding
@@ -58,6 +60,96 @@ def events(text="{}", inputs=100, outputs=20):
 def fake_catalog(monkeypatch):
     monkeypatch.setattr(cli, "_prepare_catalog", lambda r, p, **kw: p / "catalog.json")
     monkeypatch.setattr(cli, "_prepare_state", lambda r, p, **kw: None)
+
+
+def test_pre_spawn_deadline_exhaustion_settles_zero_through_propose(tmp_path, monkeypatch):
+    fake_catalog(monkeypatch)
+    account = ledger(tmp_path)
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: clock.now))
+
+    def prepare(*args, **kwargs):
+        clock.now = 105.9
+
+    original_reserve = account.reserve
+
+    def reserve_after_wait(*args, **kwargs):
+        request_id = original_reserve(*args, **kwargs)
+        # Committing the real reservation consumes the remaining spawn margin.
+        clock.now += 0.2
+        return request_id
+
+    monkeypatch.setattr(cli, "_prepare_state", prepare)
+    monkeypatch.setattr(account, "reserve", reserve_after_wait)
+    spawn = Mock(side_effect=AssertionError("model process must not start"))
+    monkeypatch.setattr(cli.subprocess, "Popen", spawn)
+    adapter = cli.CodexCliConsolidationAdapter(route(), ledger=account)
+    with pytest.raises(AuxiliaryModelError, match="^timeout$") as caught:
+        adapter.propose([dict(role="user", content="synthetic")], remaining_seconds=10)
+    spawn.assert_not_called()
+    assert account.status()["daily_calls"] == 1
+    assert account.status()["input_tokens"] == 0
+    assert account.status()["output_tokens"] == 0
+    assert caught.value.request_not_sent is True
+    with closing(sqlite3.connect(account.path)) as db:
+        assert db.execute(
+            "SELECT status,reserved_input,reserved_output,actual_input,actual_output FROM codex_subscription_requests"
+        ).fetchall() == [("request_not_sent", 32768, 8192, 0, 0)]
+
+
+def test_spawn_failure_settles_zero_through_propose(tmp_path, monkeypatch):
+    fake_catalog(monkeypatch)
+    account = ledger(tmp_path)
+    spawn = Mock(side_effect=OSError("synthetic spawn failure"))
+    monkeypatch.setattr(cli.subprocess, "Popen", spawn)
+    adapter = cli.CodexCliConsolidationAdapter(route(), ledger=account)
+    with pytest.raises(AuxiliaryModelError, match="^codex_start_failed$"):
+        adapter.propose([dict(role="user", content="synthetic")], remaining_seconds=10)
+    spawn.assert_called_once()
+    assert account.status()["daily_calls"] == 1
+    assert account.status()["input_tokens"] == 0
+    assert account.status()["output_tokens"] == 0
+    with closing(sqlite3.connect(account.path)) as db:
+        assert db.execute("SELECT status,actual_input,actual_output FROM codex_subscription_requests").fetchall() == [
+            ("request_not_sent", 0, 0)
+        ]
+
+
+def test_post_spawn_timeout_retains_reservation_through_propose(tmp_path, monkeypatch):
+    fake_catalog(monkeypatch)
+    account = ledger(tmp_path)
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=time.sleep))
+    original_spawn = subprocess.Popen
+    processes = []
+
+    def spawn(command, **kwargs):
+        process = original_spawn([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        processes.append(process)
+        # The model deadline expires only after Popen returned an owned child.
+        clock.now = 107.0
+        return process
+
+    monkeypatch.setattr(cli.subprocess, "Popen", spawn)
+    adapter = cli.CodexCliConsolidationAdapter(route(), ledger=account)
+    try:
+        with pytest.raises(AuxiliaryModelError, match="^timeout$") as caught:
+            adapter.propose([dict(role="user", content="synthetic")], remaining_seconds=10)
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert caught.value.request_not_sent is False
+        assert account.status()["daily_calls"] == 1
+        assert account.status()["input_tokens"] == 32768
+        assert account.status()["output_tokens"] == 8192
+        with closing(sqlite3.connect(account.path)) as db:
+            assert db.execute(
+                "SELECT status,actual_input,actual_output FROM codex_subscription_requests"
+            ).fetchall() == [("timeout_usage_unknown_reserved", None, None)]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
 
 
 def test_success_stdin_isolation_and_per_pass_budget(tmp_path, monkeypatch):

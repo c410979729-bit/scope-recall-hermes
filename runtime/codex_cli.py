@@ -427,18 +427,23 @@ def _run(
         exit_code=None,
     )
     if seconds <= 0:
-        raise AuxiliaryModelError("timeout")
+        raise AuxiliaryModelError("timeout", request_not_sent=True)
     require_outbound()
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=_child_env() if environment is None else environment,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=os.name != "nt",
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=_child_env() if environment is None else environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name != "nt",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        # Popen failed before a child existed; later process/pipe failures do
+        # not prove that the upstream request was never executed.
+        raise AuxiliaryModelError("codex_start_failed", request_not_sent=True) from exc
     job = _job_for(process)
     inspector = _StreamInspector(diag)
     readers = [
@@ -750,7 +755,12 @@ class CodexCliConsolidationAdapter:
             if request_id is not None:
                 try:
                     breached = self.ledger.finish(
-                        request_id, status, usage, timeout_seconds=max(0.001, deadline - time.monotonic())
+                        request_id,
+                        "request_not_sent"
+                        if isinstance(pending, AuxiliaryModelError) and pending.request_not_sent
+                        else status,
+                        usage,
+                        timeout_seconds=max(0.001, deadline - time.monotonic()),
                     )
                     if breached:
                         pending = AuxiliaryModelError("meter_breach")

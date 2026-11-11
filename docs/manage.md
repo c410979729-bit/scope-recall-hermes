@@ -1,5 +1,8 @@
 # Manage local memories
 
+For auxiliary model usage, diagnosis and explicit release of uncertain reservations, see
+[Auxiliary model budgets](auxiliary-budget.md).
+
 `scope-recall memory` is the local store owner's interface. The operating system account that can access the
 installation can use it. It does not call a model or a network service. Agent tools keep their existing scope and
 conversation-authorization checks; they do not expose this installation capability.

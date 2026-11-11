@@ -163,11 +163,7 @@ def check_vector_store(report: DoctorReport, config: Any, binding: InstanceBindi
 
 
 #: Fraction of any auxiliary ledger cap above which the instance is warned.
-#: The ledger's caps are lifetime totals, not a rolling window, so headroom only
-#: ever shrinks: once a cap is reached the derived layer stops for good and the
-#: only visible symptom is work quietly pausing with ``budget_exhausted``.
-#: Reporting the ratio turns "it stopped working one day" into something an
-#: operator can see coming.
+#: Pressure uses the configured period, including local calendar months.
 _LEDGER_PRESSURE_WARN = 0.90
 
 
@@ -895,12 +891,66 @@ def check_model_output(report: DoctorReport) -> None:
 
 
 def check_ledger(report: DoctorReport) -> None:
-    """A gap only once a lifetime cap is close enough to need action; the ratio
-    itself is always in ``ledger_headroom`` so it is visible long before that."""
+    """Report period pressure, uncertain charges and admission blocked by a cap."""
     ratio = report.ledger_headroom.get("worst_used_ratio") or 0
     if ratio >= _LEDGER_PRESSURE_WARN:
-        record_check(report, "auxiliary_ledger", "pressure", f"{ratio:.0%} of a lifetime cap")
+        record_check(report, "auxiliary_ledger", "pressure", f"{ratio:.0%} of a configured-period cap")
         report.capability_gaps.append("auxiliary_budget_pressure")
+    retained = report.ledger_headroom.get("retained_unknown", {})
+    if retained.get("requests"):
+        shares = ", ".join(
+            f"{name}={value:.1%}" for name, value in retained.get("cap_ratios", {}).items() if value is not None
+        )
+        record_check(
+            report,
+            "auxiliary_retained_unknown",
+            "retained",
+            f"{retained['requests']} requests; {retained['input_tokens']} input tokens; "
+            f"{retained['output_tokens']} output tokens; {retained['charge_micro_usd']} micro USD; {shares}. "
+            "Review scope-recall release-budget-reservations --config <runtime-config.json> "
+            "--before <ISO-timestamp-with-offset>; add --apply to accept billing risk and release.",
+        )
+    blocked = report.ledger_headroom.get("blocked_reservations", [])
+    if blocked:
+        report.capability_gaps.append("auxiliary_budget_exhausted")
+        details = "; ".join(f"{row['model']}: {', '.join(row['caps'])}" for row in blocked)
+        record_check(
+            report,
+            "auxiliary_ledger",
+            "exhausted",
+            f"Configured reservations cannot fit; requests are being refused ({details}). "
+            f"Retained unknown usage: {retained.get('requests', 0)} requests, "
+            f"{retained.get('input_tokens', 0)} input, {retained.get('output_tokens', 0)} output tokens, "
+            f"{retained.get('charge_micro_usd', 0)} micro USD; see auxiliary_retained_unknown for cap shares.",
+        )
+    _check_subscription_ledger(report)
+
+
+def _check_subscription_ledger(report: DoctorReport) -> None:
+    """Show unpriced CLI token reservations alongside API billing, with their own release selector."""
+    status = report.ledger_headroom.get("subscription", {})
+    retained = status.get("retained_unknown", {})
+    if retained.get("requests"):
+        shares = ", ".join(f"{name}={value:.1%}" for name, value in retained.get("cap_ratios", {}).items())
+        record_check(
+            report,
+            "subscription_retained_unknown",
+            "retained",
+            f"{retained['requests']} requests; {retained['input_tokens']} input tokens; "
+            f"{retained['output_tokens']} output tokens; unpriced; {shares}. "
+            "Review scope-recall release-budget-reservations --subscription --config <runtime-config.json> "
+            "--before <ISO-timestamp-with-offset>; add --apply to release.",
+        )
+    if status.get("blocked_reservations"):
+        report.capability_gaps.append("subscription_budget_exhausted")
+        record_check(
+            report,
+            "subscription_ledger",
+            "exhausted",
+            f"Requests are being refused by daily caps: {', '.join(status['blocked_reservations'])}; "
+            f"retained unknown usage: {retained.get('requests', 0)} requests, "
+            f"{retained.get('input_tokens', 0)} input and {retained.get('output_tokens', 0)} output tokens.",
+        )
 
 
 #: How many stored messages the owner never wrote the doctor names by ref.

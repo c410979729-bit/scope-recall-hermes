@@ -259,6 +259,7 @@ SUITES = {
         "tests/contract/test_a_pass_that_ends_hands_back_its_group.py",
         "tests/contract/test_settle_window_wake.py",
         "tests/contract/test_monthly_auxiliary_budget.py",
+        "tests/contract/test_budget_reservations.py",
     ],
     "storage": [
         "tests/contract/test_storage.py",

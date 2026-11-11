@@ -34,6 +34,11 @@ An initialized auxiliary budget database is required, created with `initialize_a
 
 ## Hard admission and soft token reservations
 
+Uncertain token reservations are visible in doctor and can be explicitly released for the current UTC day
+with `release-budget-reservations --subscription`. A failed process spawn settles to zero tokens; errors after
+spawn retain unknown usage. See [Auxiliary model budgets](auxiliary-budget.md) for preview, confirmation,
+cutoff and audit behavior. Call counts and meter-breach fences remain in force after a token release.
+
 | Boundary | Contract |
 | --- | --- |
 | Normal worker pass | At most one model invocation, shared by consolidation and candidate evaluation. A new pass gets a new local allowance; the durable daily ledger is not reset. |
