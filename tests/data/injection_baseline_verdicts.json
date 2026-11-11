@@ -1,0 +1,708 @@
+[
+  {
+    "id": "ignore_en",
+    "state": "quarantined",
+    "rules": [
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "ignore_zh",
+    "state": "quarantined",
+    "rules": [
+      "instruction_override_zh"
+    ]
+  },
+  {
+    "id": "override_en",
+    "state": "quarantined",
+    "rules": [
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "override_zh",
+    "state": "quarantined",
+    "rules": [
+      "instruction_override_zh"
+    ]
+  },
+  {
+    "id": "role",
+    "state": "quarantined",
+    "rules": [
+      "role_override"
+    ]
+  },
+  {
+    "id": "hidden",
+    "state": "quarantined",
+    "rules": [
+      "hidden_instruction",
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "hidden_div",
+    "state": "quarantined",
+    "rules": [
+      "hidden_instruction",
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "prompt_en",
+    "state": "quarantined",
+    "rules": [
+      "prompt_disclosure"
+    ]
+  },
+  {
+    "id": "prompt_zh",
+    "state": "quarantined",
+    "rules": [
+      "prompt_disclosure"
+    ]
+  },
+  {
+    "id": "send_en",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_en"
+    ]
+  },
+  {
+    "id": "send_zh",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_zh"
+    ]
+  },
+  {
+    "id": "mail_en",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_en"
+    ]
+  },
+  {
+    "id": "fullwidth",
+    "state": "quarantined",
+    "rules": [
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "unicode_ad",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_34f",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_61c",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_180e",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_200b",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_200e",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_200f",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_202a",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_202b",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_202c",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_202d",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_202e",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2060",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2061",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2062",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2063",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2064",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2066",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2067",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2068",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_2069",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_feff",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "unicode_e0061",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "preference_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "preference_en",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "link_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "link_en",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "ignore_color",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "ignore_color_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "history",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "history_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "send_design",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "send_design_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "emoji",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "emoji_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "arabic",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "indic",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "normal",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "normal_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "security",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "security_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "math",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "blank_lines",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "link_image",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "url_report",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "join_en",
+    "state": "quarantined",
+    "rules": [
+      "join_control_obfuscation"
+    ]
+  },
+  {
+    "id": "join_zh",
+    "state": "quarantined",
+    "rules": [
+      "join_control_obfuscation"
+    ]
+  },
+  {
+    "id": "curl_variable",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "curl_file",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "role_zh",
+    "state": "quarantined",
+    "rules": [
+      "role_override_zh"
+    ]
+  },
+  {
+    "id": "comment_zh",
+    "state": "quarantined",
+    "rules": [
+      "hidden_instruction",
+      "instruction_override_zh"
+    ]
+  },
+  {
+    "id": "curl_docs",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "wget_docs",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "external_en",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "external_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "unattributed",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "import_external",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "import_human",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "fullwidth_join",
+    "state": "quarantined",
+    "rules": [
+      "join_control_obfuscation"
+    ]
+  },
+  {
+    "id": "auth_header_en",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "auth_header_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "attack_quote_en",
+    "state": "pending_review",
+    "rules": [
+      "instruction_override_en",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "attack_quote_zh",
+    "state": "pending_review",
+    "rules": [
+      "instruction_override_zh",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "code_attack_en",
+    "state": "pending_review",
+    "rules": [
+      "exfiltration_link_en",
+      "quoted_instruction",
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "code_attack_zh",
+    "state": "pending_review",
+    "rules": [
+      "exfiltration_link_zh",
+      "quoted_instruction",
+      "instruction_override_zh"
+    ]
+  },
+  {
+    "id": "quoted_then_attack",
+    "state": "quarantined",
+    "rules": [
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "body_secret_with_header",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "send_zh_reverse",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_zh_reverse"
+    ]
+  },
+  {
+    "id": "flag_stray",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "flag_invalid",
+    "state": "quarantined",
+    "rules": [
+      "invisible_unicode"
+    ]
+  },
+  {
+    "id": "flag_gbeng",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "flag_gbsct",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "flag_gbwls",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "dense_security_discussion",
+    "state": "pending_review",
+    "rules": [
+      "instruction_override_en",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "attack_between_examples",
+    "state": "quarantined",
+    "rules": [
+      "instruction_override_en"
+    ]
+  },
+  {
+    "id": "execute_quote_en",
+    "state": "pending_review",
+    "rules": [
+      "instruction_override_en",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "execute_quote_zh",
+    "state": "pending_review",
+    "rules": [
+      "exfiltration_link_zh",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "form_file",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "form_file_attached",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "form_long",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "form_equals",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "data_binary_file",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "data_binary_equals",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command"
+    ]
+  },
+  {
+    "id": "post_file",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_command",
+      "exfiltration_link_en"
+    ]
+  },
+  {
+    "id": "normal_body",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "normal_body_zh",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "normal_form",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "normal_form_string",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "normal_auth_body",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "normal_fail_flag_auth_url",
+    "state": "clear",
+    "rules": []
+  },
+  {
+    "id": "quoted_long",
+    "state": "pending_review",
+    "rules": [
+      "instruction_override_en",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "quoted_long_overlap",
+    "state": "pending_review",
+    "rules": [
+      "instruction_override_en",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "quoted_single",
+    "state": "pending_review",
+    "rules": [
+      "instruction_override_en",
+      "quoted_instruction"
+    ]
+  },
+  {
+    "id": "wrapped_transfer_en",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_en"
+    ]
+  },
+  {
+    "id": "wrapped_transfer_zh",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_zh"
+    ]
+  },
+  {
+    "id": "inline_transfer_en",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_en"
+    ]
+  },
+  {
+    "id": "inline_transfer_zh",
+    "state": "quarantined",
+    "rules": [
+      "exfiltration_link_zh"
+    ]
+  }
+]

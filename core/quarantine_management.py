@@ -9,6 +9,7 @@ from dataclasses import replace
 
 from ..contracts import ContractError
 from .injection_guard import group_rows, notice, scan
+from .injection_policy import OWNER_QUOTE_SETTING, load_policy
 from .reflection_validity import reviewable_observation
 from .restore import maintenance_context
 from .source_admission import admit_source, observe_admitted
@@ -170,11 +171,13 @@ def _resume(tx, core, ref, revision):
     observe_admitted(tx, core.clock, sources)
 
 
-def release_source(core, authority, ref, revision, *, content_sha256):
+def release_source(core, authority, ref, revision, *, content_sha256, expected_state=None):
     """Release exactly the reviewed source version and record the owner's action atomically."""
     context = maintenance_context(core.storage, authority)
     with core.storage.write(context, remaining_seconds=10) as tx:
         view, row, held = _read_held(tx, ref, revision)
+        if expected_state is not None and held["state"] != expected_state:
+            raise ContractError("VERSION_CONFLICT", "source_state")
         if hashlib.sha256(row["content"].encode("utf-8")).hexdigest() != content_sha256:
             raise ContractError("VERSION_CONFLICT", "source_content")
         conn = view._check(write=True)
@@ -270,3 +273,26 @@ def finish_review(core, authority, ref, revision, *, content_sha256, approved):
             ),
         )
         return dict(state=state, action_id=action)
+
+
+def injection_settings(core, authority):
+    """Read the store's validated optional quote exception with owner authority."""
+    context = maintenance_context(core.storage, authority)
+    with core.storage.read(context) as tx:
+        return dict(auto_release_owner_quotes=load_policy(tx._check()).auto_release_owner_quotes)
+
+
+def set_injection_settings(core, authority, *, auto_release_owner_quotes):
+    """Set the store-wide quote exception without rescanning existing held sources."""
+    context = maintenance_context(core.storage, authority)
+    if type(auto_release_owner_quotes) is not bool:
+        raise ContractError("INPUT_INVALID", "auto_release_owner_quotes")
+    with core.storage.write(context, remaining_seconds=10) as tx:
+        conn = tx._check(write=True)
+        conn.execute(
+            "INSERT INTO injection_rules VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(rule_id) DO UPDATE SET enabled=excluded.enabled",
+            (*OWNER_QUOTE_SETTING, auto_release_owner_quotes),
+        )
+        load_policy(conn)
+    return dict(auto_release_owner_quotes=auto_release_owner_quotes)

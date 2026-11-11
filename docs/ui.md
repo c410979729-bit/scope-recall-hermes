@@ -60,6 +60,17 @@ and English otherwise. The language selector switches between both languages.
   Deletion and scope restrictions still apply. External and unattributed sources without a completed safety review stay
   pending; no model is called for this review. A hold on an older revision also withholds later revisions
   of the same source identity until the owner reviews each held version.
+  Quoted instruction matches normally wait for review because copied instructions can also be hostile.
+  There is no expiration: pending sources stay held until reviewed, without automatic release or conversion.
+  For batches, use the owner's [`review-sources` preview and confirmation command](manage.md#review-held-sources).
+  The same section describes the optional per-store `auto_release_owner_quotes` setting, off by default, which
+  only releases completed pure-quote scans whose verified human speaker is bound to the store's owner. Other people,
+  missing owner proof and all imports remain pending, even when recorded as human messages. It does not release a
+  source whose scan already ended in a hold, and it does not relax holds on tool output, assistant messages, external
+  documents or failed scans; a scan still in progress ends under the setting in force when it completes.
+  Doctor's `injection_review` reports pending rule and origin distributions, the oldest scan and currently pending
+  versions scanned within the last 24 hours, rather than a historical arrival count. These diagnostics require an
+  explicit check; the page does not send host notifications.
 - **Private mode** shows the current whole-store mode and active rules. Choose
   an exact session, absolute project directory, or the whole store to inspect,
   enable or close its rules. Full mode blocks capture, recall and outbound work;

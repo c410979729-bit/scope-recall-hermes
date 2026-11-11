@@ -50,6 +50,17 @@ class StoredSource:
     content_secret_scan: tuple[str, str, tuple[str, ...]] | None = None
 
 
+def source_origin(source) -> str:
+    """Return the recorded origin, requiring stored provenance for an import's original origin."""
+    if source.event["origin"] == "imported":
+        return (
+            source.event.get("source_original_origin", "origin_unknown")
+            if source.import_provenance_sha256
+            else "origin_unknown"
+        )
+    return source.event["origin"]
+
+
 #: The columns a loaded source is built from (``stored_source``).
 SOURCE_COLUMNS = (
     "event_id",

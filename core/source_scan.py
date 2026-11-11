@@ -16,6 +16,7 @@ from .injection_guard import (
     evidence_verdict,
     group_input,
     group_rows,
+    owner_quote_verdict,
     record_scan_deadline,
 )
 from .injection_policy import load_policy, policy_fingerprint, scan_events
@@ -135,6 +136,7 @@ def _publish(storage, clock, context, item, snapshot, verdict, remaining_seconds
                 tx.work.defer_without_attempt(*item.lease, now=now, seconds=0, error_code="scan_input_changed")
             )
         else:
+            verdict = owner_quote_verdict(tx, rows, verdict, policy)
             verdict = evidence_verdict(tx, events, verdict)
         if verdict.progress is not None:
             record_scan_deadline(tx, rows, verdict, now)
@@ -149,7 +151,7 @@ def _publish(storage, clock, context, item, snapshot, verdict, remaining_seconds
                 tx.work.defer_without_attempt(*item.lease, now=now, seconds=0, error_code="scan_checkpoint")
             )
         tx._check(write=True).execute("DELETE FROM source_scan_progress WHERE source_ref=? AND source_revision=?", key)
-        if verdict.state == "clear":
+        if verdict.state in {"clear", "released"}:
             _resume_group(tx, clock, rows[0]["event_id"], admission_policy)
         else:
             _remove_held_projections(tx, rows, preserve_work_id=item.work_id)
