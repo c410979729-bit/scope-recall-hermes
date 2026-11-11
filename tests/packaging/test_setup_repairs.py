@@ -27,7 +27,7 @@ def installed(user, host="workbuddy"):
     (user / ("." + host)).mkdir()
     args = options(host)
     result = apply_setup(build_plan(args))
-    assert result["status"] == "ready", result
+    assert result["status"] == "ready", json.dumps(result, ensure_ascii=False, indent=2)
     return args, result
 
 
@@ -375,6 +375,206 @@ def test_hermes_target_environment_is_part_of_readiness(fake_user, monkeypatch, 
     )
     result = apply_setup(build_plan(args))
     assert result["state"] == ("原文检索可用" if raw_available else None), result
+
+
+def test_setup_confirms_original_retrieval_after_unconfirmed_host_delivery(fake_user, monkeypatch):
+    """An independent hit cannot confirm host delivery when every host safety check remains unfinished."""
+    from scope_recall.core import MemoryCore
+
+    monkeypatch.setattr(MemoryCore, "confirm_session_brief", lambda *args, **kwargs: "brief_safety_unconfirmed")
+    (fake_user / ".hermes").mkdir()
+    result = apply_setup(build_plan(options("hermes")))
+    check = result["hosts"][0]["verification"]
+    assert not check["cross_session_recall"] and check["capture"]
+    assert check["readback"] == dict(
+        status="incomplete",
+        method="independent_readback",
+        host_delivery="brief_safety_unconfirmed",
+        host_attempts=3,
+        host_reasons=["brief_safety_unconfirmed"] * 3,
+        check="cross_session_recall",
+        reason="host_delivery_unconfirmed",
+        independent_recall=True,
+    )
+    assert not check["models_verified"] and result["state"] is None
+    assert result["status"] == "verification_incomplete" and result["verification_findings"]
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_setup_requires_host_delivery_even_when_its_store_is_readable(fake_user, monkeypatch, missing):
+    """A permanently broken injection path cannot become ready through an independent lookup."""
+    from scope_recall.core import MemoryCore
+    from scope_recall.maintenance import setup_verify
+
+    calls = []
+
+    def broken(*args, **kwargs):
+        calls.append(True)
+        raise RuntimeError("TEST-private-injection-detail")
+
+    monkeypatch.setattr(MemoryCore, "prepare_session_injection", broken)
+    if missing:
+        original = setup_verify._hermes
+        monkeypatch.setattr(setup_verify, "_hermes", lambda *a, **kw: "" if kw["capture"] else original(*a, **kw))
+    (fake_user / ".hermes").mkdir()
+    result = apply_setup(build_plan(options("hermes")))
+    assert result["status"] == ("verification_failed" if missing else "verification_incomplete"), json.dumps(result)
+    check = result["hosts"][0]["verification"]["readback"]
+    assert check["method"] == "independent_readback"
+    assert check["host_attempts"] == len(calls) == 3
+    assert check["host_reasons"] == ["brief_safety_unconfirmed"] * 3
+    assert result["state"] is None and not result["hosts"][0]["verification"]["cross_session_recall"]
+    assert "TEST-private-injection-detail" not in Path(result["receipt"]).read_text(encoding="utf-8")
+
+
+def test_setup_accepts_the_first_successful_host_read_and_stops(fake_user, monkeypatch):
+    """Only a host response containing the marker can turn an unfinished read into readiness."""
+    from scope_recall.maintenance import setup_verify
+
+    original, calls = setup_verify._hermes, []
+
+    def read(*args, **kwargs):
+        if kwargs["capture"]:
+            return original(*args, **kwargs)
+        calls.append(True)
+        return dict(unconfirmed="brief_safety_unconfirmed") if len(calls) == 1 else setup_verify.MARKER
+
+    monkeypatch.setattr(setup_verify, "_hermes", read)
+    _, result = installed(fake_user, "hermes")
+    check = result["hosts"][0]["verification"]["readback"]
+    assert check["method"] == "host_adapter" and check["status"] == "passed"
+    assert check["host_attempts"] == len(calls) == 2
+    assert check["host_reasons"] == ["brief_safety_unconfirmed", "marker_recalled"]
+
+
+def test_setup_reports_real_host_delivery_evidence(fake_user):
+    """A healthy synthetic store is ready only with a delivered host marker; otherwise it remains unconfirmed."""
+    (fake_user / ".hermes").mkdir()
+    result = apply_setup(build_plan(options("hermes")))
+    check = result["hosts"][0]["verification"]["readback"]
+    assert check["host_attempts"] == len(check["host_reasons"])
+    if check["method"] == "host_adapter":
+        assert result["status"] == "ready" and check["status"] == "passed"
+        assert check["host_reasons"][-1] == "marker_recalled"
+    else:
+        assert result["status"] == "verification_incomplete" and check["status"] == "incomplete"
+        assert check["independent_recall"] and check["host_attempts"] == 3
+        assert check["host_reasons"] == ["brief_safety_unconfirmed"] * 3
+
+
+def test_setup_records_a_host_read_error_without_retry(fake_user, monkeypatch):
+    """A host exception preserves its attempt and numeric error without disclosing text or repeating the call."""
+    from scope_recall.maintenance import setup_verify
+
+    original, calls = setup_verify._hermes, []
+
+    def failed(*args, **kwargs):
+        if kwargs["capture"]:
+            return original(*args, **kwargs)
+        calls.append(True)
+        raise PermissionError(13, "TEST-private-host-error")
+
+    monkeypatch.setattr(setup_verify, "_hermes", failed)
+    (fake_user / ".hermes").mkdir()
+    result = apply_setup(build_plan(options("hermes")))
+    check = result["hosts"][0]["verification"]["readback"]
+    assert result["status"] == "verification_failed"
+    assert check["method"] == "host_adapter" and check["host_attempts"] == len(calls) == 1
+    assert check["host_reasons"] == ["operation_error"] and check["errno"] == 13
+    assert "TEST-private-host-error" not in Path(result["receipt"]).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("number,windows", [(13, 5), (None, None), ("TEST-private-number", True)])
+def test_probe_os_error_keeps_only_numeric_system_codes(number, windows):
+    """Operating-system error codes remain actionable while exception data stays private."""
+    from scope_recall.maintenance.setup_verify import _probe_error
+
+    failure = OSError("TEST-private-os-detail")
+    failure.errno, failure.winerror = number, windows
+    result = _probe_error(failure, "cross_session_recall")
+    for key, value in (("errno", number), ("winerror", windows)):
+        assert result.get(key) == value if type(value) is int else key not in result
+    assert "TEST-private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "gap,expected",
+    [
+        ("deadline_exceeded_hydrate", "verification_incomplete"),
+        ("TEST_deadline_policy_error", "verification_failed"),
+        ("TEST_unconfirmed_corrupt_input", "verification_failed"),
+    ],
+)
+def test_setup_readback_classifies_only_declared_gap_codes(fake_user, monkeypatch, gap, expected):
+    """A word inside an unrelated gap cannot turn a concrete failed read into an unfinished one."""
+    from types import SimpleNamespace
+
+    from scope_recall.core import MemoryCore
+
+    monkeypatch.setattr(MemoryCore, "confirm_session_brief", lambda *a, **kw: "brief_safety_unconfirmed")
+    monkeypatch.setattr(MemoryCore, "recall", lambda *a, **kw: SimpleNamespace(items=(), gaps=(gap,)))
+    (fake_user / ".hermes").mkdir()
+    result = apply_setup(build_plan(options("hermes")))
+    assert result["status"] == expected, json.dumps(result)
+
+
+@pytest.mark.parametrize("damage", ["capture", "read", "timeout", "permission"])
+def test_setup_readback_distinguishes_broken_and_unconfirmed_operations(fake_user, monkeypatch, damage):
+    """A diagnostic lookup must still find its captured source, or explain its failure safely."""
+    from types import SimpleNamespace
+
+    from scope_recall.contracts import ContractError
+    from scope_recall.core import MemoryCore
+    from scope_recall.maintenance import setup_verify
+
+    monkeypatch.setattr(MemoryCore, "confirm_session_brief", lambda *args, **kwargs: "brief_safety_unconfirmed")
+    if damage == "capture":
+        original = setup_verify._hermes
+        monkeypatch.setattr(setup_verify, "_hermes", lambda *a, **kw: "" if kw["capture"] else original(*a, **kw))
+    elif damage == "read":
+        monkeypatch.setattr(MemoryCore, "recall", lambda *a, **kw: SimpleNamespace(items=(), gaps=()))
+    else:
+
+        def refused(*args, **kwargs):
+            if damage == "timeout":
+                raise ContractError("DEADLINE_EXCEEDED")
+            raise PermissionError(13, "TEST-private-probe-detail")
+
+        monkeypatch.setattr(MemoryCore, "recall", refused)
+    (fake_user / ".hermes").mkdir()
+    result = apply_setup(build_plan(options("hermes")))
+    expected = "verification_incomplete" if damage == "timeout" else "verification_failed"
+    assert result["status"] == expected, json.dumps(result, indent=2)
+    assert result["state"] is None
+    finding = result["verification_findings"][0]
+    assert finding["check"] == ("capture" if damage == "capture" else "cross_session_recall")
+    assert finding["status"] == ("incomplete" if damage == "timeout" else "failed")
+    assert "TEST-private-probe-detail" not in Path(result["receipt"]).read_text(encoding="utf-8")
+    assert result["hosts"][0]["verification"]["cleanup"]["status"] == "removed"
+
+
+def test_hermes_wizard_reports_unconfirmed_verification_without_claiming_install_failure(fake_user, monkeypatch):
+    """The host wizard must distinguish an installed environment from a check still unconfirmed."""
+    from types import SimpleNamespace
+
+    from scope_recall.maintenance import setup, setup_apply
+    from scope_recall.maintenance.setup import configure_hermes
+
+    monkeypatch.setattr(setup, "build_plan", lambda *a, **kw: SimpleNamespace(blockers=[]))
+    monkeypatch.setattr(
+        setup_apply,
+        "apply_setup",
+        lambda *a, **kw: dict(
+            status="verification_incomplete",
+            reason="Installation applied; readback unconfirmed",
+            receipt="TEST-receipt",
+        ),
+    )
+    config = {}
+    with pytest.raises(SystemExit, match="verification incomplete") as stopped:
+        configure_hermes(str(fake_user / ".hermes"), config)
+    assert "setup failed" not in str(stopped.value)
+    assert config == {}
 
 
 @pytest.mark.parametrize("old_kind,new_kind", [("openai", "openai_responses"), ("openai_responses", "openai")])
