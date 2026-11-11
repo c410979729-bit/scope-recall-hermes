@@ -298,6 +298,90 @@ def test_choose_conflicting_fact_and_undo_restore_both_heads(app):
         assert tx.claims.version(second.ref, tx.claims.current_revision(second.ref)).state == "active"
 
 
+def labelled_claim(core, ctx, value, **labels):
+    """An active claim of ``value`` in the slot of the given kind, subject and relation."""
+    source = capture(core, ctx, f"TEST-Object launch date {value}.")
+    with core.storage.write(ctx) as tx:
+        return tx.claims.append(
+            "TEST-scope",
+            draft(source, value, **labels),
+            Qualification("active", "direct_report", "synthetic"),
+            recorded_at=core.clock.utc_now(),
+        )
+
+
+FRAME_COLLISIONS = [
+    (("fact", "v1.2", "status"), ("fact", "v12", "status")),
+    (("fact", "C++", "compiler"), ("fact", "C", "compiler")),
+    (("fact", "Alice", "re-sign"), ("fact", "Alice", "resign")),
+    (("fact", "go", "odd jobs"), ("fact", "good", "d jobs")),
+    (("fact", "New York", "York office"), ("fact", "New", "York office")),
+    (("fact", "東京", "大学住所"), ("fact", "東京大学", "住所")),
+    (("fact", "😀", "!!!"), ("fact", "🚀", "???")),
+    (("preference", "TEST-app", "theme"), ("constraint", "TEST-app", "theme")),
+]
+
+
+def collision_pair(core, ctx, labels, same_value):
+    """Persist two independent synthetic facts without asking an extraction model to merge them."""
+    return tuple(
+        labelled_claim(
+            core,
+            ctx,
+            "blue" if index == 0 or same_value else "red",
+            kind=kind,
+            subject=subject,
+            predicate=predicate,
+        )
+        for index, (kind, subject, predicate) in enumerate(labels)
+    )
+
+
+@pytest.mark.parametrize("labels", FRAME_COLLISIONS)
+@pytest.mark.parametrize("same_value", [False, True])
+def test_lossy_frame_collision_is_not_a_definite_fact_relation(app, labels, same_value):
+    from scope_recall.core.mutate import health_pair_kind
+
+    core, ctx = app
+    first, second = collision_pair(core, ctx, labels, same_value)
+    assert health_pair_kind(first, second) not in {"duplicate", "contradiction"}
+
+
+@pytest.mark.parametrize("labels", FRAME_COLLISIONS)
+@pytest.mark.parametrize("same_value", [False, True])
+def test_lossy_frame_collision_cannot_authorize_fact_repair(app, labels, same_value):
+    core, ctx = app
+    first, second = collision_pair(core, ctx, labels, same_value)
+    action = owner(app).health_merge_facts if same_value else owner(app).health_choose_fact
+    with pytest.raises(ContractError, match="VERSION_CONFLICT"):
+        action(first.ref, first.revision, second.ref, second.revision)
+    assert core.current_claim(ctx, first.ref).revision == 1
+    assert core.current_claim(ctx, second.ref).revision == 1
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        dict(kind="fact", statement_kind="assertion", subject="TEST-Object", predicate="launch_date"),
+        dict(kind="fact", statement_kind="assertion", subject="TEST-Object launch", predicate="launch_date"),
+        dict(kind="decision", statement_kind="decision", subject="TEST-Object", predicate="launch_date"),
+    ],
+)
+def test_claims_split_only_by_lossy_labels_need_semantic_judgement_before_repair(app, labels):
+    core, ctx = app
+    first = labelled_claim(
+        core, ctx, "March 3", kind="fact", statement_kind="assertion", subject="TEST-Object", predicate="launch date"
+    )
+    second = labelled_claim(core, ctx, "March 17", **labels)
+    assert first.ref != second.ref
+    api = owner(app)
+    page = api.health(limit=20, deadline_seconds=5)
+    assert not any({first.ref, second.ref} == {v["ref"] for v in issue["facts"]} for issue in page["contradictions"])
+    with pytest.raises(ContractError, match="VERSION_CONFLICT"):
+        api.health_choose_fact(second.ref, second.revision, first.ref, first.revision)
+    assert core.current_claim(ctx, second.ref).payload["value_text"] == "March 17"
+
+
 def test_capacity_rotated_history_does_not_prove_fact_unused(app):
     core, ctx = app
     item = separate_fact(core, ctx, "TEST-Lighthouse", "blue")

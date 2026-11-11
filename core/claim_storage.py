@@ -17,6 +17,7 @@ from .claims import (
     claim_slot,
     evidence_refs,
     persisted_claim_payload,
+    slot_kinds,
 )
 from .delete_storage import canonical
 from .importance import record_importance
@@ -27,6 +28,30 @@ from .visibility import allowed, allowed_refs
 if TYPE_CHECKING:
     from .source_records import StoredSource
     from .storage import Transaction
+
+
+def _slot_match(subjects, predicate, conditions):
+    """Build a lossless prefilter before Python frame comparisons within the indexed audience."""
+    from .fact_identity import fact_frame
+
+    frames = sorted({fact_frame(subject, predicate) for subject in subjects} - {""})
+    if not frames:
+        return "0", []
+    # For ASCII labels, the collapsed frame must be a subsequence of the raw labels, even after overlap removal.
+    # Non-ASCII labels bypass this cheap test: SQLite lower() cannot implement Unicode NFKC and casefold.
+    patterns = ["*" + "*".join(frame) + "*" for frame in frames if frame.isascii()]
+    raw = "(c.subject||c.predicate)"
+    cheap = " OR ".join([f"{raw} GLOB '*[^ -~]*'", *(f"lower({raw}) GLOB ?" for _ in patterns)])
+    return (
+        f"({cheap}) AND scope_recall_fact_frame(c.subject,c.predicate) IN (SELECT value FROM json_each(?)) "
+        "AND (SELECT json_group_array(value) FROM (SELECT DISTINCT value FROM "
+        "json_each(v.payload_json,'$.conditions') ORDER BY value))=?",
+        [
+            *patterns,
+            json.dumps(frames),
+            json.dumps(sorted(set(conditions or ())), ensure_ascii=False, separators=(",", ":")),
+        ],
+    )
 
 
 def parse_source_ref(value: str) -> tuple[str, int]:
@@ -287,18 +312,20 @@ class Claims:
         *,
         subjects=(),
         predicate=None,
-        kind=None,
+        kind: str = "",
         conditions=None,
         alias_name=None,
         instant=None,
         options=None,
     ) -> tuple[str, ...]:
-        """Find bounded normalized slot/alias matches after filtering the complete authorized scope.
+        """Find bounded slot or alias matches after filtering the complete authorized scope.
 
-        Normalization is connection-local and creates no stored state. Filtering
+        A slot matches when its claim reads as one of ``subjects`` with ``predicate`` under ``conditions``, in a kind
+        that may hold a ``kind`` claim's value (``claims.slot_reading``); an alias matches by its normalized name.
+        The comparison is connection-local and creates no stored state. Filtering
         precedes the result limit, so unrelated facts cannot hide an older slot.
         """
-        from .fact_identity import normalize_fact_component
+        from .fact_identity import fact_frame, normalize_fact_component
 
         options = options or {}
         entity = options.get("entity")
@@ -307,23 +334,19 @@ class Claims:
             return self._entity_lookup(scope_id, *entity)
         self._tx._scope(scope_id)
         conn, ctx = self._tx._check(), self._tx.context
-
-        def normalize(value):
-            return normalize_fact_component(value, max_chars=2048, allow_empty=True)
-
-        conn.create_function("scope_recall_fact_component", 1, normalize, deterministic=True)
+        kinds = ["alias"] if alias_name is not None else sorted(slot_kinds(kind))
         filters = [
             "c.scope_id=?",
             "c.project_id IS ?",
             "c.branch_id IS ?",
-            "c.kind=?",
+            f"c.kind IN ({','.join('?' for _ in kinds)})",
             "c.read_blocked=0",
             "c.suppressed=0",
             "v.state='active'" if alias_name is not None else "v.state IN ('active','proposed','disputed')",
             "NOT EXISTS(SELECT 1 FROM object_blocks b WHERE b.object_kind='claim' AND b.object_ref=c.claim_id "
             "AND (b.read_blocked=1 OR b.suppressed=1))",
         ]
-        params = [scope_id, ctx.project_id, ctx.branch_id, "alias" if alias_name is not None else kind]
+        params = [scope_id, ctx.project_id, ctx.branch_id, *kinds]
         if after is not None:
             filters.append("c.claim_id>?")
             params.append(after)
@@ -331,6 +354,11 @@ class Claims:
             instant = canonical_time(instant)
             if instant is None:
                 raise ContractError("INPUT_INVALID", "alias_instant")
+
+            def normalize(value):
+                return normalize_fact_component(value, max_chars=2048, allow_empty=True)
+
+            conn.create_function("scope_recall_fact_component", 1, normalize, deterministic=True)
             conn.create_function("scope_recall_instant", 1, canonical_time, deterministic=True)
             filters += [
                 "scope_recall_fact_component(json_extract(v.payload_json,'$.alias.name'))=?",
@@ -339,24 +367,21 @@ class Claims:
             ]
             params += [normalize(alias_name), instant, instant]
         else:
-            filters += [
-                "scope_recall_fact_component(c.subject) IN (SELECT value FROM json_each(?))",
-                "scope_recall_fact_component(c.predicate)=?",
-                "(SELECT json_group_array(value) FROM (SELECT DISTINCT value FROM "
-                "json_each(v.payload_json,'$.conditions') ORDER BY value))=?",
-            ]
-            params += [
-                json.dumps(sorted(subjects)),
-                predicate,
-                json.dumps(sorted(set(conditions or ())), ensure_ascii=False, separators=(",", ":")),
-            ]
+            conn.create_function("scope_recall_fact_frame", 2, fact_frame, deterministic=True)
+            match, arguments = _slot_match(subjects, predicate, conditions)
+            filters.append(match)
+            params += arguments
+        order = "c.claim_id"
+        if alias_name is None and not options.get("by_id", after is not None):
+            order = "(c.kind=? AND c.subject IN (SELECT value FROM json_each(?)) AND c.predicate=?) DESC,c.claim_id"
+            params += [kind, json.dumps(sorted(subjects)), predicate]
         return tuple(
             row[0]
             for row in conn.execute(
                 "SELECT c.claim_id FROM claims c JOIN claim_versions v "
                 "ON v.claim_id=c.claim_id AND v.revision=c.current_revision WHERE "
                 + " AND ".join(filters)
-                + " ORDER BY c.claim_id LIMIT ?",
+                + f" ORDER BY {order} LIMIT ?",
                 [*params, limit],
             )
         )

@@ -374,6 +374,7 @@ SUITES = {
         "tests/host/codex/test_lifecycle_worker_wakeup.py",
         "tests/host/codex/test_handoff_tools.py",
         "tests/host/codex/test_mcp.py",
+        "tests/host/codex/test_automatic_revisions.py",
         "tests/host/codex/test_runtime_wiring.py",
         "tests/host/codex/test_shared_client.py",
         "tests/host/codex/test_setup_entries.py",
