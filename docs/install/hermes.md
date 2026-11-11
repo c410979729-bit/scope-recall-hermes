@@ -26,6 +26,8 @@ Discovery uses `HERMES_HOME`, otherwise `~/.hermes`. A host-local venv is prefer
 and whether it fell back to its own Python. Use `--home` or `--python` only to override that choice.
 
 Setup selects memory.provider: scope-recall in config.yaml and installs the provider and memory skill.
+Both the Hermes setup hook and standalone setup use an exact scalar edit so other configuration bytes, including
+comments, quoting and indentation, are preserved. Hermes' configuration writers serialize the YAML document.
 
 A scheduled session (`platform=cron`) with no user id does not participate in memory. Its hooks return without capture,
 recall or background work, and diagnostics report `capability_gap:unbound_session`. The reason is logged once at debug
@@ -58,8 +60,18 @@ says so once per session, and `doctor` reports `local_session_unbound` with what
 Model keys belong in this Hermes profile's own `.env` or in a secret source managed by Hermes. The in-process
 plugin resolves each route's `credential_env` through `agent.secret_scope.get_secret`, which honours the active
 profile. It does not read `.env` or other credential files itself. The plugin adds only the declared route keys
-to each background worker's inherited process environment. Missing keys pause the affected work types; later
+to each background worker's selected environment. Workers retain the operating-system, Python, proxy and certificate
+settings described in the [installation guide](../install.md), plus plugin settings and declared route credentials;
+other ambient Hermes keys are excluded unless explicitly requested through `worker_environment_names`.
+This applies to the `launch_worker` chain; direct and manual commands use their launcher's environment. Proxy
+credentials, the CLI login location and plugin-prefixed variables retain the exceptions described in that guide.
+Missing keys pause the affected work types; later
 passes recheck missing names at most once every 60 seconds. Each missing name is logged once per process.
+
+Hook callbacks read `plugins.hook_callback_timeout` through Hermes' public `load_config_readonly`, falling back to
+`load_config` on hosts without that function: the default is 30 seconds, zero disables the deadline, and the maximum
+is 600 seconds. If neither API is available or the setting is invalid, callbacks use the default. A NaN setting
+also uses the default, even on hosts whose own timeout resolver returns NaN.
 
 ## Package-managed plugin environments
 

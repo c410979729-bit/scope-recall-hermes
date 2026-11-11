@@ -60,6 +60,7 @@ Credentials are environment variable references. Never put their values in a rou
 | <a id="auto_retry_cooldown_seconds"></a>`auto_retry_cooldown_seconds` | `float` | `3600.0` |
 | <a id="max_auto_recoveries"></a>`max_auto_recoveries` | `int` | `2` |
 | <a id="worker_min_interval_seconds"></a>`worker_min_interval_seconds` | `float` | `30.0` |
+| <a id="worker_environment_names"></a>`worker_environment_names` | `tuple[str, ...]` | `[]` |
 | <a id="supervisor_enabled"></a>`supervisor_enabled` | `bool` | `true` |
 | <a id="supervisor_seconds"></a>`supervisor_seconds` | `float` | `21600.0` |
 | <a id="supervisor_max_drains"></a>`supervisor_max_drains` | `int` | `256` |
