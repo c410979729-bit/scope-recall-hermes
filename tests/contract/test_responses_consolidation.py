@@ -754,11 +754,11 @@ def test_responses_provider_refusal_is_settled_by_its_own_code(tmp_path, monkeyp
     with pytest.raises(AuxiliaryModelError) as exc:
         runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
     assert (exc.value.error_type, exc.value.detail) == ("http_status", "429")
-    # The provider's own symbol is kept; the reserved charge is retained behind
-    # it, which is the suffix every unsettled-without-usage row carries.
+    # An explicit admission refusal settles to zero while retaining the
+    # provider's own error symbol for diagnostics and backoff.
     row = _rows(ledger)[0]
-    assert row["status"].startswith("http_429:RateLimitError")
-    assert row["charge_micro_usd"] > 0
+    assert row["status"] == "http_429:RateLimitError"
+    assert (row["charge_micro_usd"], row["actual_input"], row["actual_output"]) == (0, 0, 0)
 
 
 def test_responses_reservation_precedes_the_network_call(tmp_path, monkeypatch):
