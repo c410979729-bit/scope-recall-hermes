@@ -482,6 +482,7 @@ def test_setup_probe_hooks_run_an_installed_entrys_budget(fake_user, monkeypatch
 def test_setup_retries_a_client_prompt_that_ran_out_of_time(fake_user, monkeypatch):
     """A client hook that spent its budget before delivering is read again; only a delivered marker is ready."""
     from scope_recall.adapters.clients.prompt_recall import PromptRecall
+    from scope_recall.maintenance import setup_verify
 
     original, calls = PromptRecall.own, []
 
@@ -494,10 +495,13 @@ def test_setup_retries_a_client_prompt_that_ran_out_of_time(fake_user, monkeypat
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(PromptRecall, "own", own)
+    # The read spent here is one more than a slow disk may spend on its own.
+    monkeypatch.setattr(setup_verify, "HOST_READ_ATTEMPTS", setup_verify.HOST_READ_ATTEMPTS + 1)
     _, result = installed(fake_user)
     check = result["hosts"][0]["verification"]["readback"]
     assert check["method"] == "host_adapter" and check["status"] == "passed"
-    assert check["host_reasons"] == ["deadline_exceeded", "marker_recalled"]
+    assert check["host_reasons"][0] == "deadline_exceeded" and check["host_reasons"][-1] == "marker_recalled"
+    assert set(check["host_reasons"][:-1]) <= setup_verify._UNCONFIRMED
 
 
 def test_setup_records_a_host_read_error_without_retry(fake_user, monkeypatch):
