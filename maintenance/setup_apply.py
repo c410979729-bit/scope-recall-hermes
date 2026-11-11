@@ -179,6 +179,41 @@ def _write_setup_receipt(path: Path, value: dict[str, Any], backups: list[str]) 
     return value
 
 
+def _verification_result(results: list[dict], ready: bool) -> dict:
+    """Name unsuccessful checks with fixed codes, never host text or credentials."""
+    findings = []
+    for item in results:
+        check = item["verification"]
+        if not _store_usable(item["doctor"]):
+            findings.append(
+                dict(
+                    host=item["host"],
+                    check="selected_installation",
+                    status="failed",
+                    reason="doctor_failed",
+                    capability_gaps=item["doctor"]["capability_gaps"],
+                )
+            )
+        elif not check.get("cross_session_recall"):
+            readback = check.get("readback", {})
+            findings.append(
+                dict(
+                    host=item["host"],
+                    check=readback.get("check", "cross_session_recall"),
+                    status=readback.get("status", "failed"),
+                    reason=readback.get("reason", "marker_not_recalled"),
+                )
+            )
+    incomplete = bool(findings) and all(item["status"] == "incomplete" for item in findings)
+    return dict(
+        status="ready" if ready else "verification_incomplete" if incomplete else "verification_failed",
+        verification_findings=findings,
+        reason="Installation applied; verification is not yet confirmed. Rerun setup to confirm readiness."
+        if incomplete
+        else None,
+    )
+
+
 def apply_setup(plan, *, register_copies: bool = False) -> dict[str, Any]:
     """Apply one approved plan and preserve completed stages and rollback paths on failure."""
     from .setup_verify import verify_memory
@@ -267,7 +302,7 @@ def apply_setup(plan, *, register_copies: bool = False) -> dict[str, Any]:
             item["verification"].get("cross_session_recall") and _store_usable(item["doctor"]) for item in results
         )
         value = dict(
-            status="ready" if ready else "verification_failed",
+            **_verification_result(results, ready),
             state=("完整记忆功能可用" if full else "原文检索可用") if ready else None,
             missing=[]
             if full

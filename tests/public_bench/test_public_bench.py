@@ -1612,33 +1612,70 @@ def test_scenario_clock_uses_queue_ordering_format_and_real_deadlines():
     from scenario_store import Clock
 
     clock = Clock()
-    before, deadline = clock.utc_now(), clock.monotonic()
-    clock.advance(900)
+    before = clock.utc_now()
+    # Advancing business time must not replace the real deadline clock.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("scenario_store.time.monotonic", lambda: 37.0)
+        assert clock.monotonic() == 37.0
+        clock.advance(900)
+        assert clock.monotonic() == 37.0
     assert before.endswith("Z") and clock.utc_now().endswith("Z")
     assert clock.utc_now() > before
-    assert clock.monotonic() - deadline < 1
 
 
-def test_scenario_worker_port_runs_adoption_without_external_services(tmp_path):
+@pytest.mark.parametrize("rounds,expected", [(None, 8), (2, 2)])
+def test_scenario_drain_waits_for_ready_work_or_an_explicit_observation_limit(rounds, expected):
+    """Ready work outlives six passes; explicit observations leave it inspectable."""
+    from scenario_model import drain
+
+    passes = []
+
+    def work(*args, **kwargs):
+        passes.append(kwargs)
+        return "TEST worker checkpoint"
+
+    pending = [dict(work_type="consolidate", state="pending", available_at="2020", last_error_code=None)]
+    scenes = SimpleNamespace(
+        core=SimpleNamespace(drain_worker=work),
+        context=lambda: None,
+        clock=SimpleNamespace(utc_now=lambda: "2021"),
+        rows=lambda sql: pending if len(passes) < 8 else [],
+    )
+    evidence = drain(scenes, SimpleNamespace(calls=[]), rounds=rounds)
+    assert len(passes) == len(evidence["receipts"]) == expected
+    assert evidence["pending"] == (pending if rounds is not None else [])
+
+
+@pytest.mark.parametrize("queued_reply", [False, True])
+def test_scenario_worker_port_runs_adoption_without_external_services(tmp_path, monkeypatch, queued_reply):
     """A source-bound confirmation crosses the real hook and worker stages."""
     from scenario_model import FixtureModel, drain
     from scenario_store import ScenarioStore
+    from scope_recall.core import capture_inbox
 
     scenes = ScenarioStore(tmp_path / "TEST-scenario-adoption")
     try:
         session = scenes.hook("codex", "TEST 配置重启策略，请给两个方案。")["session"]
-        scenes.hook(
-            "codex",
-            "",
-            session=session,
-            event="Stop",
-            last_assistant_message=("方案一：直接覆盖配置。\n\n方案二：先备份配置，再平滑重启，失败时恢复备份。"),
-        )
+        scenes.flush_captures(session=session)
+        with monkeypatch.context() as capture:
+            if queued_reply:
+                capture.setattr(capture_inbox, "fits", lambda *args, **kwargs: False)
+            reply = scenes.hook(
+                "codex",
+                "",
+                session=session,
+                event="Stop",
+                last_assistant_message=("方案一：直接覆盖配置。\n\n方案二：先备份配置，再平滑重启，失败时恢复备份。"),
+            )
+        if queued_reply:
+            assert reply["diagnostics"]["capture_durability"] == "queued"
+        scenes.flush_captures(session=session)
         scenes.hook("codex", "好，就用方案二", session=session)
+        scenes.flush_captures(session=session)
         model = FixtureModel()
-        drain(scenes, model)
+        evidence = drain(scenes, model)
         rows = scenes.rows("SELECT state,payload_json FROM claim_versions")
-        assert len(rows) == 1 and rows[0]["state"] == "active"
+        assert len(rows) == 1 and rows[0]["state"] == "active", evidence
         payload = json.loads(rows[0]["payload_json"])
         assert "先备份配置" in payload["value_text"]
         assert len(payload["evidence_spans"]) == 2

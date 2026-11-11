@@ -236,11 +236,14 @@ class CodexHookHandler:
         trusted_runtime_config_path: str | None = None,
         hook_started_at: float | None = None,
         remote_paths: bool = False,
+        prompt_budget: float | None = None,
     ) -> CodexHookHandler:
         """A client attached to a shared store; its runtime config is the entry's, beside its pointer.
 
         ``event_clock``, when given, dates the hook's own events (a remote client's moment), while the store keeps
-        ``clock``'s time for when it stored them.
+        ``clock``'s time for when it stored them.  ``prompt_budget`` is a prompt's allowance for an entry whose
+        runtime config is kept elsewhere (setup's disposable check entry), in place of the two seconds of an entry
+        never set up.
         """
         config = load_shared_client(home, host)
         core = _hook_core(config, clock, runtime_config_path=trusted_runtime_config_path or config.runtime_config_path)
@@ -250,7 +253,11 @@ class CodexHookHandler:
         handler.remote_paths = remote_paths
         handler._pending_runtime_config_path = trusted_runtime_config_path or str(config.runtime_config_path)
         if host in _CONFIGURED_PROMPT_BUDGET:
-            handler._prompt_budget = _configured_budget(handler._pending_runtime_config_path)
+            handler._prompt_budget = (
+                _configured_budget(handler._pending_runtime_config_path)
+                if prompt_budget is None
+                else strict_hook_budget(prompt_budget)
+            )
         return handler
 
     # -- diagnostics and budget ------------------------------------------

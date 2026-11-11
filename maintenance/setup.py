@@ -404,6 +404,11 @@ def configure_hermes(hermes_home: str, config: dict) -> None:
     result = apply_setup(plan)
     if result["status"] != "ready":
         reason = result.get("reason") or result.get("error_type") or result["status"]
+        if result["status"] == "verification_incomplete":
+            # The reason is a full sentence; one closing period, then the receipt.
+            raise SystemExit(
+                f"Scope Recall verification incomplete: {str(reason).rstrip('.')}. Setup receipt: {result['receipt']}"
+            )
         raise SystemExit(
             f"Scope Recall setup failed at {result.get('failed_step') or 'verification'}: {reason}. "
             f"Setup receipt: {result['receipt']}"

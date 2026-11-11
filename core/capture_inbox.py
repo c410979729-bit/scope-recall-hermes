@@ -107,6 +107,22 @@ def _prepared_ingress(value, context):
 
 
 def enqueue(storage, clock, context, value, *, scope_id, host_scope, remaining_seconds=1.0):
+    """Report an unavailable inbox write without claiming that a capture is durable."""
+    try:
+        return _enqueue(
+            storage,
+            clock,
+            context,
+            value,
+            scope_id=scope_id,
+            host_scope=host_scope,
+            remaining_seconds=remaining_seconds,
+        )
+    except _TRANSIENT as exc:
+        raise ContractError("STORAGE_UNAVAILABLE", "ingress_write") from exc
+
+
+def _enqueue(storage, clock, context, value, *, scope_id, host_scope, remaining_seconds):
     storage._context_check(context)
     if scope_id not in context.allowed_scope_ids:
         raise ContractError("ACCESS_DENIED")
