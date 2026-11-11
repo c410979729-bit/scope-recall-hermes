@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .model_budget import request_provably_unbilled
 from .validation import mapping, only_keys, positive_int
 
 _TABLE = """CREATE TABLE IF NOT EXISTS codex_subscription_requests (
@@ -55,6 +56,46 @@ def _day() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+_UNKNOWN_SUFFIX = "_usage_unknown_reserved"
+
+
+def _retained_records(db: sqlite3.Connection, day: str, before_ns: int | None = None) -> list[dict]:
+    """Settled uncertain subscription calls for one UTC day; in-flight calls are excluded."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='codex_subscription_requests'").fetchone():
+        return []
+    cutoff = " AND started_ns < ?" if before_ns is not None else ""
+    values = (day, "*" + _UNKNOWN_SUFFIX) + (() if before_ns is None else (before_ns,))
+    keys = ("id", "model", "status", "started_ns", "input_tokens", "output_tokens")
+    return [
+        dict(zip(keys, row, strict=True))
+        for row in db.execute(
+            "SELECT id,model,status,started_ns,COALESCE(actual_input,reserved_input),"
+            "COALESCE(actual_output,reserved_output) FROM codex_subscription_requests "
+            "WHERE day=? AND status GLOB ?" + cutoff + " ORDER BY id",
+            values,
+        )
+    ]
+
+
+def _retained_totals(records: list[dict]) -> dict:
+    """Subscription tokens have no inferred dollar price."""
+    return dict(
+        requests=len(records),
+        input_tokens=sum(row["input_tokens"] for row in records),
+        output_tokens=sum(row["output_tokens"] for row in records),
+        charge_micro_usd=None,
+    )
+
+
+def _cap_checks(policy: SubscriptionBudgetPolicy, calls: int, inputs: int, outputs: int) -> tuple:
+    """Daily admission limits shared by reservation and status reporting."""
+    return (
+        ("calls", calls, policy.daily_calls, 1),
+        ("input_tokens", inputs, policy.daily_input_tokens, policy.reserve_input),
+        ("output_tokens", outputs, policy.daily_output_tokens, policy.reserve_output),
+    )
+
+
 class SubscriptionBudgetLedger:
     """Separate call/token table, sharing the configured auxiliary SQLite file."""
 
@@ -87,11 +128,7 @@ class SubscriptionBudgetLedger:
                 "FROM codex_subscription_requests WHERE day=?",
                 (_day(),),
             ).fetchone()
-            if (
-                calls >= p.daily_calls
-                or inputs + p.reserve_input > p.daily_input_tokens
-                or outputs + p.reserve_output > p.daily_output_tokens
-            ):
+            if any(used + need > cap for _, used, cap, need in _cap_checks(p, calls, inputs, outputs)):
                 raise ValueError("budget_exhausted_or_meter_breach")
             cursor = db.execute(
                 "INSERT INTO codex_subscription_requests(day,model,reserved_input,reserved_output,status,started_ns) "
@@ -102,6 +139,8 @@ class SubscriptionBudgetLedger:
 
     def finish(self, request_id: int, status: str, usage: tuple[int, int] | None, *, timeout_seconds: float) -> bool:
         """Settle once, retaining unknown usage; return whether usage breached."""
+        if request_provably_unbilled(status):
+            usage = (0, 0)
         with closing(self._connect(timeout_seconds)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -113,7 +152,7 @@ class SubscriptionBudgetLedger:
             if usage is None:
                 db.execute(
                     "UPDATE codex_subscription_requests SET status=? WHERE id=?",
-                    (status + "_usage_unknown_reserved", request_id),
+                    (status + _UNKNOWN_SUFFIX, request_id),
                 )
                 return False
             if len(usage) != 2 or any(type(v) is not int or v < 0 for v in usage):
@@ -125,9 +164,36 @@ class SubscriptionBudgetLedger:
             )
             return breach
 
+    def release_unknown_reservations(self, *, before_ns: int, apply: bool = False) -> dict:
+        """Preview or release old uncertain tokens today, keeping call counts and history."""
+        if type(before_ns) is not int or before_ns < 0:
+            raise ValueError("invalid_before")
+        uri = self.path.resolve().as_uri() + ("?mode=rw" if apply else "?mode=ro")
+        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db, db:
+            db.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
+            day = _day()
+            records = _retained_records(db, day, before_ns)
+            if apply:
+                db.executemany(
+                    "UPDATE codex_subscription_requests SET actual_input=0,actual_output=0,status=? WHERE id=?",
+                    (
+                        (row["status"][: -len(_UNKNOWN_SUFFIX)] + "_usage_unknown_released_by_operator", row["id"])
+                        for row in records
+                    ),
+                )
+        return dict(
+            applied=apply,
+            period="daily",
+            time_zone="UTC",
+            day=day,
+            before_ns=before_ns,
+            records=records,
+            totals=_retained_totals(records),
+        )
+
     def status(self) -> dict:
         """Metadata-only read; no ledger creation, no inferred dollar price."""
-        result = dict(
+        result: dict = dict(
             accounting="subscription_unpriced",
             charge_micro_usd=None,
             day=_day(),
@@ -141,20 +207,34 @@ class SubscriptionBudgetLedger:
         if not self.path.is_file():
             return result
         with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+            db.execute("BEGIN")
             if not db.execute("SELECT 1 FROM sqlite_master WHERE name='codex_subscription_requests'").fetchone():
                 return result
             calls, inputs, outputs = db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(COALESCE(actual_input,reserved_input)),0), "
                 "COALESCE(SUM(COALESCE(actual_output,reserved_output)),0) FROM codex_subscription_requests WHERE day=?",
-                (_day(),),
+                (result["day"],),
             ).fetchone()
             latest = db.execute("SELECT status FROM codex_subscription_requests ORDER BY id DESC LIMIT 1").fetchone()
             breach = db.execute("SELECT 1 FROM codex_subscription_requests WHERE meter_breach=1 LIMIT 1").fetchone()
+            retained = _retained_totals(_retained_records(db, result["day"]))
+        p = self.policy
+        retained["cap_ratios"] = dict(
+            calls=retained["requests"] / p.daily_calls,
+            input_tokens=retained["input_tokens"] / p.daily_input_tokens,
+            output_tokens=retained["output_tokens"] / p.daily_output_tokens,
+        )
+        blocked = []
+        for key, used, cap, need in _cap_checks(p, calls, inputs, outputs):
+            if used + need > cap:
+                blocked.append(key)
         result.update(
             daily_calls=calls,
             input_tokens=inputs,
             output_tokens=outputs,
             meter_breach=bool(breach),
             latest_status=latest[0] if latest else None,
+            retained_unknown=retained,
+            blocked_reservations=blocked,
         )
         return result

@@ -35,6 +35,20 @@ _LEDGER_BUSY_SLEEP_SECONDS = 0.01
 _RESERVED = "reserved_before_network"
 _LEDGER_WRITE_LOCKS = {}
 
+# These responses refuse admission: invalid payload, credentials, account,
+# route, method, media type, size, validation or capacity. They do not report
+# an executed generation. Other 4xx (especially 408), and every 5xx, can follow
+# execution and are deliberately excluded.
+UNBILLED_HTTP_STATUSES = frozenset({400, 401, 402, 403, 404, 405, 413, 415, 422, 429})
+UNKNOWN_RESERVED_SUFFIX = "_usage_unknown_reserved_charge_retained"
+
+
+def request_provably_unbilled(status: str) -> bool:
+    """Whether a trusted transport outcome proves no model execution occurred."""
+    return status == "request_not_sent" or status.split(":", 1)[0] in {
+        f"http_{code}" for code in UNBILLED_HTTP_STATUSES
+    }
+
 
 def _readonly_uri(path: Path) -> str:
     return f"file:{path.resolve().as_posix()}?mode=ro"
@@ -265,6 +279,28 @@ def budget_totals(
         _summary_key(window, model),
     ).fetchone()
     return dict(zip(_TOTAL_FIELDS, row or (0, 0, 0, 0), strict=True))
+
+
+def reservation_cap_checks(
+    policy: BudgetPolicy,
+    model: str,
+    totals: Mapping[str, int],
+    model_totals: Mapping[str, int],
+    *,
+    amount: int,
+    reserved_input: int,
+    reserved_output: int,
+) -> tuple[tuple[str, int | None, int, int], ...]:
+    """Named cap, used and required amounts shared by admission and diagnostics."""
+    model_input, model_output = policy.model_token_caps.get(model, (None, None))
+    return (
+        ("calls", policy.total_call_cap, totals["requests"], 1),
+        ("charge_micro_usd", policy.cap_micro_usd, totals["charge_micro_usd"], amount),
+        ("input_tokens", policy.total_input_cap, totals["input_tokens"], reserved_input),
+        ("output_tokens", policy.total_output_cap, totals["output_tokens"], reserved_output),
+        ("model_input_tokens", model_input, model_totals["input_tokens"], reserved_input),
+        ("model_output_tokens", model_output, model_totals["output_tokens"], reserved_output),
+    )
 
 
 def _summary_windows(zones: set[str], started_ns: int | None) -> set[tuple[int, int]]:
@@ -693,18 +729,16 @@ class AuxiliaryBudgetLedger:
         window = budget_window(policy, started_ns)
         totals = budget_totals(db, window)
         model_totals = budget_totals(db, window, model=model)
-        model_input_cap, model_output_cap = policy.model_token_caps.get(model, (None, None))
-        checks = (
-            (policy.cap_micro_usd, totals["charge_micro_usd"] + amount),
-            (policy.total_input_cap, totals["input_tokens"] + reserved_input),
-            (policy.total_output_cap, totals["output_tokens"] + reserved_output),
-            (model_input_cap, model_totals["input_tokens"] + reserved_input),
-            (model_output_cap, model_totals["output_tokens"] + reserved_output),
+        checks = reservation_cap_checks(
+            policy,
+            model,
+            totals,
+            model_totals,
+            amount=amount,
+            reserved_input=reserved_input,
+            reserved_output=reserved_output,
         )
-        exceeded = (policy.total_call_cap is not None and totals["requests"] >= policy.total_call_cap) or any(
-            cap is not None and total > cap for cap, total in checks
-        )
-        if exceeded:
+        if any(cap is not None and used + required > cap for _, cap, used, required in checks):
             raise ValueError("budget_exhausted_or_meter_breach")
 
     def finish(
@@ -761,9 +795,12 @@ class AuxiliaryBudgetLedger:
         cached_input: int | None = None,
         unreported_output: int | None = None,
     ) -> str:
-        """Close the reservation once.  Unknown usage keeps the reserved charge."""
+        """Close once; proven refusals cost zero, uncertain usage keeps its charge."""
         deadline = None if timeout_seconds is None else time.monotonic() + float(timeout_seconds)
-        retained = f"{status}_usage_unknown_reserved_charge_retained"
+        retained = status + UNKNOWN_RESERVED_SUFFIX
+        if request_provably_unbilled(status):
+            counts = (0, 0)
+            cached_input = unreported_output = None
         while True:
             _await_ledger_lock(deadline)
             try:
@@ -922,7 +959,7 @@ PROVIDER_HOLD_LONGEST_SECONDS = PROVIDER_HOLD.ceiling
 #: Recent calls of one model read to count refusals in a row.
 _HOLD_LOOKBACK_ROWS = 32
 #: Rows that are no answer at all: still in flight, or lost on the way.
-_NO_ANSWER_PREFIXES = (_RESERVED, "network_error", "timeout")
+_NO_ANSWER_PREFIXES = (_RESERVED, "network_error", "timeout", "request_not_sent")
 #: Refusals that started this close together were in flight at the same time --
 #: one group's concurrent requests -- and are one refusal, not several in a row.
 #: Counted one by one, a single wave of four refused requests would hold the model

@@ -29,6 +29,8 @@ for an hour without spending an attempt. Invalid consolidation or evaluation out
 attempt. A repeated invalid result stops and retains validation metadata. Operator recovery closes unfinished questions whose work stopped; previews retain their request marks, and a spent grant closes bookkeeping without repeating the request. Private-mode work is held without an
 outbound request. `scope-recall retry-failures --apply --config <runtime-config.json>` grants bounded recovery after repair; adding
 `--include-terminal` explicitly includes by-design refusals. Stored retry marks retain their recorded meaning.
+Summary pages stopped by invalid output are excluded by default; `retry-failures --apply --include-terminal`
+reopens eligible pages. With unchanged sources the model receives the same request, so the result depends on its response.
 
 Embedding preparation uses the earlier of the pass deadline and the group's effective lease deadline, with time
 reserved for publication and bookkeeping. A single-request embedding port receives decreasing budgets and may

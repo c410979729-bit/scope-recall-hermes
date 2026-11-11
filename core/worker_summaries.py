@@ -11,6 +11,7 @@ from . import private
 from .consolidation_chunks import ChunkedSource, ConsolidationChunk, source_chunk
 from .consolidation_summary import grounded_sentences
 from .entry_control import entry_fence, paused_since, sources_paused
+from .failure_retry import validation_feedback
 from .language_resources import prompt_text
 from .resume_compaction import resume_evidence_refs
 from .source_qualification import sentence_bounds
@@ -269,6 +270,8 @@ def _process_summary_page(storage, clock, context, item, *, model, started, budg
     except (ContractError, ValueError, TypeError) as exc:
         if getattr(exc, "field", None) == "entry_state:paused":
             return hold_for_entry_state(storage, clock, context, item, started=started, budget=budget)
+        code = getattr(exc, "code", None) or "DERIVATION_INVALID"
+        failure = validation_feedback(code, getattr(exc, "field", None) or "summary_invalid")["field"]
         with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
             if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
                 return stale_result(tx, item)
@@ -277,10 +280,10 @@ def _process_summary_page(storage, clock, context, item, *, model, started, budg
                 return work_result(tx.work.mark_obsolete(*item.lease, now=clock.utc_now()))
             tx._check().execute(
                 "UPDATE summary_groups SET state='partial',failure=? WHERE group_key=? AND generation=? "
-                "AND state='pending'",
-                (getattr(exc, "field", None) or "summary_invalid", current["group_key"], current["generation"]),
+                "AND state IN ('pending','partial')",
+                (failure, current["group_key"], current["generation"]),
             )
-        return finish("retry", getattr(exc, "code", None) or "DERIVATION_INVALID")
+        return finish("retry", code, error_detail=failure)
     except (OSError, RuntimeError, TimeoutError) as exc:
         return finish(*model_failure(exc))
 

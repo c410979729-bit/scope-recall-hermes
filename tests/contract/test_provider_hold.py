@@ -86,12 +86,13 @@ def test_an_answer_ends_the_hold(tmp_path):
     assert provider_hold_until(path, "m", now=now) is None
 
 
-def test_calls_that_got_no_answer_neither_extend_nor_end_a_hold(tmp_path):
+@pytest.mark.parametrize("status", ("network_error_usage_unknown_reserved_charge_retained", "request_not_sent"))
+def test_calls_that_got_no_answer_neither_extend_nor_end_a_hold(tmp_path, status):
     path, now = _ledger(
         tmp_path,
         [
             ("m", REFUSED, 20),
-            ("m", "network_error_usage_unknown_reserved_charge_retained", 15),
+            ("m", status, 15),
             ("m", "reserved_before_network", 5),
         ],
     )

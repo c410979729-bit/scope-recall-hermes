@@ -41,6 +41,169 @@ class FirstSentenceModel:
         )
 
 
+@pytest.mark.parametrize("failure", ["summary_grounding", "evidence_spans", "summary_invalid"])
+def test_summary_validation_failure_records_field_on_every_attempt(app, failure):
+    core, ctx = app
+    text = " ".join(f"TEST sentence {i}." for i in range(17))
+    capture(core, ctx, text)
+
+    class InvalidSummary:
+        def judge(self, messages, *, remaining_seconds):
+            source = json.loads(messages[-1]["content"])["sources"][0]
+            if failure == "summary_invalid":
+                return "{"
+            sentences = ["invented"] if failure == "summary_grounding" else [f"TEST sentence {i}." for i in range(17)]
+            return {
+                "sentences": [
+                    dict(text=s, source_ref=source["ref"], source_revision=source["revision"]) for s in sentences
+                ]
+            }
+
+    model = InvalidSummary()
+    build(core, ctx, model)
+    for _ in range(2):
+        with core.storage.write(ctx) as tx:
+            tx._check().execute("UPDATE work_items SET available_at=? WHERE state='pending'", (core.clock.utc_now(),))
+        from scope_recall.core.worker import WorkerConfig, drain_worker
+
+        drain_worker(
+            core.storage,
+            core.clock,
+            ctx,
+            config=WorkerConfig("TEST-summary", summary_capable=True),
+            consolidation=model,
+            remaining_seconds=30,
+        )
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        group = conn.execute("SELECT state,failure FROM summary_groups").fetchone()
+        details = conn.execute("SELECT error_field FROM work_error_details ORDER BY detail_id").fetchall()
+        work = conn.execute("SELECT state FROM work_items WHERE work_type='rebuild_projection'").fetchone()
+    assert tuple(group) == ("partial", failure)
+    assert work[0] == "failed"
+    assert len(details) == 3 and all(row[0] == group[1] for row in details)
+
+
+@pytest.mark.parametrize("partial,total,alert", [(19, 19, False), (20, 200, False), (20, 199, True)])
+def test_doctor_summary_partial_reasons_and_threshold(app, partial, total, alert):
+    from scope_recall.maintenance.doctor import _classify_status
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_storage
+
+    core, ctx = app
+    with core.storage.write(ctx) as tx:
+        conn = tx._check()
+        for i in range(total):
+            state = "partial" if i < partial else "complete"
+            failure = ("summary_grounding" if i % 2 else "evidence_spans") if state == "partial" else None
+            conn.execute(
+                "INSERT INTO summary_groups(group_key,kind,subject_ref,scope_id,entry_id,last_activity,state,failure) "
+                "VALUES(?, 'session', ?, 'TEST-scope', 'local', ?, ?, ?)",
+                (f"TEST-group-{i}", f"TEST-subject-{i}", core.clock.utc_now(), state, failure),
+            )
+    report = DoctorReport(host="codex", status="ok")
+    assert check_storage(report, ctx.binding, core.storage.path.parent)
+    reasons = {"evidence_spans": (partial + 1) // 2, "summary_grounding": partial // 2}
+    assert report.summaries["partial_failures"] == reasons
+    check = next(c for c in report.checks if c["name"] == "summaries")
+    assert all(f"{reason}={count}" in check["detail"] for reason, count in reasons.items())
+    assert ("summary_partial" in report.capability_gaps) is alert
+    _classify_status(report)
+    assert report.status == ("attention" if alert else "ok")
+
+
+def test_summary_retry_updates_failure_when_the_model_error_changes(app):
+    from scope_recall.core.worker import WorkerConfig, drain_worker
+
+    core, ctx = app
+    capture(core, ctx, "TEST summary source.")
+
+    class ChangingError:
+        def __init__(self):
+            self.calls = 0
+
+        def judge(self, messages, *, remaining_seconds):
+            self.calls += 1
+            if self.calls > 1:
+                return "{"
+            source = json.loads(messages[-1]["content"])["sources"][0]
+            return {"sentences": [dict(text="invented", source_ref=source["ref"], source_revision=source["revision"])]}
+
+    model = ChangingError()
+    build(core, ctx, model)
+    with core.storage.write(ctx) as tx:
+        tx._check().execute("UPDATE work_items SET available_at=? WHERE state='pending'", (core.clock.utc_now(),))
+    drain_worker(
+        core.storage,
+        core.clock,
+        ctx,
+        config=WorkerConfig("TEST-summary", summary_capable=True),
+        consolidation=model,
+        remaining_seconds=30,
+    )
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        failure = conn.execute("SELECT failure FROM summary_groups").fetchone()[0]
+        fields = [row[0] for row in conn.execute("SELECT error_field FROM work_error_details ORDER BY detail_id")]
+    assert fields == ["summary_grounding", "summary_invalid"]
+    assert failure == fields[-1]
+
+
+def test_summary_terminal_retry_requires_flag_and_repeats_request(app, tmp_path, monkeypatch):
+    from scope_recall.core.worker import WorkerConfig, drain_worker
+    from scope_recall.maintenance import cli
+    from test_queue_recovery_actions import _command
+
+    core, ctx = app
+    capture(core, ctx, "TEST summary source.")
+
+    class InvalidSummary:
+        def __init__(self):
+            self.requests = []
+
+        def judge(self, messages, *, remaining_seconds):
+            self.requests.append(messages)
+            source = json.loads(messages[-1]["content"])["sources"][0]
+            text = source["content"] if len(self.requests) == 4 else "invented"
+            return {"sentences": [dict(text=text, source_ref=source["ref"], source_revision=source["revision"])]}
+
+    model = InvalidSummary()
+    build(core, ctx, model)
+    for _ in range(2):
+        with core.storage.write(ctx) as tx:
+            tx._check().execute("UPDATE work_items SET available_at=? WHERE state='pending'", (core.clock.utc_now(),))
+        drain_worker(
+            core.storage,
+            core.clock,
+            ctx,
+            config=WorkerConfig("TEST-summary", summary_capable=True),
+            consolidation=model,
+            remaining_seconds=30,
+        )
+    assert len(model.requests) == 3
+    _command(core, ctx, tmp_path, monkeypatch)
+    with core.storage.read(ctx) as tx:
+        assert (
+            tx._check().execute("SELECT state FROM work_items WHERE work_type='rebuild_projection'").fetchone()[0]
+            == "failed"
+        )
+    assert (
+        cli.main(["retry-failures", "--apply", "--include-terminal", "--config", str(tmp_path / "TEST-runtime.json")])
+        == 0
+    )
+    drain_worker(
+        core.storage,
+        core.clock,
+        ctx,
+        config=WorkerConfig("TEST-summary", summary_capable=True),
+        consolidation=model,
+        remaining_seconds=30,
+    )
+    assert len(model.requests) == 4 and all(request == model.requests[0] for request in model.requests)
+    with core.storage.read(ctx) as tx:
+        assert tx._check().execute("SELECT state FROM summary_groups").fetchone()[0] == "complete"
+
+
 def rendered_conversation(core, ctx, query="昨天做了什么"):
     """Compile and render the packet through the product's conversation recall path."""
     from datetime import UTC

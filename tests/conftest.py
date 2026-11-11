@@ -94,6 +94,19 @@ _REPO_ROOT = _install_plugin()
 _register_package_alias(_REPO_ROOT)
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Report failed test phases as soon as their results are available."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.failed:
+        reporter = item.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            # An interrupted run cannot print its final failure summary.
+            phase = f" ({report.when})" if report.when != "call" else ""
+            reporter.write(f"\nFAILED {report.nodeid}{phase}\n", flush=True)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_posix_truth_hardening_cache():
     """Reset process-local POSIX hardening records around every test."""

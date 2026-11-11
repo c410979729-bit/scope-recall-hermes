@@ -142,6 +142,57 @@ def test_owner_instruction_reaches_consolidation_while_original_remains_searchab
         assert tx._check().execute("SELECT count(*) FROM claims").fetchone()[0] == 0
 
 
+#: Long enough that a batch or page sized without it has no room left for it.
+_LONG_INSTRUCTION = "TEST 只记长期决定和偏好；疑问句、反问句不记为事实；" * 18
+
+
+def _requests_after_instruction(core, ctx):
+    from scope_recall.core.management import MemoryManagement
+    from scope_recall.core.restore import InstallationMaintenance
+
+    MemoryManagement(core, InstallationMaintenance(ctx)).set_memory_instruction("TEST-scope", _LONG_INSTRUCTION)
+    _mark_embed_done(core)
+    calls = []
+
+    class SyntheticPort:
+        def propose(self, messages, *, remaining_seconds):
+            calls.append(messages)
+            return json.dumps(json.loads(messages[-1]["content"])["empty_result"])
+
+    core.consolidation = SyntheticPort()
+    for _ in range(12):
+        core.drain_worker(ctx, max_items=4, remaining_seconds=10)
+    assert all(row[3] == "done" for row in consolidate_rows(core))
+    return calls
+
+
+def test_owner_instruction_reaches_every_batch_of_an_episode(worker_app):
+    from scope_recall.core.consolidate import CONSOLIDATION_INPUT_BUDGET
+
+    core, ctx, _clock = worker_app
+    for index in range(8):
+        capture(core, ctx, f"TEST 第{index}条：部署窗口定在周{index}晚上，日志保留三十天，告警发到值班群。")
+    calls = _requests_after_instruction(core, ctx)
+    assert len(calls) > 1
+    assert sum(len(json.loads(messages[-1]["content"])["sources"]) for messages in calls) == 8
+    for messages in calls:
+        assert any(_LONG_INSTRUCTION in message["content"] for message in messages[1:-1])
+        assert sum(len(message["content"].encode("utf-8")) for message in messages) <= CONSOLIDATION_INPUT_BUDGET
+
+
+def test_owner_instruction_reaches_every_page_of_a_long_source(worker_app):
+    from scope_recall.core.consolidate import CONSOLIDATION_INPUT_BUDGET
+
+    core, ctx, _clock = worker_app
+    capture(core, ctx, "TEST 长消息：" + "我们决定把日志保留三十天，告警发到值班群。" * 120)
+    calls = _requests_after_instruction(core, ctx)
+    assert len(calls) > 1
+    for messages in calls:
+        assert "source_window" in json.loads(messages[-1]["content"])["sources"][0]
+        assert any(_LONG_INSTRUCTION in message["content"] for message in messages[1:-1])
+        assert sum(len(message["content"].encode("utf-8")) for message in messages) <= CONSOLIDATION_INPUT_BUDGET
+
+
 def test_C14_duplicate_capture_does_not_expand_work(worker_app):
     core, ctx, clock = worker_app
     first = capture(core, ctx, "好", key="TEST-C14/1")

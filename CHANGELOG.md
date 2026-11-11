@@ -6,6 +6,8 @@ A line or two per release.  Each release's full notes are on its GitHub release 
 
 Between releases, `distribution/hermes/plugin.yaml` on the default branch keeps naming the newest release, so `hermes plugins install 410979729/scope-recall-hermes#distribution/hermes` goes on installing a core that is on PyPI.
 
+Fixes: a scope memory instruction reaches every consolidation request and an evidence quote without letters or digits is refused (#360); entity and adoption requests name JSON (#359); auxiliary budgets settle proven refusals at zero and kept reservations can be inspected and released (#366); failed summary pages record why (#363); an excluded Hermes recording-control message gives back its capture slot (#364).
+
 ## [4.0.3] - 2026-11-07
 
 `hermes memory setup` and `scope-recall setup --host hermes` now give a new Hermes entry's memory to Hermes Desktop on the same machine as well as to the CLI: the entry gets the owner principal `(desktop, local)` and its `owner_private` row on the CLI row's scope, so a Desktop chat recalls and captures without a `scope-recall grants` edit. `hermes --tui` still needs the owner's approval, because the browser dashboard's chat tab runs the TUI and a dashboard on loopback can serve it without a login. Running setup again keeps an existing entry's grants; add Desktop to an entry made by an earlier release as `docs/install/hermes.md` describes.
