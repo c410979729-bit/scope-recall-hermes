@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import sys
+from collections import ChainMap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,114 @@ from .validation import absolute_path, strict_bool, strict_float, strict_int
 EPHEMERAL_CONFIG_INFIX = "-worker-"
 #: A runtime config's file name, beside the binding's data or an entry's attachment.
 RUNTIME_CONFIG_FILENAME = "runtime-config.json"
+
+#: System executables, user locations, temporary files, locale and timezone must resolve as they do in the host.
+_WORKER_ENV_NAMES = (
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USER",
+    "LOGNAME",
+    "USERNAME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "TZDIR",
+    "PYTHONTZPATH",
+    # The same interpreter keeps its package policy, encoding and operator-selected execution behavior.
+    "PYTHONPATH",
+    "PYTHONNOUSERSITE",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONUNBUFFERED",
+    "PYTHONWARNINGS",
+    "PYTHONSAFEPATH",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "PYTHONCOERCECLOCALE",
+    "PYTHONLEGACYWINDOWSSTDIO",
+    "PYTHONLEGACYWINDOWSFSENCODING",
+    # Interpreter and native dependencies must remain discoverable without enabling preload injection.
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    # SQLite scratch files and TLS configuration retain deployment-specific locations.
+    "SQLITE_TMPDIR",
+    "OPENSSL_CONF",
+    # HTTP model routes and CLI subscriptions retain the operator's proxy and certificate locations.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    # A subscription route locates its existing CLI login without inheriting ambient provider overrides.
+    "CODEX_HOME",
+    # NumPy's native vector math retains explicit CPU limits, affinity and Linux huge-page compatibility settings.
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_MAIN_FREE",
+    "NUMPY_MADVISE_HUGEPAGE",
+)
+
+
+def _worker_environment(config_path: Path, environment: dict[str, str] | None) -> dict[str, str]:
+    """Select child settings and declared route credentials, with caller values taking precedence.
+
+    Overrides pass through the same selection as the parent, including explicitly requested deployment names.
+    Windows aliases merge case-insensitively; the last explicit item in mapping iteration order wins when aliases
+    collide. POSIX names remain distinct. Values may contain secrets, and the watchdog's descendants inherit the
+    selected environment without a separate filtering policy.
+    """
+    from .instance_config import WORKER_ENVIRONMENT_FORBIDDEN
+    from .worker_entry import load_config
+
+    config = load_config(config_path)
+    windows = os.name == "nt"
+    overrides = environment or {}
+    if windows:
+        overrides = {name.upper(): value for name, value in overrides.items()}
+    source = ChainMap(overrides, os.environ)
+    names: set[str] = set(_WORKER_ENV_NAMES) | set(config.worker_environment_names)
+    # Plugin-owned settings include runtime authorization paths and the isolated test process guard.
+    names.update(name for name in source if name.startswith("SCOPE_RECALL_"))
+    auxiliary = config.auxiliary
+    # Only credentials named by the trusted runtime configuration are eligible; absent names stay absent.
+    if auxiliary is not None:
+        names.update(
+            name
+            for route in (auxiliary.embedding, auxiliary.consolidation)
+            if (name := getattr(route, "credential_env", None))
+        )
+    if windows:
+        names = {name.upper() for name in names}
+    names.difference_update(WORKER_ENVIRONMENT_FORBIDDEN)
+    return {name: source[name] for name in names if name in source}
 
 
 def is_ephemeral_worker_config(path: Path) -> bool:
@@ -176,12 +285,7 @@ def launch_worker(
         command.extend(("--after-pid", str(after_pid)))
     if delay_seconds:
         command.extend(("--delay-seconds", str(delay_seconds)))
-    # The caller owns PYTHONPATH and other trusted environment configuration;
-    # copying it avoids mutating the parent while preserving installed/checked
-    # package resolution for the child.
-    child_env = os.environ.copy()
-    if environment:
-        child_env.update(environment)
+    child_env = _worker_environment(path, environment)
     package_root = Path(__file__).resolve().parents[1]
     inherited_pythonpath = child_env.get("PYTHONPATH")
     child_env["PYTHONPATH"] = str(package_root) + (os.pathsep + inherited_pythonpath if inherited_pythonpath else "")

@@ -821,7 +821,7 @@ def test_a_hook_past_the_host_timeout_is_said_and_counted(adapter, monkeypatch, 
 
 
 def test_a_host_that_never_times_out_a_hook_hears_of_no_skip(adapter, monkeypatch, caplog):
-    """Hermes reads a hook timeout of 0 or less as none: it waits for the hook and skips nothing, so nothing may say
+    """Hermes reads a hook timeout of 0 as none: it waits for the hook and skips nothing, so nothing may say
     that it does."""
     provider, _clock = adapter
     monkeypatch.setattr(hooks, "host_hook_timeout", lambda: None)
@@ -834,17 +834,61 @@ def test_a_host_that_never_times_out_a_hook_hears_of_no_skip(adapter, monkeypatc
     assert provider.diagnostics.host_backpressure is None
 
 
-def test_a_hook_timeout_of_zero_is_read_as_none(monkeypatch):
-    """As Hermes reads it: ``plugins.hook_callback_timeout`` of 0 or less waits for a hook however long it takes."""
+@pytest.mark.parametrize(
+    "configured, expected",
+    [(0, None), (-5, 30.0), (45, 45.0), ("12.5", 12.5), (900, 600.0), (float("inf"), 600.0), (float("nan"), 30.0)],
+)
+def test_host_hook_timeout_reads_public_config(monkeypatch, configured, expected):
+    """Zero disables the host deadline; negative settings fall back to its default."""
     import sys
     import types
 
-    plugins = types.ModuleType("hermes_cli.plugins")
+    config = types.ModuleType("hermes_cli.config")
     monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
-    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
-    for configured, read in ((0, None), (-5, None), (45, 45.0)):
-        plugins._resolve_hook_callback_timeout = lambda value=configured: value
-        assert hooks.host_hook_timeout() == read, configured
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    config.load_config_readonly = lambda: {"plugins": {"hook_callback_timeout": configured}}
+    assert hooks.host_hook_timeout() == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"plugins": None},
+        {"plugins": {"hook_callback_timeout": None}},
+        {"plugins": {"hook_callback_timeout": "invalid"}},
+    ],
+)
+def test_host_hook_timeout_defaults_for_missing_or_invalid_public_config(monkeypatch, payload):
+    import sys
+    import types
+
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config_readonly = lambda: payload
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    assert hooks.host_hook_timeout() == 30.0
+
+
+def test_host_hook_timeout_defaults_without_public_reader(monkeypatch):
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", types.ModuleType("hermes_cli.config"))
+    assert hooks.host_hook_timeout() == 30.0
+
+
+@pytest.mark.parametrize("value, expected", [(0, None), (45, 45.0)])
+def test_host_hook_timeout_falls_back_to_public_config_loader(monkeypatch, value, expected):
+    import sys
+    import types
+
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config = lambda: {"plugins": {"hook_callback_timeout": value}}
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    assert hooks.host_hook_timeout() == expected
 
 
 def _turn_with_interim(provider, turn: str, steps: int) -> None:

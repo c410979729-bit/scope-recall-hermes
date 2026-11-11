@@ -15,6 +15,7 @@ from ..core.recall_budget import DEFAULT_INJECTION_TOKEN_CAP
 from ..core.recall_log_storage import DEFAULT_LOG_POLICY, LOG_POLICY_BOUNDS
 from ..core.recall_policy import EMBEDDING_SPACE, RecallPolicy, embedding_space_id
 from .auxiliary import AuxiliaryRuntimeConfig
+from .models import validate_credential_env_name
 from .validation import (
     absolute_path,
     identifier,
@@ -33,6 +34,20 @@ _HOST_ADAPTERS = frozenset({"hermes", "codex", "claude-code", "workbuddy", "dsh"
 
 
 _VECTOR_BACKENDS = frozenset({"sqlite", "sqlite-vec", "lancedb", "sqlite-bruteforce"})
+
+#: Interpreter and loader injection overrides are excluded even from explicitly requested worker settings.
+WORKER_ENVIRONMENT_FORBIDDEN = frozenset(
+    {
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONBREAKPOINT",
+        "PYTHON_PRESITE",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +175,8 @@ class RuntimeInstanceConfig:
     auto_retry_cooldown_seconds: float = 3600.0
     max_auto_recoveries: int = 2
     worker_min_interval_seconds: float = 30.0
+    #: Additional parent environment names needed by this deployment; values stay outside runtime configuration.
+    worker_environment_names: tuple[str, ...] = ()
     supervisor_enabled: bool = True
     supervisor_seconds: float = 21600.0
     supervisor_max_drains: int = 256
@@ -195,6 +212,7 @@ class RuntimeInstanceConfig:
         for name, (low, high) in _COUNT_BOUNDS.items():
             strict_int(name, getattr(self, name), minimum=low, maximum=high)
         strict_bool("supervisor_enabled", self.supervisor_enabled)
+        self._check_worker_environment_names()
         strict_bool("session_brief_enabled", self.session_brief_enabled)
         strict_int("session_brief_tokens", self.session_brief_tokens, minimum=1, maximum=8192)
         member("injection_format", self.injection_format, FORMATS)
@@ -222,6 +240,14 @@ class RuntimeInstanceConfig:
         # valid space, is an invalid configuration rather than a failed build.
         self.recall_policy()
         self._check_vector_binding()
+
+    def _check_worker_environment_names(self) -> None:
+        if type(self.worker_environment_names) is not tuple or len(self.worker_environment_names) > 32:
+            raise ValueError("worker_environment_names")
+        for name in self.worker_environment_names:
+            validate_credential_env_name(name)
+            if name.upper() in WORKER_ENVIRONMENT_FORBIDDEN:
+                raise ValueError("worker_environment_names_forbidden")
 
     def _check_vector_binding(self) -> None:
         vector = self.vector
@@ -287,8 +313,10 @@ class RuntimeInstanceConfig:
             for item in fields(cls)
             if item.name not in _COMPOSED_FIELDS
         }
-        if type(plain["owner_names"]) is list:  # JSON has no tuple; anything else is refused by the policy
-            plain["owner_names"] = tuple(plain["owner_names"])
+        # JSON has no tuples; preserve other input types so the field's validator can refuse them.
+        for name in ("owner_names", "worker_environment_names"):
+            if type(plain[name]) is list:
+                plain[name] = tuple(plain[name])
         return cls(
             binding=binding,
             allowed_scope_ids=frozenset(raw.get("allowed_scope_ids") or ()),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import threading
 import time
 import weakref
@@ -19,6 +20,8 @@ _SUPPORTED_HOOKS = tuple(_OBSERVERS)
 #: Fallback callback allowance when the host SDK cannot supply its configured timeout. Each session lock waits for
 #: a bounded share so a busy session cannot stall unrelated callbacks.
 _HOST_HOOK_TIMEOUT_S = 30.0
+#: The documented upper bound for plugins.hook_callback_timeout.
+_HOST_HOOK_TIMEOUT_MAX_S = 600.0
 #: The longest a hook waits for its own session, at most a third of the host's timeout.
 _SESSION_WAIT_CAP_S = 10.0
 _REGISTRY_LOCK = threading.RLock()
@@ -88,15 +91,27 @@ def _active_adapter(kwargs: dict[str, Any]) -> Any | None:
 
 
 def host_hook_timeout() -> float | None:
-    """Hermes' ``plugins.hook_callback_timeout`` as Hermes reads it, or its default outside Hermes; ``None`` when
-    the operator set it to 0 or less, with which Hermes waits for a hook however long it takes."""
-    try:
-        from hermes_cli.plugins import _resolve_hook_callback_timeout  # pyright: ignore[reportMissingImports]
+    """Read the documented hook deadline through Hermes' public configuration API.
 
-        timeout = float(_resolve_hook_callback_timeout())
+    Zero disables the deadline, negative/invalid values use the 30-second default, and positive values are capped
+    at the documented 600 seconds. Prefer load_config_readonly, then load_config on hosts without that function;
+    unavailable APIs use the default. NaN deliberately uses the default even when the host's resolver returns NaN.
+    """
+    try:
+        try:
+            from hermes_cli.config import load_config_readonly  # pyright: ignore[reportMissingImports]
+        except ImportError:
+            from hermes_cli.config import load_config as load_config_readonly  # pyright: ignore[reportMissingImports]
+
+        plugins = (load_config_readonly() or {}).get("plugins")
+        if not isinstance(plugins, dict) or plugins.get("hook_callback_timeout") is None:
+            return _HOST_HOOK_TIMEOUT_S
+        timeout = float(plugins["hook_callback_timeout"])
     except Exception:
         return _HOST_HOOK_TIMEOUT_S
-    return timeout if timeout > 0 else None
+    if timeout < 0 or math.isnan(timeout):
+        return _HOST_HOOK_TIMEOUT_S
+    return min(timeout, _HOST_HOOK_TIMEOUT_MAX_S) if timeout > 0 else None
 
 
 def _dispatch(event: str, kwargs: dict[str, Any], *, wait: float) -> Any | None:
