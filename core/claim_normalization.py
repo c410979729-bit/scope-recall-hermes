@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 
-from .claims import evidence_context, rejects_other_value
+from .claims import effective_origin, evidence_context, rejects_other_value, verified_human_ref
 from .source_qualification import AUTHORITY_QUESTION, CONDITIONAL, REPORTED_SPEECH, UNASSERTED_UNCERTAINTY
 
 PROJECT_TAG = re.compile(r"项目[【\[][^【】\[\]\n]{1,120}[】\]]")
@@ -193,11 +193,8 @@ def expand_frames(proposal, roots):
 
 
 def human_owner(roots):
-    owners = {
-        (r.source_principal or {}).get("principal_ref")
-        for r in roots
-        if r.origin == "human_direct" and (r.source_principal or {}).get("resolution") == "verified"
-    }
+    """Return the one verified human speaker, including attested imports; mixed or missing identities stay unknown."""
+    owners = {verified_human_ref(r) for r in roots if effective_origin(r) == "human_direct"}
     return next(iter(owners)) if len(owners) == 1 and None not in owners else None
 
 

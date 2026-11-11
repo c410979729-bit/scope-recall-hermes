@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from scope_recall.contracts import TrustedSourcePrincipal
 from scope_recall.core.language_resources import prompt_text
 from scope_recall.core.recall_budget import estimate_tokens
 from scope_recall.maintenance.setup_configuration import runtime_payload
@@ -24,9 +25,9 @@ from tests.v11_support import context, recall_request, source_event
 
 def test_monthly_twenty_turn_recommendation_includes_inflight_reserves():
     totals = recommended_totals(daily_turns=20, period="monthly")
-    assert totals["total_call_cap"] == 4411
-    assert totals["total_input_cap"] == 8761083
-    assert totals["total_output_cap"] == 303188
+    assert totals["total_call_cap"] == 4615
+    assert totals["total_input_cap"] == 8948134
+    assert totals["total_output_cap"] == 316487
     assert totals["inflight_input"] == 65536
     assert totals["inflight_output"] == 8192
     assert totals["cap_micro_usd"] == 0
@@ -60,6 +61,7 @@ def counting_response(proposals, records):
     """Record each protocol stage while returning bounded synthetic responses."""
 
     def response(**kwargs):
+        drift = False
         body = json.loads(kwargs["body"])
         if "input" in body:
             texts = body["input"] if isinstance(body["input"], list) else [body["input"]]
@@ -115,6 +117,17 @@ def counting_response(proposals, records):
                     else "extraction"
                 )
                 answer = json.dumps(dict(support="supported", action="new", target_ref=None, target_revision=None))
+                if stage == "extraction" and payload["proposal"]["subject"].startswith("TEST-workload"):
+                    drift = True
+                    target = next(c for c in payload["candidates"] if c["payload"]["value_text"] == "March 3")
+                    answer = json.dumps(
+                        dict(
+                            support="supported",
+                            action="update",
+                            target_ref=target["ref"],
+                            target_revision=target["revision"],
+                        )
+                    )
             else:
                 stage, found = "extraction", []
                 for source in payload["sources"]:
@@ -140,10 +153,40 @@ def counting_response(proposals, records):
                 choices=[dict(message=dict(role="assistant", content=answer), finish_reason="stop")],
                 usage=dict(prompt_tokens=inputs, completion_tokens=estimate_tokens(answer)),
             )
-        records.append(dict(task=stage, input_tokens=inputs, output_tokens=estimate_tokens(answer) if answer else 0))
+        records.append(
+            dict(
+                task=stage,
+                input_tokens=inputs,
+                output_tokens=estimate_tokens(answer) if answer else 0,
+                slot_drift=drift,
+            )
+        )
         return 200, json.dumps(data).encode()
 
     return response
+
+
+def label_drift_proposals():
+    """Four dated-plan pairs whose corrections change kind, separator and subject boundary."""
+    drift_proposals = []
+    for index in range(8):
+        correction = index % 2 == 1
+        value = "March 17" if correction else "March 3"
+        text = f"TEST-workload{index // 2} launch date {value}."
+        drift_proposals.append(
+            dict(
+                kind="decision" if correction else "fact",
+                statement_kind="decision" if correction else "assertion",
+                subject=f"TEST-workload{index // 2}" + (" launch" if correction else ""),
+                predicate="launch_date" if correction else "launch date",
+                value_text=value,
+                conditions=[],
+                valid_from=None,
+                valid_to=None,
+                evidence_spans=[dict(source_ref="event-TEST", source_revision=1, quote=text, start=0, end=len(text))],
+            )
+        )
+    return drift_proposals
 
 
 def test_hundred_turn_worker_cost_matches_setup_catalog(tmp_path, monkeypatch, record_property):
@@ -154,11 +197,9 @@ def test_hundred_turn_worker_cost_matches_setup_catalog(tmp_path, monkeypatch, r
         for case in corpus
         for p in [*(item["payload"] for item in case["input"]["candidates"]), case["input"]["proposal"]]
     ]
+    drift_proposals = label_drift_proposals()
     records = []
-
-    response = counting_response(proposals, records)
-
-    transport = FakeTransport(response)
+    transport = FakeTransport(counting_response([*proposals, *drift_proposals], records))
     monkeypatch.setattr(
         instance,
         "build_auxiliary_runtime",
@@ -223,6 +264,9 @@ def test_hundred_turn_worker_cost_matches_setup_catalog(tmp_path, monkeypatch, r
                 ctx,
                 session_id=f"TEST-session-{turn // 25}",
                 task_anchor="TEST-task" if 40 <= turn <= 49 else None,
+                source_principal=TrustedSourcePrincipal("human", "verified", "principal:TEST-cost-owner")
+                if 60 <= turn < 68
+                else None,
             )
             content = (
                 proposals[turn]["evidence_spans"][0]["quote"]
@@ -230,6 +274,8 @@ def test_hundred_turn_worker_cost_matches_setup_catalog(tmp_path, monkeypatch, r
                 else f"For synthetic checkpoint {turn}, explain the tradeoffs of SQLite transactions and queue retries."
             )
             content += " Keep source evidence, error recovery, and resource limits explicit. " * (1 + turn % 4)
+            if 60 <= turn < 68:
+                content = drift_proposals[turn - 60]["evidence_spans"][0]["quote"]
             if turn in {7, 19, 38, 57, 76, 95}:
                 content = f"Adopt option {turn - 1}."
             if turn == 40:
@@ -300,7 +346,24 @@ def test_hundred_turn_worker_cost_matches_setup_catalog(tmp_path, monkeypatch, r
             "workload_measurement",
             json.dumps(dict(turns=100, assistant_token_lengths=lengths, tasks=counts, requests=records)),
         )
-        assert_within_a_tenth(counts, recommended_workload())
-        assert counts["entity_resolution"]["calls"] > 0
+        assert_worker_measurement(runtime, ctx, counts, records)
     finally:
         runtime.close()
+
+
+def assert_worker_measurement(runtime, ctx, counts, records):
+    """Check metering and that the measured corrections actually advanced four existing facts."""
+    assert counts["entity_resolution"]["calls"] > 0
+    assert sum(record["slot_drift"] for record in records) == 4
+    with runtime.core.storage.read(ctx) as tx:
+        heads = (
+            tx._check()
+            .execute(
+                "SELECT v.state,json_extract(v.payload_json,'$.value_text') FROM claims c "
+                "JOIN claim_versions v ON v.claim_id=c.claim_id AND v.revision=c.current_revision "
+                "WHERE c.subject LIKE 'TEST-workload%'"
+            )
+            .fetchall()
+        )
+    assert [tuple(row) for row in heads] == [("active", "March 17")] * 4
+    assert_within_a_tenth(counts, recommended_workload())
