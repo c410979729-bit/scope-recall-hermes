@@ -25,6 +25,9 @@ from .shared import attach, fresh_installation, init_shared
 MARKER = "amber-orchid"
 STATEMENT = "The synthetic bluebird project marker is amber-orchid."
 QUESTION = "What is the synthetic bluebird project marker?"
+# Setup already allows ten seconds for shared-store locks. Give cold diagnostic
+# files the same headroom instead of imposing the short runtime shutdown budget.
+DIAGNOSTIC_CLOSE_SECONDS = 10.0
 
 
 def _client(home: Path, host: str, session: str, prompt: str) -> dict:
@@ -65,21 +68,27 @@ def _hermes(home: Path, session: str, prompt: str, *, capture: bool, agent_ident
         provider.shutdown()
 
 
-def _clean_owned_check(root: Path) -> None:
-    """Remove only enumerated files in this call's new directory, without recursive deletion."""
+def _clean_owned_check(root: Path) -> dict:
+    """Retire this probe's writers and report removal or retention without changing readiness."""
     # Host shutdown can detach its runtime. Retire only this probe's diagnostics
     # before enumerating files so a late WAL or health receipt cannot race removal.
-    if not close_writers(root):
-        raise OSError("verification diagnostics still active; directory retained")
-    paths = list(root.rglob("*"))
-    if any(path.is_symlink() for path in paths):
-        raise ValueError("verification directory contains a link; retain it for inspection")
-    for path in paths:
-        if path.is_file():
-            path.unlink()
-    for path in sorted((path for path in paths if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
-        path.rmdir()
-    root.rmdir()
+    retained = dict(status="retained", directory=str(root), reason="verification diagnostics still active")
+    try:
+        if not close_writers(root, timeout=DIAGNOSTIC_CLOSE_SECONDS):
+            return retained
+        paths = list(root.rglob("*"))
+        if any(path.is_symlink() for path in paths):
+            return dict(retained, reason="verification directory contains a link; retain it for inspection")
+        for path in paths:
+            if path.is_file():
+                path.unlink()
+        for path in sorted((path for path in paths if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
+            path.rmdir()
+        root.rmdir()
+    except (OSError, ValueError) as exc:
+        # Filesystem exception text can contain caller data; keep a fixed reason and type.
+        return dict(retained, reason="verification directory cleanup failed", error_type=type(exc).__name__)
+    return dict(status="removed", directory=str(root))
 
 
 @contextmanager
@@ -100,7 +109,7 @@ def temporary_credentials(config: RuntimeInstanceConfig, env_file: str | None):
 
 
 def verify_memory(parent: Path, host: HostChoice, source: dict, *, env_file: str | None = None) -> dict:
-    """Run the host adapter and real worker on an independent synthetic store, then remove it."""
+    """Probe an independent synthetic store and report its readiness and cleanup separately."""
     from .setup_configuration import runtime_payload
 
     if host == "hermes":
@@ -123,6 +132,7 @@ def verify_memory(parent: Path, host: HostChoice, source: dict, *, env_file: str
             probe_parent = ancestor.parent
     root = probe_parent / ("setup-check-" + uuid.uuid4().hex)
     root.mkdir(parents=True)
+    result: dict = {}
     try:
         store, home = root / "store", root / "host"
         init_shared(root=store, agent_id="setup-check", test_mode=True)
@@ -191,7 +201,7 @@ def verify_memory(parent: Path, host: HostChoice, source: dict, *, env_file: str
                 and not worker.get("capability_gaps")
                 and worker.get("processed", 0)
             )
-            return dict(
+            result.update(
                 capture=True,
                 worker_exit=code,
                 worker=worker,
@@ -199,5 +209,6 @@ def verify_memory(parent: Path, host: HostChoice, source: dict, *, env_file: str
                 models_verified=full,
                 isolation="independent synthetic store; no test messages enter the selected memory store",
             )
+            return result
     finally:
-        _clean_owned_check(root)
+        result["cleanup"] = _clean_owned_check(root)

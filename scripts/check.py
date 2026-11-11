@@ -409,6 +409,7 @@ SUITES = {
         "tests/packaging/test_hermes_catalog_setup.py",
         "tests/packaging/test_setup.py",
         "tests/packaging/test_setup_repairs.py",
+        "tests/packaging/test_setup_cleanup.py",
         "tests/packaging/test_clean_v11_wheel.py",
         "tests/packaging/test_package_upgrade.py",
         "tests/packaging/test_install_v11.py",

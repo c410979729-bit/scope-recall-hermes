@@ -80,7 +80,7 @@ def _attach(row: dict, plan) -> None:
 
         entry = "hermes-" + hashlib.sha256(str(Path(row["home"]).resolve()).encode()).hexdigest()[:16]
     if entry in taken:
-        raise ValueError("entry name already belongs to another home; choose that home or detach explicitly")
+        raise InstallError("entry name already belongs to another home; choose that home or detach explicitly")
     source = row["scopes"]["source_entry"]
     kwargs: dict[str, Any] = (
         dict(grants_like=(source,), capture_like=source) if source and row["host"] != "hermes" else {}
@@ -285,13 +285,18 @@ def apply_setup(plan, *, register_copies: bool = False) -> dict[str, Any]:
             host_activation="Start a new host session; approve plugin hooks or MCP when the host requests it.",
         )
     except Exception as exc:  # noqa: BLE001 -- external failures must produce a sanitized recovery receipt.
-        # Unexpected transport/parser errors may carry credentials. Persist only a type and the known stage, plus
-        # the text of the installer's own refusals, which name paths and settings and never credential values.
+        # External exception text may carry credentials. Only installer refusals,
+        # the known stage and numeric operating-system error codes belong in receipts.
         value = dict(
             status="failed",
             failed_step=stage,
             error_type=type(exc).__name__,
             reason=str(exc) if isinstance(exc, (InstallError, SharedStoreError)) else None,
+            **{
+                name: getattr(exc, name)
+                for name in ("errno", "winerror")
+                if isinstance(exc, OSError) and type(getattr(exc, name, None)) is int
+            },
             completed=completed,
             backups=backups,
             receipt=str(receipt),

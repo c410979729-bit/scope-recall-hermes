@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from ..adapters.clients.config import CodexConfigError, load_codex_config
 from .backup import adjacent_backup, atomic_write
+from .install_common import InstallError
 
 
 def remote_identity(root: Path) -> str | None:
@@ -66,7 +67,7 @@ def register_project_copy(home: Path, suggestion: dict[str, str]) -> Path:
     config = load_codex_config(path)
     current = project_suggestions(home, Path(suggestion["directory"]))
     if suggestion not in current:
-        raise ValueError("project suggestion changed; rerun setup")
+        raise InstallError("project suggestion changed; rerun setup")
     payload = json.loads(path.read_text(encoding="utf-8"))
     backup = adjacent_backup(path)
     payload["project_roots"][suggestion["directory"]] = suggestion["scope_id"]
