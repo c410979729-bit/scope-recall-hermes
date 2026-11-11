@@ -194,11 +194,14 @@ def test_unbound_provider_is_unavailable_and_hooks_do_not_raise(fake_user):
 
 def test_catalog_manifest_declares_hooks_and_pinned_core():
     from scope_recall._version import __version__
+    from scope_recall.adapters.host_profiles import HOSTS
 
     root = Path(__file__).resolve().parents[2]
     for relative in ["adapters/hermes/plugin.yaml", "distribution/hermes/plugin.yaml"]:
         value = yaml.safe_load((root / relative).read_text("utf-8"))
         assert "provides_hooks" in value and "hooks" not in value
+    packaged = yaml.safe_load((root / "adapters/hermes/plugin.yaml").read_text("utf-8"))
+    assert set(packaged["provides_hooks"]) == {event for event, _observer in HOSTS["hermes"].hook_observers}
     value = yaml.safe_load((root / "distribution/hermes/plugin.yaml").read_text("utf-8"))
     assert value["requires_hermes"] == ">=0.22.5"
     if ".dev" in __version__:
@@ -208,6 +211,7 @@ def test_catalog_manifest_declares_hooks_and_pinned_core():
         assert re.fullmatch(r"\d+\.\d+\.\d+", expected)
     else:
         expected = __version__
+        assert set(value["provides_hooks"]) == set(packaged["provides_hooks"])
     assert value["pip_dependencies"] == [f"hermes-scope-recall[vectors]=={expected}"]
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 
 def proposal(source, *, subject="TEST-azalea", value="琥珀色", kind="decision", predicate="配色"):
@@ -87,24 +88,49 @@ class FixtureModel:
         return json.dumps(value, ensure_ascii=False)
 
 
-def drain(scenes, model, *, rounds=6):
-    """Run bounded real worker passes and retain receipts and fake-port call counts."""
+def drain(scenes, model, *, rounds=None):
+    """Drain ready work, or observe an explicit number of passes without advancing business time.
+
+    Future work and missing ports remain visible in the returned queue state.
+    The wall limit bounds a hang; it never turns unfinished work into success.
+    """
     receipts = []
-    for _ in range(rounds):
+    deadline = time.monotonic() + 120
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"scenario worker did not settle: {receipts}")
         receipt = scenes.core.drain_worker(
             scenes.context(),
             owner_id="TEST-scenarios-worker",
             consolidation=model,
             max_items=64,
-            remaining_seconds=20,
+            remaining_seconds=min(20, remaining),
         )
         receipts.append(str(receipt))
-    return dict(receipts=receipts, model_calls=list(getattr(model, "calls", ())))
+        pending = scenes.rows(
+            "SELECT work_type,state,available_at,last_error_code FROM work_items WHERE state IN ('pending','leased')"
+        )
+        ready = [
+            row
+            for row in pending
+            if row["available_at"] <= scenes.clock.utc_now()
+            and (
+                row["work_type"] in {"purge", "rebuild_projection"} or model is not None and row["work_type"] != "embed"
+            )
+        ]
+        if rounds is not None:
+            if len(receipts) >= rounds:
+                break
+        elif not ready:
+            break
+    return dict(receipts=receipts, pending=pending, model_calls=list(getattr(model, "calls", ())))
 
 
 def seed_claim(scenes):
     """Capture a literal decision through a hook, then derive it with the fake port."""
     scenes.hook("codex", "TEST-azalea 配色是琥珀色。")
+    scenes.flush_captures()
     model = FixtureModel()
     drain(scenes, model)
     rows = scenes.rows("SELECT * FROM claims WHERE subject='TEST-azalea'")

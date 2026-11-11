@@ -8,10 +8,12 @@ import jsonschema
 import pytest
 from scope_recall.adapters.clients import CodexHookHandler
 from scope_recall.adapters.clients.identity import resolve_runtime_audience, trusted_context
+from scope_recall.adapters.hermes.authorization import build_ingress_authorizer
 from scope_recall.adapters.hermes.shared_entries import attach_shared_record, client_entry_record, read_shared_payload
 from scope_recall.adapters.runtime_wiring import render_host_recall_context
 from scope_recall.contracts import TrustedSourcePrincipal
 from scope_recall.core import recall_restatement
+from scope_recall.core.capture_inbox import replay_inbox
 from scope_recall.core.deadline import RequestDeadline, using_request_deadline
 from scope_recall.core.recall_packet import RecallPacketCompiler, packet_item, render_recall_packet_context
 from scope_recall.core.recall_restatement import mark_restatement, prefer_originals
@@ -455,6 +457,14 @@ def test_real_client_capture_pairs_assistant_under_same_installation_owner(
                 cwd=str(tmp_path),
             )
         )
+        # On a slow disk a capture stays in the durable inbox when its commit would run past the hook's wait.
+        # A replay commits it, as a worker's does.
+        authorize = build_ingress_authorizer(b.core.storage.binding)
+        for hook, session in ((a, "TEST-first"), (b, "TEST-second")):
+            writer = trusted_context(
+                hook.config, resolve_runtime_audience(hook.config, None), session_id=session, mutation=True
+            )
+            replay_inbox(hook.core.storage, hook.core.clock, writer, authorize=authorize, remaining_seconds=30)
         contexts = [
             trusted_context(hook.config, resolve_runtime_audience(hook.config, None), session_id="TEST-reader")
             for hook in (a, b)

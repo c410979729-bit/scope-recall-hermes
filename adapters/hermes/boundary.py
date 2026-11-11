@@ -686,7 +686,11 @@ def steer_source_event(
     steer: Steer,
     recorded_at: str,
 ) -> tuple[SourceEvent | None, tuple[str, ...], SourceIdentity | None]:
-    """One message the person sent while a turn ran, stored in the session it is first read in."""
+    """Store a delivered steer or an unanswered historical row in its first observed session.
+
+    Untimed history keeps an unknown occurrence so Core can enforce historical privacy intervals. A typed
+    steer may use the instant its request hook first observes it.
+    """
     return ledger.observe(
         source_event_key=steer_source_key(context, steer),
         source_revision=1,
@@ -694,7 +698,7 @@ def steer_source_event(
         content=steer.words,
         origin=context.actor_origin,
         recorded_at=recorded_at,
-        occurred_at=steer.occurred_at or recorded_at,
+        occurred_at=steer.occurred_at if steer.kind == UNANSWERED_KIND else steer.occurred_at or recorded_at,
         capture_state="complete",
     )
 

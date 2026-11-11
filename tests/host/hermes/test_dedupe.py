@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextvars import copy_context
 
 from scope_recall.adapters.hermes import ScopeRecallHermesAdapter
 from scope_recall.adapters.hermes.boundary import SourceObservationLedger, pre_llm_source_event, sync_turn_source_events
@@ -110,6 +111,7 @@ def test_success_sync_persists_with_trusted_context(adapter, hermes_home):
 def test_what_the_assistant_showed_between_tool_calls_is_recorded_with_the_answer(adapter, hermes_home):
     """Hermes hands ``sync_turn`` the answer only; the rest of the turn arrives with ``post_llm_call``."""
     provider, _clock = adapter
+    provider.on_turn_start(3, "TEST 别的回合", turn_id="turn-other")
     provider.on_turn_start(4, "TEST 查一下 QX-17", turn_id="turn-4")
     history = [
         {"role": "user", "content": "TEST 上一轮"},
@@ -263,6 +265,7 @@ def test_a_message_hermes_writes_itself_is_stored_as_the_host_s(adapter, hermes_
         user_message=asked["content"],
         conversation_history=[asked],
     )
+    provider.on_turn_start(1, asked["content"])
     provider.sync_turn(asked["content"], started["content"], session_id="TEST-session-1")
     _global_callback("pre_llm_call")(
         session_id="TEST-session-1",
@@ -271,6 +274,7 @@ def test_a_message_hermes_writes_itself_is_stored_as_the_host_s(adapter, hermes_
         user_message=_NOTICE,
         conversation_history=[asked, started, notice],
     )
+    provider.on_turn_start(2, _NOTICE)
     provider.observe_post_llm_call(
         session_id="TEST-session-1",
         turn_id="turn-notice",
@@ -311,9 +315,7 @@ def test_a_notice_whose_pre_llm_call_was_not_taken_is_still_the_host_s(adapter, 
 
 
 def test_a_late_sync_of_the_person_s_turn_keeps_their_words_theirs(adapter, hermes_home):
-    """Hermes runs ``sync_turn`` on its memory worker, after the reply, and the adapter names the turn by the one
-    active then: the next turn, a notice whose ``pre_llm_call`` a busy session left untaken, may have begun.  The
-    person's message written then is still theirs."""
+    """A queued human turn keeps its identity when a recovered host notice opens the next turn."""
     provider, _clock = adapter
     said = "TEST 帮我看一下日志"
     provider._calls.busy(
@@ -321,6 +323,7 @@ def test_a_late_sync_of_the_person_s_turn_keeps_their_words_theirs(adapter, herm
         {"turn_id": "turn-person", "user_message": said, "conversation_history": [{"role": "user", "content": said}]},
     )
     provider.on_turn_start(8, said)
+    queued = copy_context()
     provider._calls.busy(
         "pre_llm_call",
         {
@@ -334,10 +337,11 @@ def test_a_late_sync_of_the_person_s_turn_keeps_their_words_theirs(adapter, herm
         },
     )
     provider.on_turn_start(9, _NOTICE)
-    provider.sync_turn(said, "TEST 日志正常。", session_id="TEST-session-1")
+    queued.run(provider.sync_turn, said, "TEST 日志正常。", session_id="TEST-session-1")
     rows = [(role, content, origin) for role, content, origin, _at in _stored(hermes_home)]
     assert ("user", said, "human_direct") in rows
-    assert not any(origin == "host_generated" for _role, _content, origin in rows)
+    assert rows.count(("user", said, "human_direct")) == 1
+    assert rows.count(("user", _NOTICE, "host_generated")) == 1
 
 
 #: Hermes 0.21.5's own lines around a folded summary and a carried to-do list (agent.context_compressor,

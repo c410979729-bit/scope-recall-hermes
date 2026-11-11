@@ -6,11 +6,11 @@ import json
 import sqlite3
 import subprocess
 import sys
-import time
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from legacy_fixture import build_official_578b_fixture
@@ -18,6 +18,7 @@ from release_fixture import LATEST_RELEASE, LATEST_SCHEMA, PREVIOUS_SCHEMA, buil
 from scope_recall.adapters.clients.config import install_codex_scope_recall
 from scope_recall.contracts import ContractError, InstanceBinding, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore, backup_primitives
+from scope_recall.core import storage as storage_module
 from scope_recall.core.capture import record_event
 from scope_recall.core.restore import (
     InstallationMaintenance,
@@ -1485,7 +1486,6 @@ def test_session_index_open_keeps_its_budget_when_another_process_takes_the_leas
         conn.execute("DROP INDEX source_session")
     probe = """
 import sys
-import time
 from pathlib import Path
 from scope_recall.core.writer_lease import TruthWriterLease
 lease = TruthWriterLease(Path(sys.argv[1]), role="provider")
@@ -1493,7 +1493,7 @@ print("ready", flush=True)
 sys.stdin.readline()
 assert lease.acquire()
 print("held", flush=True)
-time.sleep(0.2)
+assert sys.stdin.readline().strip() == "release"
 lease.release()
 """
     child = subprocess.Popen(
@@ -1504,7 +1504,15 @@ lease.release()
         stderr=subprocess.PIPE,
         text=True,
     )
-    actual_close, closed, contended = storage._close, [], []
+    actual_close, actual_open, closed, budgets, contended = storage._close, storage._open, [], [], []
+    now = [0.0]
+
+    def advance(seconds):
+        now[0] += seconds
+
+    def open_with_budget(mode, remaining_seconds=None, **kwargs):
+        budgets.append(remaining_seconds)
+        return actual_open(mode, remaining_seconds, **kwargs)
 
     def close_and_contend(conn, original):
         actual_close(conn, original)
@@ -1514,27 +1522,33 @@ lease.release()
             child.stdin.write("acquire\n")
             child.stdin.flush()
             assert child.stdout.readline().strip() == "held"
-            contended.append(time.monotonic())
+            contended.append(len(budgets))
+            advance(0.02)
 
     monkeypatch.setattr(storage, "_close", close_and_contend)
+    monkeypatch.setattr(storage, "_open", open_with_budget)
+    monkeypatch.setattr(storage, "monotonic", lambda: now[0])
+    # Only storage's deadline clock and lease-poll sleeps are synthetic. The
+    # child holds a real cross-process lease until the parent observes refusal.
+    monkeypatch.setattr(storage_module, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=advance))
     try:
         assert child.stdout.readline().strip() == "ready"
-        started = time.monotonic()
         with pytest.raises((TruthWriterBusyError, ContractError)) as refused:
             with storage.write(ctx, remaining_seconds=0.05):
                 pytest.fail("the index open waited for the other writer's full lease")
-        # Timed from the moment the other process holds the lease: the handshake that gets it there runs a child
-        # interpreter and took a quarter of a second on a slow Windows runner, which is not the open's wait.  A
-        # budget spent before that moment refuses without contention, timed from the start.
-        elapsed = time.monotonic() - (contended[0] if contended else started)
         if isinstance(refused.value, ContractError):
             assert refused.value.code == "DEADLINE_EXCEEDED"
-        # Allow scheduler overhead, while remaining below the holder's 200 ms.
-        assert elapsed < 0.1
+        assert len(closed) >= close_number
+        assert budgets[0] == 0.05 and len(budgets) > contended[0]
+        assert all(budget is not None and 0 < budget <= 0.03 + 1e-9 for budget in budgets[contended[0] :])
+        assert now[0] <= 0.05 + 1e-9
+        assert child.poll() is None
         assert truth_writer_process_snapshot(storage.path.parent)["connection_pin_count"] == 0
     finally:
-        _out, err = child.communicate(timeout=5)
+        _out, err = child.communicate(input="release\n", timeout=30)
         assert child.returncode == 0, err
+    with storage.write(ctx, remaining_seconds=0.05) as tx:
+        assert tx._check().execute("SELECT 1 FROM sqlite_master WHERE name='source_session'").fetchone()
 
 
 def test_conversion_reindexes_the_explicit_current_head_after_history(tmp_path: Path) -> None:

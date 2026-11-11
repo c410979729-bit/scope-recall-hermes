@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextvars import copy_context
 from dataclasses import replace
 
 import pytest
@@ -15,6 +16,13 @@ from scope_recall.core.injection_policy import ScanResult
 
 from tests.host.hermes.test_hermes_private_mode import _owner
 from tests.host.hermes.test_steers import _row, _steer, telegram  # noqa: F401
+
+
+def _hook(*args, **kwargs):
+    """Use the registered helper-thread dispatcher without a module import cycle."""
+    from tests.host.hermes.test_turn_binding_recovery import _hook as dispatch
+
+    dispatch(*args, **kwargs)
 
 
 def _rows(provider, table="source_events"):
@@ -30,7 +38,7 @@ def _human_words(provider):
 
 
 def _pre(provider, text, turn="TEST-turn", **kwargs):
-    provider.observe_pre_llm(session_id=provider._identity.session_id, turn_id=turn, user_message=text, **kwargs)
+    _hook(provider, "pre_llm_call", turn_id=turn, user_message=text, **kwargs)
 
 
 def test_recording_controls_release_observation_slots(telegram):
@@ -44,19 +52,21 @@ def test_recording_controls_release_observation_slots(telegram):
 
 @pytest.mark.parametrize("finish", ["cancelled", "api_error", "timeout"])
 @pytest.mark.parametrize("pre_called", [False, True])
-def test_no_reply_needs_pre_capture(adapter, finish, pre_called):
-    """Turn start and error notification alone do not archive the opening input."""
+def test_skipped_pre_capture_is_recovered_at_turn_start(adapter, monkeypatch, finish, pre_called):
+    """A delivered but busy pre-hook leaves enough identity for the inline start to recover its input."""
     provider, _clock = adapter
     text = "TEST input whose turn has no reply"
     if pre_called:
         _pre(provider, text)
     else:
-        provider._calls.busy("pre_llm_call", {"turn_id": "TEST-turn", "user_message": text})
+        from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+        _busy_hook(provider, monkeypatch, turn_id="TEST-turn", user_message=text)
     provider.on_turn_start(1, text)
     if finish != "cancelled":
         provider.observe_api_request_error(turn_id="TEST-turn", status=finish)
     provider.on_session_end([dict(role="user", content=text, timestamp=1788696000)])
-    assert _human_words(provider) == ([text] if pre_called else [])
+    assert _human_words(provider) == [text]
 
 
 def test_sync_recovers_opener_when_pre_hook_is_missing(adapter):
@@ -66,14 +76,163 @@ def test_sync_recovers_opener_when_pre_hook_is_missing(adapter):
     assert _human_words(provider) == ["TEST skipped opener"]
 
 
-def test_delayed_sync_uses_the_active_turn_instead_of_its_missing_opener(adapter):
-    """The host queues sync without a turn ID; a newer pre-captured turn suppresses its user fallback."""
+@pytest.mark.parametrize("pre_called", [False, True])
+def test_delayed_sync_keeps_each_turns_opener_and_reply(adapter, pre_called):
+    """The memory worker runs a queued context after a later turn has already started."""
     provider, _clock = adapter
+    if pre_called:
+        _pre(provider, "TEST older input without pre capture", "TEST-older")
     provider.on_turn_start(1, "TEST older input without pre capture")
+    older_id = provider._active_turn_id
+    queued = copy_context()
     _pre(provider, "TEST newer input", "TEST-newer")
     provider.on_turn_start(2, "TEST newer input")
-    provider.sync_turn("TEST older input without pre capture", "TEST older reply")
-    assert _human_words(provider) == ["TEST newer input"]
+    queued.run(provider.sync_turn, "TEST older input without pre capture", "TEST older reply")
+    provider.sync_turn("TEST newer input", "TEST newer reply")
+    queued.run(provider.sync_turn, "TEST older input without pre capture", "TEST older reply")
+    rows = _rows(provider)
+    assert len(rows) == 4
+    by_content = {row["content"]: row["source_event_key"] for row in rows}
+    assert by_content["TEST older input without pre capture"].endswith(f":user:{older_id}@1")
+    assert by_content["TEST older reply"].endswith(f":sync_assistant:{older_id}@1")
+    assert by_content["TEST newer input"].endswith(":user:TEST-newer@1")
+    assert by_content["TEST newer reply"].endswith(":sync_assistant:TEST-newer@1")
+
+
+def test_pre_api_request_captures_steers_before_the_turn_finishes(telegram):
+    """The per-request hook sees the steer after insertion and before a model can choose tools."""
+    _pre(telegram, "TEST opener")
+    telegram.on_turn_start(1, "TEST opener")
+    history = [dict(role="user", content="TEST opener"), _row(_steer("TEST correction", message_id="TEST-early"))]
+    for retry in range(2):
+        _hook(
+            telegram,
+            "pre_api_request",
+            turn_id="TEST-turn",
+            user_message="TEST opener",
+            conversation_history=history,
+            retry_count=retry,
+        )
+    assert _human_words(telegram) == ["TEST opener", "TEST correction"]
+    assert len({row["source_event_key"] for row in _rows(telegram)}) == 2
+    telegram.sync_turn("TEST opener", "TEST reply", messages=history)
+    assert _human_words(telegram) == ["TEST opener", "TEST correction"]
+
+
+def test_next_pre_hook_does_not_restore_untyped_interrupted_input(telegram):
+    """Request hooks cannot link untyped interrupted history to its original source or deletion state."""
+    telegram.on_turn_start(1, "TEST missed input")
+    history = [
+        dict(role="user", content="TEST missed input", timestamp=1788696000),
+        dict(role="assistant", content="TEST interruption placeholder", display_kind="hidden"),
+        dict(role="user", content="TEST next input", timestamp=1788696060),
+    ]
+    _pre(telegram, "TEST next input", "TEST-next", conversation_history=history)
+    assert _human_words(telegram) == ["TEST next input"]
+    telegram.on_session_end(history)
+    assert _human_words(telegram) == ["TEST next input"]
+
+
+def test_delayed_sync_leaves_the_next_turns_interim_intact(adapter):
+    """Each queued sync drains only its own post-model snapshot."""
+    provider, _clock = adapter
+    queued = []
+    for number in (1, 2):
+        turn = f"TEST-turn-{number}"
+        opener, answer, interim = f"TEST opener {number}", f"TEST answer {number}", f"TEST interim {number}"
+        _pre(provider, opener, turn)
+        provider.on_turn_start(number, opener)
+        _hook(
+            provider,
+            "post_llm_call",
+            turn_id=turn,
+            assistant_response=answer,
+            conversation_history=[
+                dict(role="user", content=opener),
+                dict(role="assistant", content=interim, tool_calls=[dict(id=f"TEST-tool-{number}")]),
+                dict(role="tool", content="TEST tool result"),
+                dict(role="assistant", content=answer),
+            ],
+        )
+        queued.append((copy_context(), opener, answer))
+    context, opener, answer = queued[0]
+    context.run(provider.sync_turn, opener, answer)
+    assert "TEST-turn-2" in provider._interim_said
+    context, opener, answer = queued[1]
+    context.run(provider.sync_turn, opener, answer)
+    assert len(_rows(provider)) == 6
+    for row in _rows(provider):
+        number = row["content"][-1]
+        assert f"TEST-turn-{number}" in row["source_event_key"]
+
+
+def test_first_api_request_promotes_a_missing_pre_hooks_ordinal(adapter):
+    """The first request supplies the UUID even when the pre-hook was suppressed entirely."""
+    provider, _clock = adapter
+    provider.on_turn_start(11, "TEST resumed input")
+    queued = copy_context()
+    # Hermes invokes plugin callbacks in copied contexts on helper threads.
+    _hook(
+        provider,
+        "pre_api_request",
+        turn_id="TEST-resumed-uuid",
+        user_message="TEST resumed input",
+        conversation_history=[dict(role="user", content="TEST resumed input")],
+    )
+    _pre(provider, "TEST later input", "TEST-later")
+    provider.on_turn_start(12, "TEST later input")
+    queued.run(provider.sync_turn, "TEST resumed input", "TEST resumed answer")
+    rows = [row for row in _rows(provider) if row["content"].startswith("TEST resumed")]
+    assert len(rows) == 2
+    assert all("TEST-resumed-uuid" in row["source_event_key"] for row in rows)
+
+
+def test_a_late_pre_api_hook_cannot_promote_the_next_turns_binding(adapter):
+    """An abandoned hook retains its own copied context when the next turn has already begun."""
+    provider, _clock = adapter
+    _pre(provider, "TEST first input", "TEST-first")
+    provider.on_turn_start(1, "TEST first input")
+    late = copy_context()
+    provider.on_turn_start(2, "TEST second input")
+    _hook(provider, "pre_api_request", late, turn_id="TEST-first", user_message="TEST first input")
+    _hook(
+        provider,
+        "pre_api_request",
+        turn_id="TEST-second",
+        user_message="TEST second input",
+        conversation_history=[dict(role="user", content="TEST second input")],
+    )
+    provider.sync_turn("TEST second input", "TEST second answer")
+    rows = [row for row in _rows(provider) if row["content"].startswith("TEST second")]
+    assert len(rows) == 2
+    assert all("TEST-second" in row["source_event_key"] for row in rows)
+
+
+@pytest.mark.parametrize("hook", ["start", "api"])
+def test_opener_recovery_respects_private_mode_and_controls(adapter, monkeypatch, hook):
+    """Fallback capture uses the same privacy and recording-command boundary as the pre-hook."""
+    provider, _clock = adapter
+    owner, ctx = _owner(provider)
+    owner.private_on(target="session", session=ctx.session_id)
+    from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+    _busy_hook(provider, monkeypatch, turn_id="TEST-private", user_message="TEST private recovered input")
+    provider.on_turn_start(1, "TEST private recovered input")
+    if hook == "api":
+        _hook(
+            provider,
+            "pre_api_request",
+            turn_id="TEST-private",
+            user_message="TEST private recovered input",
+            conversation_history=[],
+        )
+    assert _rows(provider) == _rows(provider, "capture_inbox") == []
+    assert not provider._retry.captures
+    owner.private_off(target="session", session=ctx.session_id)
+    _busy_hook(provider, monkeypatch, turn_id="TEST-control", user_message="scope-recall resume")
+    provider.on_turn_start(2, "scope-recall resume")
+    assert _rows(provider) == []
+    assert provider._ledger.pending_identities() == ()
 
 
 @pytest.mark.parametrize(
@@ -310,6 +469,7 @@ def test_active_redirect_without_a_steer_kind_has_no_separate_source(telegram):
     """The host's redirect row is untyped and its combined sync input reuses the captured opener."""
     opener, correction, answer = "TEST opening input", "TEST active correction", "TEST final response"
     _pre(telegram, opener)
+    telegram.on_turn_start(1, opener)
     origin_text = _steer(correction, message_id="TEST-redirect").split("\n", 1)[1].rsplit("\n", 1)[0]
     history = [
         dict(role="user", content=opener),
@@ -317,8 +477,9 @@ def test_active_redirect_without_a_steer_kind_has_no_separate_source(telegram):
         dict(role="user", content=origin_text, timestamp=1788696000),
         dict(role="assistant", content=answer),
     ]
-    telegram.observe_post_llm_call(
-        session_id=telegram._identity.session_id,
+    _hook(
+        telegram,
+        "post_llm_call",
         turn_id="TEST-turn",
         assistant_response=answer,
         conversation_history=history,

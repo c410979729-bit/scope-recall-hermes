@@ -108,13 +108,17 @@ class CaptureWriter:
         gaps: tuple[str, ...],
         scope_id: str | None,
         remaining_seconds: float = CAPTURE_TIMEOUT_S,
-        replay: bool = False,
+        opener_turn_id: str | None = None,
         bound: HermesIdentity | None = None,
         release: bool = False,
     ):
         """Record one host event: the receipt, or None when nothing was written (said in the diagnostics and the
-        log).  ``release``: the caller holds the adapter's lock exactly once, and the store I/O runs without it."""
+        log). A RetryCapture replays its original envelope. ``opener_turn_id`` explicitly assigns opening receipts;
+        source keys are opaque. ``release`` requires exactly one adapter-lock hold and releases it for store I/O."""
         adapter = self._adapter
+        pending = event if isinstance(event, RetryCapture) else None
+        replay = pending is not None
+        event = pending.event if pending is not None else event
         if (
             context.actor_origin == "human_direct"
             and isinstance(event, dict)
@@ -138,12 +142,12 @@ class CaptureWriter:
             self.record_failure(identity, "capability_gap")
             adapter._merge_gaps(gaps, ("capability_gap:no_capture_scope",))
             return None
-        turn_key = (context.session_id, adapter._active_turn_id)
+        with adapter._said_lock:
+            turn_key = (context.session_id, opener_turn_id if opener_turn_id is not None else adapter._active_turn_id)
         started = time.monotonic()
         snapshot = self._snapshot(context, event, identity, gaps, scope_id, bound)
-        retry = adapter._retry.captures
-        host_scope = retry[identity].host_scope if replay and identity in retry else bound.scope
-        store_event = replace(retry[identity], event=event) if replay and identity in retry else event
+        host_scope = pending.host_scope if pending is not None else bound.scope
+        store_event = replace(pending, event=event) if pending is not None else event
         receipt = self._store(context, store_event, identity, scope_id, host_scope, remaining_seconds, started, release)
         if isinstance(receipt, CaptureReceipt):
             adapter._diagnostics.masked_secret_count += receipt.masked_secret_count
@@ -152,9 +156,10 @@ class CaptureWriter:
                     if gap.startswith("private_spans_removed:"):
                         count = gap.removeprefix("private_spans_removed:")
                         if count.isascii() and count.isdecimal():
-                            adapter._private_span_receipts[turn_key] = int(count)
-                            if len(adapter._private_span_receipts) > 128:
-                                del adapter._private_span_receipts[next(iter(adapter._private_span_receipts))]
+                            with adapter._said_lock:
+                                adapter._private_span_receipts[turn_key] = int(count)
+                                if len(adapter._private_span_receipts) > 128:
+                                    del adapter._private_span_receipts[next(iter(adapter._private_span_receipts))]
         if release and not adapter._initialized:
             return self._closed_meanwhile(identity, receipt, replay, snapshot)
         if isinstance(receipt, Exception):
@@ -163,7 +168,7 @@ class CaptureWriter:
             return self._queued(context, identity, receipt, gaps, replay)
         if receipt.durability != "persisted":
             return self._refused(identity, receipt, snapshot, gaps, replay)
-        return self._stored(context, identity, receipt, gaps, replay)
+        return self._stored(context, identity, receipt, gaps, replay, opener_turn_id)
 
     def capture_guard(self, context, remaining_seconds: float, *, observations=()):
         """Read a batch's Core policy snapshot; a failed read cannot authorize a local copy."""
@@ -449,7 +454,8 @@ class CaptureWriter:
         self._adapter._merge_gaps(gaps, receipt.gaps, (f"capture_gap:{receipt.disposition}",))
         return receipt
 
-    def _stored(self, context, identity, receipt, gaps, replay: bool):
+    def _stored(self, context, identity, receipt, gaps, replay: bool, opener_turn_id: str | None):
+        """Confirm durability and fence sources, assigning an opener only to the caller's explicit turn."""
         adapter = self._adapter
         if identity is not None:
             adapter._ledger.confirm(identity)
@@ -457,8 +463,12 @@ class CaptureWriter:
             if replay:
                 # Said once, as the capture's being kept was: the pair shows what the retries saved.
                 _log.info("scope-recall: stored on retry: %s", label(identity))
-        if context.session_id == adapter._require_identity().stored_session_id():
-            self._fence(receipt)
+        with adapter._said_lock:
+            if context.session_id == adapter._require_identity().stored_session_id() and opener_turn_id in (
+                None,
+                adapter._active_turn_id,
+            ):
+                self._fence(receipt)
         if gaps or receipt.gaps:
             adapter._merge_gaps(gaps, receipt.gaps)
         adapter._binding.wake_worker(context=context)
