@@ -141,10 +141,9 @@ def test_runtime_construction_is_pure_and_vector_opens_only_on_demand(tmp_path):
             "budget_tokens": 1200,
         }
     )
-    assert calls[:2] == ["build", "open"]
-    # A disabled query-embedding route must not expose or invoke the raw
-    # native store as a Core VectorPort; lexical retrieval remains available.
-    assert "search" not in calls
+    # With the query-embedding route off there is no vector search to make, so a recall neither builds
+    # nor opens the native store and never reaches it as a Core VectorPort; lexical retrieval remains available.
+    assert calls == []
     assert result.items == ()
     instance.close()
 
