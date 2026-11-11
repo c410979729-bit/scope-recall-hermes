@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from ..contracts import (
@@ -46,6 +47,7 @@ from .confirmation import CONFIRMED_REASON, confirmation_targets, is_confirmatio
 from .corroboration import CORROBORATED_REASON, corroboration_promotes
 from .evidence_quote import resolve_evidence_quotes, same_evidence
 from .evidence_support import positioned, support_verdict
+from .fact_temporal_semantics import date_value
 from .reflection_revision import revise_observation
 from .reflection_validity import reflection_live
 from .review_policy import PENDING, REVIEW_REASONS, held_proposal, owner_publication, policy
@@ -136,7 +138,7 @@ def health_fact_pair(tx, clock, first_ref, first_revision, second_ref, second_re
 
 
 def health_pair_kind(first, second):
-    """Classify an exact audience and normalized slot using existing identity and time rules."""
+    """Classify only strict normalized slots; a lossy candidate reading proves no fact relation."""
     from .claims import claim_slot, valid_at
     from .fact_identity import normalize_fact_component
 
@@ -144,15 +146,14 @@ def health_pair_kind(first, second):
         return None
     proposals = []
     for item in (first, second):
-        payload = deepcopy(item.payload)
-        payload["subject"] = normalize_fact_component(payload["subject"])
-        payload["predicate"] = normalize_fact_component(payload["predicate"])
+        payload = dict(item.payload)
+        payload.update((key, normalize_fact_component(payload[key])) for key in ("subject", "predicate"))
         proposals.append(payload)
     if claim_slot(first.scope_id, first.project_id, first.branch_id, proposals[0]) != claim_slot(
         second.scope_id, second.project_id, second.branch_id, proposals[1]
     ):
         return None
-    values = [normalize_fact_component(p["value_text"]) for p in proposals]
+    values = [normalize_fact_component(item.payload["value_text"]) for item in (first, second)]
     if values[0] == values[1]:
         periods = [(canonical_time(v.valid_from), canonical_time(v.valid_to)) for v in (first, second)]
         return "duplicate" if periods[0] == periods[1] else None
@@ -373,6 +374,23 @@ def _dated_before(new_start, old_start, new_times, old_times) -> bool:
     )
 
 
+def _historical_start(proposal):
+    """Return a validity start usable for historical ordering, without changing the stored assertion.
+
+    A complete calendar-date value echoed into valid_from supplies no independent order: only the source's time
+    can establish that such evidence is historical. The possible calendar day spans UTC+14 through UTC-12;
+    validity-based reads still use the original interval.
+    """
+    start = canonical_time(proposal["valid_from"])
+    day = date_value(proposal["value_text"])
+    if start and day:
+        # Compare timedeltas to avoid overflowing at the first and last representable calendar dates.
+        offset = datetime.fromisoformat(start) - datetime(*day, tzinfo=UTC)
+        if -timedelta(hours=14) <= offset < timedelta(days=1, hours=12):
+            return None
+    return start
+
+
 def _order_against_head(tx, proposal, roots, previous, qualification, scope_id):
     """Decide whether a differing assertion advances the slot head.
 
@@ -392,7 +410,8 @@ def _order_against_head(tx, proposal, roots, previous, qualification, scope_id):
             qualification = Qualification(previous.state, previous.basis, previous.reason)
         return qualification, True, ()
     old_roots = tx.claims.roots(evidence_refs(previous.payload))
-    new_owner, old_owner = human_owner(roots), human_owner(old_roots)
+    proof_memo: dict = {}
+    new_owner, old_owner = human_owner(roots, tx=tx, memo=proof_memo), human_owner(old_roots, tx=tx, memo=proof_memo)
     new_order, old_order = source_order(tx, roots), source_order(tx, old_roots)
     ingestion_ordered = (
         new_owner is not None
@@ -401,13 +420,19 @@ def _order_against_head(tx, proposal, roots, previous, qualification, scope_id):
         and old_order is not None
         and all(r.occurred_at is None for r in (*roots, *old_roots))
     )
-    new_start, old_start = canonical_time(proposal["valid_from"]), canonical_time(previous.valid_from)
+    new_start, old_start = _historical_start(proposal), _historical_start(previous.payload)
     new_times, old_times = _said_times(roots), _said_times(old_roots)
     late = _dated_before(new_start, old_start, new_times, old_times) or (ingestion_ordered and new_order < old_order)
     if new_owner is not None and old_owner is not None and new_owner != old_owner:
         return Qualification("proposed", "inferred_suggestion", "different_source_principal"), False, ()
     if late:
         return Qualification("active", qualification.basis, "late_historical_evidence"), False, ()
+    if (
+        new_owner is None
+        and any(r.origin == "imported" and effective_origin(r) == "human_direct" for r in roots)
+        and any(effective_origin(r) == "human_direct" for r in old_roots)
+    ):
+        return Qualification("proposed", "inferred_suggestion", "source_identity_unresolved"), False, ()
     try:
         tx.claims.current_human(evidence_refs(proposal), scope_id)
         live_human = True
@@ -464,14 +489,31 @@ def _end_denied_value(tx, proposal, roots, previous, held, qualification, scope_
     return Mutation(retracted.ref, retracted.revision, "retracted", retracted.state)
 
 
+def _merge_target(tx, proposal: ClaimProposal, verdict, scope_id, now) -> ClaimProposal | None:
+    """The payload of the claim version a prepared judgement merges ``proposal`` into, if it still is a candidate of
+    it in this transaction; None when the judgement names none."""
+    if verdict is None or verdict.target_ref is None:
+        return None
+    choices = merge_candidates(tx, proposal, scope_id, now=now)
+    target = next(
+        (c for c in choices if (c["ref"], c["revision"]) == (verdict.target_ref, verdict.target_revision)), None
+    )
+    if target is None:
+        raise ContractError("VERSION_CONFLICT", "merge_target")
+    return target["payload"]
+
+
 def _qualify_incoming(
     tx, proposal: ClaimProposal, roots, scope_id, now, subject_already_bound
 ) -> tuple[ClaimProposal, Qualification, bool]:
     """Bind source identity, classify support and revalidate any prepared slot decision."""
     if adoption_qualification(tx, proposal):
         return proposal, Qualification("active", "direct_report", "owner_adopted_assistant_proposal"), False
-    submitted = proposal
     verdict = support_verdict(proposal, roots) if positioned(proposal) else None
+    target = _merge_target(tx, proposal, verdict, scope_id, now)
+    if target is not None and target["kind"] != proposal["kind"]:
+        # A slot keeps the kind of its claim, and that kind's rules decide what the slot may be told and by whom.
+        proposal = cast(ClaimProposal, dict(proposal, kind=target["kind"]))
     support_state = verdict.state if verdict else None
     if positioned(proposal) and support_state is None:
         support_state = "supported" if qualify(proposal, roots, _legacy=True).state == "active" else "unavailable"
@@ -495,15 +537,9 @@ def _qualify_incoming(
         )
     if proposal["kind"] == "alias" and not _alias_verified(tx, proposal, roots, scope_id, now):
         qualification = Qualification("proposed", "inferred_suggestion", "alias_target_or_relation_unverified")
-    if verdict is not None and verdict.target_ref is not None:
-        choices = merge_candidates(tx, submitted, scope_id, now=now)
-        target = next(
-            (c for c in choices if (c["ref"], c["revision"]) == (verdict.target_ref, verdict.target_revision)), None
-        )
-        if target is None:
-            raise ContractError("VERSION_CONFLICT", "merge_target")
+    if target is not None:
         proposal = deepcopy(proposal)
-        proposal.update(subject=target["payload"]["subject"], predicate=target["payload"]["predicate"])
+        proposal.update(subject=target["subject"], predicate=target["predicate"])
     return proposal, qualification, verdict is not None and verdict.action == "duplicate"
 
 
