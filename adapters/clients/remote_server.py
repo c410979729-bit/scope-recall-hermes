@@ -19,6 +19,11 @@ hook, each refused request and the server's own errors go to ``remote-server.log
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from ...core.process_environment import configure_numeric_threads
+
+    configure_numeric_threads()
+
 import argparse
 import atexit
 import hashlib

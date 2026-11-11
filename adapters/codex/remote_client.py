@@ -4,7 +4,11 @@ configurations hold (see this package):
 
 import sys
 
-from ..clients.remote_client import main as client_main
+from ...core.process_environment import configure_numeric_threads
+
+configure_numeric_threads()
+
+from ..clients.remote_client import main as client_main  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:

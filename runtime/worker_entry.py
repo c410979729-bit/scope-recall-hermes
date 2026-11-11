@@ -7,6 +7,12 @@ daemon alive after the bounded drain finishes.
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    # Hermes imports worker helpers during setup; only a worker process owns this default.
+    from ..core.process_environment import configure_numeric_threads
+
+    configure_numeric_threads()
+
 import argparse
 import hashlib
 import json

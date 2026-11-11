@@ -6,6 +6,11 @@ a client attached to a shared store, Codex or Claude Code.
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from ...core.process_environment import configure_numeric_threads
+
+    configure_numeric_threads()
+
 import argparse
 import os
 import sys

@@ -14,6 +14,7 @@ import math
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -95,6 +96,30 @@ def stable_conditions(value):
     return value
 
 
+@contextmanager
+def seed_writes(connection: sqlite3.Connection):
+    """Build disposable fixtures without per-commit syncs, then publish and restore disk policy.
+
+    A partial fixture is rebuilt after interruption. Checkpointing before measurements
+    keeps deferred WAL copying out of reader timings; live writers retain their defaults.
+    """
+    if connection.in_transaction:
+        raise ValueError("fixture writer requires an idle connection")
+    synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
+    checkpoint = connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+    try:
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        yield connection
+        connection.commit()
+        if connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+            raise RuntimeError("synthetic fixture checkpoint is busy")
+    finally:
+        connection.rollback()
+        connection.execute(f"PRAGMA synchronous={synchronous}")
+        connection.execute(f"PRAGMA wal_autocheckpoint={checkpoint}")
+
+
 def seed_truth(lab: Lab, count: int) -> list[str]:
     """Populate a synthetic schema from actual captured rows; never touch an existing user store."""
     seed = Turn("TEST-performance-template", "TEST-template", "user", "TESTtopic00000 color amber.", NOW)
@@ -125,7 +150,7 @@ def seed_truth(lab: Lab, count: int) -> list[str]:
         remaining_seconds=60,
     )
     refs = []
-    with sqlite3.connect(lab.core.storage.path) as connection:
+    with closing(sqlite3.connect(lab.core.storage.path)) as connection, seed_writes(connection):
         connection.row_factory = sqlite3.Row
         template = dict(connection.execute("SELECT * FROM source_events WHERE event_id=?", (source_ref,)).fetchone())
         claim = dict(connection.execute("SELECT * FROM claims LIMIT 1").fetchone())
@@ -183,7 +208,6 @@ def seed_truth(lab: Lab, count: int) -> list[str]:
                     f"INSERT INTO claim_versions VALUES ({','.join('?' for _ in version)})", versions
                 )
                 connection.executemany("INSERT INTO evidence_links VALUES (?,?,?,?,?,?,?,?)", links)
-            connection.commit()
         connection.execute("UPDATE work_items SET state='done'")
         # Bulk fixture inserts bypass the live writer; publish their projections
         # before timing so dirty fallback work is not mistaken for recall cost.
@@ -192,8 +216,7 @@ def seed_truth(lab: Lab, count: int) -> list[str]:
             "ON CONFLICT(cursor_name) DO UPDATE SET position_ref=NULL,processed_count=0,completed=0"
         )
         while lexical_index.backfill_claim_page(connection):
-            connection.commit()
-        connection.commit()
+            pass
     return [source_ref, *refs]
 
 
@@ -215,51 +238,52 @@ def seed_vectors(lab: Lab, refs: list[str]) -> dict:
         )
         for scope in SCOPES
     }
-    for start in range(0, len(refs), 4096):
-        end = min(len(refs), start + 4096)
-        matrix = rng.standard_normal((end - start, 3072), dtype=np.float32)
-        matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
-        rows = []
-        for index in range(start, end):
-            if index % 100 == 0 and index > start:
-                matrix[index - start] = matrix[index - start - 1]
-            scope = "public" if index % 8 == 0 else f"public-{index % 8}"
-            vector_id = f"TEST-vector-{index}"
-            metadata = {
-                "object_kind": "event",
-                "object_ref": refs[index],
-                "object_revision": 1,
-                "vector_id": vector_id,
-                "embedding_space": space,
-                "agent_id": lab.binding.agent_id,
-                "installation_id": lab.binding.installation_id,
-                "project_id": None,
-                "branch_id": None,
-                "logical_scope_id": scope,
-            }
-            rows.append(
-                dict(
-                    id=vector_id,
-                    scope_id=partitions[scope],
-                    source=refs[index],
-                    target=json.dumps(metadata),
-                    content="",
-                    summary="",
-                    updated_at=NOW,
-                    vector=matrix[index - start],
+    with seed_writes(lab.companion._conn):
+        for start in range(0, len(refs), 4096):
+            end = min(len(refs), start + 4096)
+            matrix = rng.standard_normal((end - start, 3072), dtype=np.float32)
+            matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
+            rows = []
+            for index in range(start, end):
+                if index % 100 == 0 and index > start:
+                    matrix[index - start] = matrix[index - start - 1]
+                scope = "public" if index % 8 == 0 else f"public-{index % 8}"
+                vector_id = f"TEST-vector-{index}"
+                metadata = {
+                    "object_kind": "event",
+                    "object_ref": refs[index],
+                    "object_revision": 1,
+                    "vector_id": vector_id,
+                    "embedding_space": space,
+                    "agent_id": lab.binding.agent_id,
+                    "installation_id": lab.binding.installation_id,
+                    "project_id": None,
+                    "branch_id": None,
+                    "logical_scope_id": scope,
+                }
+                rows.append(
+                    dict(
+                        id=vector_id,
+                        scope_id=partitions[scope],
+                        source=refs[index],
+                        target=json.dumps(metadata),
+                        content="",
+                        summary="",
+                        updated_at=NOW,
+                        vector=matrix[index - start],
+                    )
                 )
-            )
-        lab.companion.upsert_records(rows)
-        if start % 40960 == 0:
-            print(f"vectors {start}/{len(refs)}", flush=True)
-    while True:
-        receipt = lab.maintain_vectors()
-        if not receipt or receipt["outcome"] != "indexed":
-            raise RuntimeError("synthetic vector cache was not published")
-        if receipt["rows"] < 512:
-            break
-    if lab.companion.count_rows() != len(refs):
-        raise RuntimeError("vector row count mismatch")
+            lab.companion.upsert_records(rows)
+            if start % 40960 == 0:
+                print(f"vectors {start}/{len(refs)}", flush=True)
+        while True:
+            receipt = lab.maintain_vectors()
+            if not receipt or receipt["outcome"] != "indexed":
+                raise RuntimeError("synthetic vector cache was not published")
+            if receipt["rows"] < 512:
+                break
+        if lab.companion.count_rows() != len(refs):
+            raise RuntimeError("vector row count mismatch")
     return {"rows": len(refs), "seconds": time.perf_counter() - started, "vector_runtime": lab.companion.diagnostics()}
 
 

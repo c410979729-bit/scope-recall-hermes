@@ -4,6 +4,16 @@ The benchmark programs use synthetic data and explicitly downloaded public
 datasets. They never discover an installed host, read a user's store, or start
 a host program. Data, stores and results belong outside the checkout.
 
+Scope Recall's own entry processes default `OPENBLAS_NUM_THREADS` to `1` before
+NumPy loads, avoiding unused thread buffers while vector scans retain their own
+bounded workers. Set this variable explicitly in the launching environment to
+choose another value (for example, `16` to restore a 16-thread BLAS pool); existing
+values are preserved, and Scope Recall's own worker processes inherit them. Host processes such as Hermes
+keep their environment unchanged; operators can set the same variable in the
+host's environment to reduce its OpenBLAS memory commitment too.
+This setting controls OpenBLAS only; it does not control the threads or memory
+used by macOS Accelerate or Intel MKL.
+
 ## Offline checks
 
 The retrieval tier includes the synthetic recall benchmark and the public

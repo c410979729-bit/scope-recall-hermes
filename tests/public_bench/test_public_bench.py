@@ -1439,9 +1439,47 @@ def test_a_failed_question_is_recorded_and_the_split_continues():
         isolated(broken, _question(), cache_only=True)
 
 
-def test_scale_fixture_uses_mapped_backend_without_legacy_sdk_or_embedding_requests(tmp_path, monkeypatch):
+@pytest.mark.parametrize("abort", [False, True])
+def test_fixture_writer_restores_policy_and_publishes_before_reads(tmp_path, abort):
+    """Disposable writes must not leak relaxed durability or pending WAL work into measurements."""
+    from performance import seed_writes
+
+    path = tmp_path / "TEST-seed.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE synthetic(value TEXT)")
+        settings = tuple(
+            connection.execute("PRAGMA " + name).fetchone()[0] for name in ("synchronous", "wal_autocheckpoint")
+        )
+        try:
+            with seed_writes(connection):
+                assert connection.execute("PRAGMA synchronous").fetchone()[0] == 0
+                assert connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+                connection.execute("INSERT INTO synthetic VALUES ('TEST-value')")
+                if abort:
+                    raise RuntimeError("TEST interrupted fixture")
+        except RuntimeError as exc:
+            assert abort and str(exc) == "TEST interrupted fixture"
+        assert not connection.in_transaction
+        assert (
+            tuple(connection.execute("PRAGMA " + name).fetchone()[0] for name in ("synchronous", "wal_autocheckpoint"))
+            == settings
+        )
+        with sqlite3.connect(path) as reader:
+            assert reader.execute("SELECT value FROM synthetic").fetchall() == ([] if abort else [("TEST-value",)])
+        if not abort:
+            assert path.with_name(path.name + "-wal").stat().st_size == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("fixture_name", ["performance", "realistic_distribution"])
+def test_scale_fixture_uses_mapped_backend_without_legacy_sdk_or_embedding_requests(
+    tmp_path, monkeypatch, fixture_name
+):
     """Synthetic scale preparation works with the base backend and no embedding capability."""
-    from performance import SCOPES, seed_vectors
+    fixture = importlib.import_module(fixture_name)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("TEST fixture seeding must not request embeddings")
@@ -1451,13 +1489,41 @@ def test_scale_fixture_uses_mapped_backend_without_legacy_sdk_or_embedding_reque
     monkeypatch.setattr(ports.embedder, "embed_source", forbidden)
     monkeypatch.setattr(ports.embedder, "embed_query", forbidden)
     monkeypatch.setitem(sys.modules, "lancedb", None)
-    lab = Lab(tmp_path / "TEST-scale", ports, now="2020-01-01T00:00:00Z", scopes=SCOPES)
+    lab = Lab(
+        tmp_path / "TEST-scale",
+        ports,
+        now="2020-01-01T00:00:00Z",
+        scopes=fixture.SCOPES,
+        installation_kind="shared" if fixture_name == "realistic_distribution" else "local",
+    )
     try:
+        connection = lab.companion._conn
+        policy = tuple(
+            connection.execute("PRAGMA " + name).fetchone()[0] for name in ("synchronous", "wal_autocheckpoint")
+        )
+        upsert = lab.companion.upsert_records
+
+        def seed_batch(rows):
+            assert connection.execute("PRAGMA synchronous").fetchone()[0] == 0
+            assert connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+            return upsert(rows)
+
+        monkeypatch.setattr(lab.companion, "upsert_records", seed_batch)
         refs = ["event-" + hashlib.sha256(f"TEST-scale:{i}".encode()).hexdigest() for i in range(32)]
-        result = seed_vectors(lab, refs)
-        assert result["rows"] == 32 and lab.companion.count_rows() == 32
-        assert result["vector_runtime"]["cache_ready"]
-        assert result["vector_runtime"]["engine"] == "numpy-exact"
+        result = fixture.seed_vectors(lab, refs)
+        assert lab.companion.count_rows() == 32
+        if fixture_name == "performance":
+            assert result["rows"] == 32
+            assert result["vector_runtime"]["cache_ready"]
+            assert result["vector_runtime"]["engine"] == "numpy-exact"
+        else:
+            assert result is None
+            assert lab.companion.diagnostics()["cache_ready"]
+            assert lab.companion.diagnostics()["engine"] == "numpy-exact"
+        assert (
+            tuple(connection.execute("PRAGMA " + name).fetchone()[0] for name in ("synchronous", "wal_autocheckpoint"))
+            == policy
+        )
         with sqlite3.connect(cache.path) as connection:
             assert connection.execute("SELECT count(*) FROM responses").fetchone()[0] == 0
     finally:

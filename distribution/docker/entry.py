@@ -1,5 +1,7 @@
 """Start the registered remote servers under one container-wide store lease."""
 
+# ruff: noqa: E402 -- Numerical defaults must precede imports that can load NumPy.
+
 from __future__ import annotations
 
 import errno
@@ -9,6 +11,10 @@ import shlex
 import sys
 from pathlib import Path
 from typing import IO
+
+from ...core.process_environment import configure_numeric_threads
+
+configure_numeric_threads()
 
 from ...adapters.clients.remote_server import RemoteServerConfig, load_server_config
 from ...core.writer_lease import TruthWriterLease, try_lock_exclusive_nonblocking

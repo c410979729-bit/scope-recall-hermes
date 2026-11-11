@@ -1,5 +1,7 @@
 """CLI entry for bounded v1.1 install, doctor, and uninstall flows."""
 
+# ruff: noqa: E402 -- Numerical defaults must precede imports that can load NumPy.
+
 from __future__ import annotations
 
 import argparse
@@ -12,6 +14,10 @@ from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import Any
+
+from scope_recall.core.process_environment import configure_numeric_threads
+
+configure_numeric_threads()
 
 from scope_recall.contracts import ContractError
 from scope_recall.core.failure_policy import TERMINAL_FAILURES

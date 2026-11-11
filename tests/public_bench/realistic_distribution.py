@@ -11,11 +11,12 @@ import hashlib
 import json
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from dataclasses import replace
 
 import numpy as np
 from cases import Turn
-from performance import NOW
+from performance import NOW, seed_writes
 from scope_recall.core import lexical_index
 from scope_recall.core.events import lexical_terms
 
@@ -328,7 +329,7 @@ def seed_sources(lab, count):
     turn = Turn("TEST-realistic-template", "TEST-template", "user", source_text(0, int(lengths[0]), origins[0]), NOW)
     ref = lab.capture(turn).event_refs[0].ref
     refs = [ref]
-    with sqlite3.connect(lab.core.storage.path) as conn:
+    with closing(sqlite3.connect(lab.core.storage.path)) as conn, seed_writes(conn):
         conn.row_factory = sqlite3.Row
         template = dict(conn.execute("SELECT * FROM source_events WHERE event_id=?", (ref,)).fetchone())
         conn.execute("DELETE FROM lexical_postings WHERE source_id=?", (template["source_id"],))
@@ -391,7 +392,6 @@ def seed_sources(lab, count):
                     postings.append((term_ids[term], row["source_id"]))
             _insert(conn, "source_events", rows)
             conn.executemany("INSERT OR IGNORE INTO lexical_postings VALUES (?,?)", postings)
-            conn.commit()
         conn.execute("UPDATE work_items SET state='done'")
     return refs
 
@@ -426,7 +426,7 @@ def seed_claims(lab, refs):
     rng.shuffle(conditioned)
     _simple_heads(states, kinds, conditioned)
     examples = []
-    with sqlite3.connect(lab.core.storage.path) as conn:
+    with closing(sqlite3.connect(lab.core.storage.path)) as conn, seed_writes(conn):
         conn.row_factory = sqlite3.Row
         source_rows = {}
         for source in conn.execute("SELECT event_id,scope_id FROM source_events ORDER BY source_id"):
@@ -524,15 +524,12 @@ def seed_claims(lab, refs):
                     for proof in proofs
                 ],
             )
-            if claim_index % 500 == 499:
-                conn.commit()
         conn.execute(
             "INSERT INTO candidate_scan_cursors(cursor_name,updated_at) VALUES ('claim_lexical',datetime('now')) "
             "ON CONFLICT(cursor_name) DO UPDATE SET position_ref=NULL,processed_count=0,completed=0"
         )
         while lexical_index.backfill_claim_page(conn):
-            conn.commit()
-        conn.commit()
+            pass
     return dict(
         facts=27951,
         versions=position,
@@ -557,7 +554,7 @@ def seed_relations(lab):
     assumptions; no aggregate episode distribution was supplied by the caller.
     Every evidence edge is same-scope and uses an existing synthetic source.
     """
-    with sqlite3.connect(lab.core.storage.path) as conn:
+    with closing(sqlite3.connect(lab.core.storage.path)) as conn, seed_writes(conn):
         occupied = {row[0] for row in conn.execute("SELECT source_ref FROM episode_events")}
         grouped = {}
         for ref, scope in conn.execute("SELECT event_id,scope_id FROM source_events ORDER BY source_id"):
@@ -603,7 +600,6 @@ def seed_relations(lab):
                         (ref, revision, episode),
                     )
                     dependencies += 1
-        conn.commit()
     return dict(
         pressure_episodes=episodes,
         pressure_members=members,
@@ -630,48 +626,49 @@ def seed_vectors(lab, refs):
         )
         for scope in SCOPES
     }
-    for start in range(0, len(refs), 4096):
-        matrix = rng.standard_normal((min(4096, len(refs) - start), 3072), dtype=np.float32)
-        matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
-        rows = []
-        for offset, vector in enumerate(matrix):
-            index = start + offset
-            scope = source_scope(index)
-            metadata = dict(
-                object_kind="event",
-                object_ref=refs[index],
-                object_revision=1,
-                vector_id=f"TEST-vector-{index}",
-                embedding_space=space,
-                agent_id=lab.binding.agent_id,
-                installation_id=lab.binding.installation_id,
-                project_id=None,
-                branch_id=None,
-                logical_scope_id=scope,
-            )
-            rows.append(
-                dict(
-                    id=metadata["vector_id"],
-                    scope_id=partitions[scope],
-                    source=refs[index],
-                    target=json.dumps(metadata),
-                    content="",
-                    summary="",
-                    updated_at=NOW,
-                    vector=vector,
+    with seed_writes(lab.companion._conn):
+        for start in range(0, len(refs), 4096):
+            matrix = rng.standard_normal((min(4096, len(refs) - start), 3072), dtype=np.float32)
+            matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
+            rows = []
+            for offset, vector in enumerate(matrix):
+                index = start + offset
+                scope = source_scope(index)
+                metadata = dict(
+                    object_kind="event",
+                    object_ref=refs[index],
+                    object_revision=1,
+                    vector_id=f"TEST-vector-{index}",
+                    embedding_space=space,
+                    agent_id=lab.binding.agent_id,
+                    installation_id=lab.binding.installation_id,
+                    project_id=None,
+                    branch_id=None,
+                    logical_scope_id=scope,
                 )
-            )
-        lab.companion.upsert_records(rows)
-        if start % 40960 == 0:
-            print(f"vectors {start}/{len(refs)}", flush=True)
-    while True:
-        # Fixture preparation drains production cache pages outside a worker
-        # deadline. A partially prepared cache would measure tail ingestion
-        # alongside recall; worker scheduling is benchmarked separately.
-        receipt = lab.companion.maintain_index(max_rows=262144)
-        if not receipt or receipt["outcome"] != "indexed":
-            raise RuntimeError("synthetic vector cache was not published")
-        if receipt["rows"] < 262144:
-            break
-    if lab.companion.count_rows() != len(refs):
-        raise RuntimeError("synthetic vector count mismatch")
+                rows.append(
+                    dict(
+                        id=metadata["vector_id"],
+                        scope_id=partitions[scope],
+                        source=refs[index],
+                        target=json.dumps(metadata),
+                        content="",
+                        summary="",
+                        updated_at=NOW,
+                        vector=vector,
+                    )
+                )
+            lab.companion.upsert_records(rows)
+            if start % 40960 == 0:
+                print(f"vectors {start}/{len(refs)}", flush=True)
+        while True:
+            # Fixture preparation drains production cache pages outside a worker
+            # deadline. A partially prepared cache would measure tail ingestion
+            # alongside recall; worker scheduling is benchmarked separately.
+            receipt = lab.companion.maintain_index(max_rows=262144)
+            if not receipt or receipt["outcome"] != "indexed":
+                raise RuntimeError("synthetic vector cache was not published")
+            if receipt["rows"] < 262144:
+                break
+        if lab.companion.count_rows() != len(refs):
+            raise RuntimeError("synthetic vector count mismatch")

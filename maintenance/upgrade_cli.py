@@ -1,10 +1,16 @@
 """Agent-facing setup routing and migration job commands."""
 
+# ruff: noqa: E402 -- Numerical defaults must precede imports that can load NumPy.
+
 import argparse
 import json
 import sqlite3
 import sys
 from pathlib import Path
+
+from ..core.process_environment import configure_numeric_threads
+
+configure_numeric_threads()
 
 from ..adapters.hermes.audiences import HermesIdentityError
 from ..contracts import ContractError

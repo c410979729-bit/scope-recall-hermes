@@ -173,6 +173,7 @@ SUITES = {
     "unit": [
         "tests/unit/test_codex_cli_identity.py",
         "tests/unit/test_file_access.py",
+        "tests/unit/test_numeric_threads.py",
         "tests/unit/test_host_memory_status.py",
         "tests/unit/test_host_memory_context.py",
         "tests/unit/test_setup_discovery.py",
@@ -410,9 +411,11 @@ SUITES = {
         "tests/migration/test_upgrade_policy.py",
     ],
     "packaging": [
+        "tests/storage_native/test_process_numeric_threads.py",
         "tests/packaging/test_hermes_catalog_setup.py",
         "tests/packaging/test_setup.py",
         "tests/packaging/test_setup_repairs.py",
+        "tests/packaging/test_setup_cleanup.py",
         "tests/packaging/test_clean_v11_wheel.py",
         "tests/packaging/test_package_upgrade.py",
         "tests/packaging/test_install_v11.py",
