@@ -109,6 +109,9 @@ def test_final_usage_is_visible_in_history_and_doctor_without_content(app):
     initial(core, ctx, when=core.clock.now)
     pending = core.prepare_session_injection(ctx, _question_text(core, ctx, "TEST-usage"))
     assert core.confirm_session_brief(ctx, pending, remaining_seconds=1) == "brief_delivered"
+    # These assertions concern persisted content, not disk speed. The test runner
+    # bounds the wait if the writer stops making progress.
+    core.recall_diagnostics.writer.queue.join()
     assert core.recall_diagnostics.flush()
     owner = MemoryManagement(core, InstallationMaintenance(replace(ctx, allowed_scope_ids=ctx.binding.scope_ids)))
     rows = owner.recalls(request_id="TEST-usage")["items"]
@@ -209,6 +212,7 @@ def test_notice_only_usage_remains_bound_to_original_request(app):
     owner.revise(item.ref, expected_revision=1, value="TEST green")
     pending = core.prepare_session_injection(ctx, "", request_id="TEST-notice-only")
     core.confirm_session_brief(ctx, pending, remaining_seconds=1)
+    core.recall_diagnostics.writer.queue.join()
     assert core.recall_diagnostics.flush()
     report = DoctorReport(host="codex", status="ok")
     check_recall_log(report, ctx.binding, request_id="TEST-notice-only")
@@ -268,6 +272,7 @@ def test_brief_usage_fallback_keeps_canonical_reference_kinds(app, monkeypatch):
     monkeypatch.setattr(recall_trace, "record_brief", lambda *_args: None)
     pending = core.prepare_session_injection(ctx, brief["text"], brief=brief)
     assert core.confirm_session_brief(ctx, pending, remaining_seconds=1) == "brief_delivered"
+    core.recall_diagnostics.writer.queue.join()
     assert core.recall_diagnostics.flush()
     rows = core.recall_diagnostics.store.list()
     assert rows and all(item["kind"] in {"claim", "episode"} for item in rows[0]["items"])
