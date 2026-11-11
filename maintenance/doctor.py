@@ -27,6 +27,7 @@ from scope_recall.adapters.hermes.shared_entries import read_attachment
 from scope_recall.adapters.hermes.unbound_sessions import owner_sessions_unbound
 from scope_recall.adapters.host_memory import inspect_host_memory
 from scope_recall.core.recall_policy import RecallPolicy, embedding_space_id
+from scope_recall.runtime.budget_reservations import reservation_headroom
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.model_budget import (
     budget_totals,
@@ -243,7 +244,7 @@ def load_binding(host: HostChoice, instance_root: Path):
     return config.to_binding(), config.data_directory
 
 
-def _ledger_headroom(ledger_path: Path | None, policy: Any) -> dict[str, Any]:
+def _ledger_headroom(ledger_path: Path | None, policy: Any, *, auxiliary=None) -> dict[str, Any]:
     """Selected-period usage of each auxiliary-ledger cap, as used/cap plus a ratio.
 
     Read-only and best-effort: a missing ledger, an unreadable file or a policy
@@ -262,6 +263,7 @@ def _ledger_headroom(ledger_path: Path | None, policy: Any) -> dict[str, Any]:
             prepare_budget_totals(db, policy, readonly=True)
             totals = budget_totals(db, window)
             lifetime = budget_totals(db) if window is not None else totals
+            reservations = reservation_headroom(db, policy, window, totals, auxiliary=auxiliary)
     except (sqlite3.Error, OSError, ValueError):
         return {}
     calls, inputs, outputs = totals["requests"], totals["input_tokens"], totals["output_tokens"]
@@ -290,6 +292,15 @@ def _ledger_headroom(ledger_path: Path | None, policy: Any) -> dict[str, Any]:
         headroom.update(
             time_zone=policy.time_zone, window_start_ns=window[0], window_end_ns=window[1], lifetime_usage=lifetime
         )
+    headroom.update(reservations)
+    route = getattr(auxiliary, "consolidation", None)
+    if route is not None and route.kind == "codex_cli":
+        from scope_recall.runtime.subscription_budget import SubscriptionBudgetLedger
+
+        try:
+            headroom["subscription"] = SubscriptionBudgetLedger(ledger_path, route.subscription_budget).status()
+        except (sqlite3.Error, OSError, ValueError):
+            headroom["subscription"] = {"status": "unreadable"}
     return headroom
 
 
@@ -775,7 +786,7 @@ def _check_autostart(report: DoctorReport, binding, data_directory: Path) -> flo
         aux = getattr(runtime_config, "auxiliary", None)
         if aux is not None:
             ledger = getattr(aux, "ledger_path", None)
-            report.ledger_headroom = _ledger_headroom(ledger, getattr(aux, "budget", None))
+            report.ledger_headroom = _ledger_headroom(ledger, getattr(aux, "budget", None), auxiliary=aux)
             report.capability_gaps.extend(provider_refusals(ledger))
             report.capability_gaps.extend(pre_request_refusals(aux))
         control = read_control(runtime_config)

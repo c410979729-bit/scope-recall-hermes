@@ -21,7 +21,7 @@ from ..contracts import ContractError
 from ..core.endpoint_policy import endpoint_scheme_allowed
 from ..core.private import require_outbound
 from ..core.secret_patterns import contains_secret_like_text
-from .model_budget import AuxiliaryBudgetLedger
+from .model_budget import UNBILLED_HTTP_STATUSES, AuxiliaryBudgetLedger
 
 MAX_CHAT_RESPONSE_BYTES = 1_048_576
 RESERVE_ENVELOPE_MARGIN = 256
@@ -33,9 +33,18 @@ CredentialGetter = Callable[[str], str | None]
 
 class AuxiliaryModelError(RuntimeError):
     def __init__(
-        self, error_type: str, *, detail: str | None = None, phase: str | None = None, elapsed_ms: int | None = None
+        self,
+        error_type: str,
+        *,
+        detail: str | None = None,
+        phase: str | None = None,
+        elapsed_ms: int | None = None,
+        request_not_sent: bool = False,
     ) -> None:
         self.error_type = error_type
+        # Only a completed HTTP worker reply or a failed process spawn proves
+        # no request was sent; a parent's progress frame can be stale.
+        self.request_not_sent = request_not_sent
         self.phase = phase if phase in {"prefetch", "connection_slot", "connect", "read", "transport"} else None
         self.elapsed_ms = elapsed_ms if type(elapsed_ms) is int and elapsed_ms >= 0 else None
         self.detail = detail if type(detail) is str and detail.isdigit() and len(detail) == 3 else None
@@ -219,11 +228,17 @@ def _worker_reply(stdout: bytes, max_response_bytes: int) -> tuple[int, bytes]:
         or error_type not in _HTTP_WORKER_ERRORS
     ):
         raise AuxiliaryModelError("transport_worker_protocol")
+    if status is not None and status in UNBILLED_HTTP_STATUSES:
+        # Refusal headers remain conclusive if reading their error body fails.
+        return status, response_body
     raise AuxiliaryModelError(
         error_type,
         detail=None if status is None else str(status),
         phase=result.get("phase"),
         elapsed_ms=result.get("elapsed_ms"),
+        request_not_sent=status is None
+        and result.get("phase") == "connect"
+        and error_type in {"network_error", "timeout", "http_protocol"},
     )
 
 
@@ -552,7 +567,7 @@ def metered_post(
         )
         http_remaining = seconds_left(deadline)
         if http_remaining <= 0:
-            raise AuxiliaryModelError("timeout")
+            raise AuxiliaryModelError("timeout", request_not_sent=True)
         require_outbound()
         status_code, raw = transport.post(
             endpoint, body=body, headers=headers, timeout_seconds=http_remaining, max_response_bytes=max_response_bytes
@@ -570,6 +585,8 @@ def metered_post(
         # ContractError subclasses ValueError; a reply's own verdict (such as a
         # truncated answer) must not be relabelled as a ledger refusal below.
         pending = exc
+        if isinstance(exc, AuxiliaryModelError) and exc.request_not_sent:
+            status = "request_not_sent"
     except ValueError as exc:
         pending = _ledger_error(exc)
     finally:

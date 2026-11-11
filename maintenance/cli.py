@@ -129,7 +129,14 @@ def _replay_sessions(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _release_budget_reservations(argv: list[str]) -> int:
+    from .budget import main
+
+    return main(argv[1:])
+
+
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
+    "release-budget-reservations": ("preview or release uncertain auxiliary charges", _release_budget_reservations),
     "replay-sessions": ("preview or recover missed host session records", _replay_sessions),
     "ui": ("open the local owner's memory management page", _ui),
     "memory": ("browse, correct, mute or forget memories as the local store owner", _memory),
