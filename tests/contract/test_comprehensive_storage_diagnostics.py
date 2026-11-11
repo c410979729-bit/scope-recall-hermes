@@ -15,7 +15,7 @@ from scope_recall._version import __version__
 from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.admission import AdmissionPolicy
-from scope_recall.core.recall_policy import SPACE_ID, RecallPolicy
+from scope_recall.core.recall_policy import BUILTIN_VECTOR_THRESHOLD, SPACE_ID, RecallPolicy
 from scope_recall.core.schema import SCHEMA_VERSION
 from scope_recall.maintenance import doctor, doctor_store
 from test_autonomous_admission import app_at, capture
@@ -510,7 +510,7 @@ def test_doctor_resolves_builtin_threshold_and_names_unconfigured_other_spaces(t
     assert "vector_threshold_unconfigured" not in result.capability_gaps
     [check] = [item for item in result.checks if item["name"] == "vector_threshold"]
     assert check["result"] == "default"
-    assert float(check["detail"]) == RecallPolicy(vector_threshold=None).vector_threshold == 0.70
+    assert float(check["detail"]) == RecallPolicy(vector_threshold=None).vector_threshold == BUILTIN_VECTOR_THRESHOLD
     assert app.storage.path.read_bytes() == before
     # Worth a look, not a fault: recall still answers lexically.
     alone = doctor.DoctorReport(host="hermes", status="degraded", capability_gaps=["vector_threshold_unconfigured"])

@@ -168,6 +168,8 @@ class PromptRecall:
         if isinstance(reason, str) and reason.startswith("auto_recall_skipped:"):
             self._hook.note(reason)
         self._hook.diagnostics.recall_trace = vector_trace_fields(fields.get("recall_trace"))
+        vectors = fields.get("recall_vectors")
+        self._hook.diagnostics.recall_vectors = vectors if type(vectors) is bool else None
         for name in ("recall_vector_gap", "recall_error_detail"):
             value = fields.get(name)
             if value is None or type(value) is str:

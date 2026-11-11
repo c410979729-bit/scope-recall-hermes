@@ -69,7 +69,7 @@ with one also gives the shared worker its routes, and its spend ledger moves to 
 directory. Every later entry must use the same embedding model as the worker: a
 query vector from another model searches a directory the worker never fills, so `attach`
 refuses with `embedding_space_differs`. An entry attached without a runtime config recalls
-lexically only (`vector_recall_unavailable`). The entry keeps the `vector_threshold` of the config it was attached from. An omitted value uses `0.70` for the built-in embedding space; a custom space needs an explicit threshold; automatic recall also applies `auto_vector_threshold`
+lexically only (`vector_recall_unavailable`). The entry keeps the `vector_threshold` of the config it was attached from. An omitted value uses `0.66` for the built-in embedding space: the best vector hit must reach it, and automatic recall then also admits the hits ranked in its first six down to 0.10 below it; a custom space needs an explicit threshold; automatic recall also applies `auto_vector_threshold`
 ([configuration.md](configuration.md#vector_threshold)).
 
 Then give the shared worker its credentials in `<root>\.env` and register it once, with an
@@ -350,6 +350,24 @@ scope-recall detach --instance-root "<home>"
 return an instance to its own store, detach it, rename `scope-recall.local-backup` back to
 `scope-recall`, install the package version that store was last opened with, re-enable its
 autostart and start its gateway.
+
+## One owner, several entries
+
+Each entry, and each surface of a Hermes entry, names the owner by a principal of its own. The store's manifest
+approves those principals as one person's. Within the same authorized scope, a correction that can be recognized as
+the same fact can become its next version, preserving the earlier value as history. First-person subjects remain
+bound to each entry's original principal, so first-person facts across entries currently remain separate. Existing
+split facts are not automatically merged. The shared
+worker reads the approvals from the manifest each time it orders a new statement against a stored one. A principal
+no entry approves as the owner's is somebody else, and that person's differing statement stays a proposal beside the
+fact (`different_source_principal`).
+
+`local` attests the running account or the user of an approved surface, not a natural person. People sharing one
+system account, container, or remote desktop with that account are treated as the same owner.
+
+These corrections are stated in conversation and take effect through background consolidation. On a Hermes entry,
+the `revise` and `forget` tools remain available only at the CLI; Desktop, TUI, gateway routes and A2A peers cannot
+use them.
 
 ## Repeated evidence in recall
 

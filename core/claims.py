@@ -26,6 +26,7 @@ from .candidate_lifecycle import SELF_SUBJECTS
 from .evidence_support import positioned, support_verdict
 from .fact_actions import ClaimDraft, EvidenceReference
 from .fact_evidence import evidence_supports_claim, evidence_supports_relation, stem
+from .fact_identity import fact_frame
 from .fact_temporal_semantics import classify_durable_state_clause
 from .source_qualification import (
     AUTHORITY_QUESTION,
@@ -117,6 +118,31 @@ def claim_slot(scope_id: str, project_id: str | None, branch_id: str | None, pro
         sorted(set(proposal["conditions"])),
     ]
     return hashlib.sha256(json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+#: Kinds whose claims state one value for a subject's relation.  Which of them an extraction reads a statement as
+#: varies from one message to the next ("we launch on March 3": a fact, then a decision), so a value's slot is looked
+#: for among all four (``slot_kinds``).  A claim's own kind never changes.
+STATED_VALUE_KINDS = frozenset({"fact", "preference", "constraint", "decision"})
+
+
+def slot_kinds(kind: str) -> frozenset[str]:
+    """The kinds under which a claim of ``kind`` may already hold its slot's value."""
+    return STATED_VALUE_KINDS if kind in STATED_VALUE_KINDS else frozenset({kind})
+
+
+def slot_reading(payload) -> tuple[frozenset[str], str, tuple[str, ...]]:
+    """What a claim's kind, labels and conditions say its slot is, however an extraction wrote them.
+
+    Claims that ``claim_slot`` files apart only for that writing read the same: they are candidates for one
+    same-slot judgement (``semantic_proposals.merge_candidates``). Empty frames cannot nominate a candidate.
+    A reading decides nothing by itself; health classification uses the strict normalized slot.
+    """
+    return (
+        slot_kinds(payload["kind"]),
+        fact_frame(payload["subject"], payload["predicate"]),
+        tuple(sorted(set(payload["conditions"]))),
+    )
 
 
 def same_assertion(left: ClaimProposal, right: ClaimProposal) -> bool:

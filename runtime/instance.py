@@ -131,12 +131,19 @@ class _LazyVectorPort:
     Construction opens no vector files.  The first real SearchContext opens only
     an existing companion under that request's absolute deadline, then keeps
     the trusted identity and scope supplied by that context all the way to
-    ``VectorPort``.  A disabled query embedding route returns no vector
-    candidates; it never exposes the raw native store as a Core port.
+    ``VectorPort``. A disabled query embedding route reports the channel as
+    unavailable; it never exposes the raw native store as a Core port.
     """
+
+    reports_searched_scopes = True
 
     def __init__(self, instance: RuntimeInstance) -> None:
         self._instance = instance
+
+    @property
+    def available(self) -> bool:
+        """Whether the configured query route can attempt a vector search, without opening the store."""
+        return self._instance.query_vectors_available
 
     def _embedding_adapter(self) -> VectorPort | None:
         embedding = getattr(self._instance.auxiliary, "query_embedding", None)
@@ -194,8 +201,15 @@ class _LazyVectorPort:
         return pending
 
     def search(
-        self, context: SearchContext, *, limit: int, remaining_seconds: float, prefetched: _QueryEmbedding | None = None
+        self,
+        context: SearchContext,
+        *,
+        limit: int,
+        remaining_seconds: float,
+        prefetched: _QueryEmbedding | None = None,
+        searched_scopes: set[str] | None = None,
     ):
+        """Search the configured query route and report only fully checked logical scopes."""
         if not isinstance(context, SearchContext):
             raise TypeError("context must be SearchContext")
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -248,6 +262,7 @@ class _LazyVectorPort:
                 allow_create=False, deadline=deadline, during_open=embed_while_opening
             )
             if port is None:
+                # No query route means no scope was checked. Core reports the absent capability before calling.
                 return ()
             if failed:
                 raise failed[0]
@@ -262,8 +277,14 @@ class _LazyVectorPort:
                 # nothing, and the recall would look as if it had searched by meaning.
                 raise TimeoutError("vector store request deadline exhausted before the search")
             if prepared:
-                return port.search(context, limit=limit, remaining_seconds=remaining, _prepared_query=prepared[0])
-            return port.search(context, limit=limit, remaining_seconds=remaining)
+                return port.search(
+                    context,
+                    limit=limit,
+                    remaining_seconds=remaining,
+                    _prepared_query=prepared[0],
+                    searched_scopes=searched_scopes,
+                )
+            return port.search(context, limit=limit, remaining_seconds=remaining, searched_scopes=searched_scopes)
 
 
 def _open_store(resource: Any, *, allow_create: bool, deadline: RequestDeadline | float | None, during_open) -> None:
@@ -304,6 +325,10 @@ class RuntimeInstance:
     _default_embed: Any = None
     _default_purge: Any = None
     _ingress_authorizer: Callable[[object], frozenset[str]] | None = None
+    #: A shared store's ownership proof, which a drain gives its claim writes: the worker's context speaks for no
+    #: entry and carries none (``core.claim_normalization.using_owner_proof``).
+    #: ``None`` for a store of one installation.
+    _owner_proof: Callable[..., str | None] | None = None
     _owned_resources: list[Any] = field(default_factory=list)
     _vector_openers: dict[int, int] = field(default_factory=dict, init=False, repr=False, compare=False)
     _closed: bool = False
@@ -327,6 +352,15 @@ class RuntimeInstance:
     #: Work types this drain left alone, each with the held model and when its
     #: hold ends (runtime/model_budget.py ``provider_holds``).
     provider_holds: dict = field(default_factory=dict)
+
+    @property
+    def query_vectors_available(self) -> bool:
+        """Whether both the vector configuration and an actual query embedding route are present.
+
+        Source embedding and an existing vector index do not enable query embedding. Runtime failures on an
+        enabled route remain search failures, so callers can diagnose and recover from them.
+        """
+        return self.config.vector is not None and getattr(self.auxiliary, "query_embedding", None) is not None
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -597,6 +631,7 @@ class RuntimeInstance:
                 *self.background_gaps,
                 f"deletion_mirror_failed:{(self.backup_upkeep or {}).get('error', 'unknown')}",
             )
+        from ..core.claim_normalization import using_owner_proof
         from ..core.worker import WorkerConfig, drain_worker  # only a process that drains loads the worker
 
         model, candidate = self._consolidation_ports(consolidation)
@@ -653,31 +688,32 @@ class RuntimeInstance:
         limit = self.config.request_seconds
         effective_embed = embed if embed is not None else self._default_embed
         effective_purge = purge if purge is not None else self._default_purge
-        return drain_worker(
-            self.core.storage,
-            self.core.clock,
-            self.config.context(),
-            config=WorkerConfig(
-                owner_id=self.config.owner_id,
-                max_items=self.config.max_items if max_items is None else max_items,
-                lease_seconds=self.config.lease_seconds,
-                auto_retry_cooldown_seconds=self.config.auto_retry_cooldown_seconds,
-                max_auto_recoveries=self.config.max_auto_recoveries,
-                purge_only=purge_only,
-                admission_policy=self.core.config.admission_policy,
-                # The bound the model and embedding ports below are clamped to.
-                request_seconds=limit,
-                model_request_seconds=self.config.model_request_seconds,
-                held_work_types=held_work_types,
-                summary_capable=summary_budget_enabled(self.config.auxiliary),
-                reflection_capable=summary_budget_enabled(self.config.auxiliary),
-            ),
-            remaining_seconds=max(0.001, deadline - time.monotonic()),
-            consolidation=model,
-            candidate=candidate,
-            embed=_BoundedEmbed(effective_embed, limit) if effective_embed is not None else None,
-            purge=_BoundedPurge(effective_purge, limit) if effective_purge is not None else None,
-        )
+        with using_owner_proof(self._owner_proof):
+            return drain_worker(
+                self.core.storage,
+                self.core.clock,
+                self.config.context(),
+                config=WorkerConfig(
+                    owner_id=self.config.owner_id,
+                    max_items=self.config.max_items if max_items is None else max_items,
+                    lease_seconds=self.config.lease_seconds,
+                    auto_retry_cooldown_seconds=self.config.auto_retry_cooldown_seconds,
+                    max_auto_recoveries=self.config.max_auto_recoveries,
+                    purge_only=purge_only,
+                    admission_policy=self.core.config.admission_policy,
+                    # The bound the model and embedding ports below are clamped to.
+                    request_seconds=limit,
+                    model_request_seconds=self.config.model_request_seconds,
+                    held_work_types=held_work_types,
+                    summary_capable=summary_budget_enabled(self.config.auxiliary),
+                    reflection_capable=summary_budget_enabled(self.config.auxiliary),
+                ),
+                remaining_seconds=max(0.001, deadline - time.monotonic()),
+                consolidation=model,
+                candidate=candidate,
+                embed=_BoundedEmbed(effective_embed, limit) if effective_embed is not None else None,
+                purge=_BoundedPurge(effective_purge, limit) if effective_purge is not None else None,
+            )
 
     def _replay_ingress(self, budget: float) -> tuple[str, ...]:
         """Persist captured inbox payloads.  Ingress never spends the model-work budget."""
@@ -961,16 +997,19 @@ def build_runtime_instance(
         retrieval_policy=config.recall_policy(),
     )
     core.recall_diagnostics.writer.observe = lambda: worker_observation(config.binding)
-    ingress_authorizer = None
+    ingress_authorizer = owner_proof = None
     # A shared store's inbox holds its Hermes entries' captures, whichever
     # process replays them; each is checked against the entry that made it.
     if config.host_adapter == "hermes" or config.binding.installation_kind == "shared":
-        # The worker checks a replayed capture against the host's current installation map, which is the host
-        # adapters' identity code: the one import from runtime up into adapters, kept to the call (it would add
-        # about twenty modules to every worker start).
-        from ..adapters.hermes.authorization import build_ingress_authorizer
+        # The worker checks a replayed capture against the host's current installation map, and reads from it
+        # which principals are the store's owner.  Both are the host adapters' identity code: the one import from
+        # runtime up into adapters, kept to the call (it would add about twenty modules to every worker start).
+        from ..adapters.hermes.authorization import build_ingress_authorizer, build_owner_proof
 
         ingress_authorizer = build_ingress_authorizer(config.binding)
+        # The adapters name the installed package's ``InstanceBinding``, which pyright reads as another class than
+        # this module's.
+        owner_proof = build_owner_proof(config.binding)  # pyright: ignore[reportArgumentType]
     elif config.host_adapter == "codex":
         from ..adapters.clients.authorization import build_ingress_authorizer
 
@@ -983,6 +1022,7 @@ def build_runtime_instance(
         _vector_port=vectors,
         _vector_store=vectors,
         _ingress_authorizer=ingress_authorizer,
+        _owner_proof=owner_proof,
         _owned_resources=[resource for resource in (vectors, auxiliary) if resource is not None],
     )
     if vectors is None and config.vector is not None:

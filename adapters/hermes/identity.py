@@ -206,6 +206,19 @@ class HermesIdentity:
     def entry_id(self) -> str | None:
         return self.manifest.entry_id
 
+    def is_sender(self, sender_id: str) -> bool:
+        """Whether ``sender_id``, as a host hook names a turn's sender, is the user this session was bound for.
+
+        Hermes names the sender to its hooks as it named the session's user to the provider.  That is the bound
+        user, except in a conversation of its local session transport: there the host names the account it runs as,
+        and the session was bound as the person at this machine (``bind_hermes_identity``).
+        """
+        user = self.scope.user_id
+        if sender_id == user:
+            return True
+        local = self.scope.platform == "cli" or self.scope.platform in LOCAL_PLATFORMS
+        return local and user == LOCAL_USER_ID and _names_this_account(sender_id)
+
     @property
     def runtime_config_path(self) -> Path | None:
         """An entry's own runtime config: its model routes, beside its pointer.

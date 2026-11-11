@@ -118,9 +118,9 @@ def _merge_alias_live(tx, alias, now):
 
 
 def merge_candidates(tx, proposal, scope_id, *, now, entity=None, vector_hits=(), paging=None) -> Any:
-    """Find same-slot candidates by normalized components and verified aliases in this audience."""
-    from .claims import bind_claim_subject, evidence_refs, valid_at
-    from .fact_identity import normalize_fact_component
+    """Find the claims in this audience whose slot reads as this proposal's (``claims.slot_reading``), under its own
+    subject or one a verified alias names."""
+    from .claims import bind_claim_subject, evidence_refs, slot_reading, valid_at
 
     page = paging is not None
     after, limit = paging if page else (None, 16)
@@ -132,9 +132,7 @@ def merge_candidates(tx, proposal, scope_id, *, now, entity=None, vector_hits=()
     bound, _, issue = bind_claim_subject(proposal, roots, semantic_support=True)
     if issue:
         return ((), None) if page else ()
-    subject = normalize_fact_component(bound["subject"])
-    predicate = normalize_fact_component(bound["predicate"])
-    subjects = {subject}
+    subjects = {bound["subject"]}
     for ref in tx.claims.merge_lookup(scope_id, alias_name=proposal["subject"], instant=now):
         alias = next((v for v in tx.claims.versions(ref) if v.revision == v.current_revision), None)
         if (
@@ -144,26 +142,23 @@ def merge_candidates(tx, proposal, scope_id, *, now, entity=None, vector_hits=()
             and valid_at(alias, now, historical=False)
             and _merge_alias_live(tx, alias, now)
         ):
-            subjects.add(normalize_fact_component(alias.payload["subject"]))
+            subjects.add(alias.payload["subject"])
+    readings = {slot_reading(dict(bound, subject=subject)) for subject in subjects}
     found = []
     refs = tx.claims.merge_lookup(
         scope_id,
         subjects=subjects,
-        predicate=predicate,
+        predicate=bound["predicate"],
         kind=proposal["kind"],
         conditions=proposal["conditions"],
-        options=dict(after=after, limit=limit),
+        options=dict(after=after, limit=limit, by_id=page),
     )
     for ref in refs:
         versions = tx.claims.versions(ref)
         head = next((v for v in versions if v.revision == v.current_revision), None)
         if head is None or head.scope_id != scope_id or head.state not in {"active", "proposed", "disputed"}:
             continue
-        if (
-            normalize_fact_component(head.payload["subject"]) in subjects
-            and normalize_fact_component(head.payload["predicate"]) == predicate
-            and sorted(head.payload["conditions"]) == sorted(proposal["conditions"])
-        ):
+        if slot_reading(head.payload) in readings:
             found.append(dict(ref=head.ref, revision=head.revision, payload=head.payload))
     result = tuple(found[:limit])
     return (result, refs[-1] if len(refs) == limit else None) if page else result
