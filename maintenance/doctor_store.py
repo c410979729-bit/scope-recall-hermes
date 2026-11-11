@@ -393,6 +393,7 @@ def _injection_checks(report, conn):
     )
     report.injection_quarantined = safety.get("quarantined", 0)
     report.injection_pending_review = safety.get("pending_review", 0)
+    report.injection_review = _injection_review_summary(conn)
     report.injection_scan_deadlines = conn.execute(
         "SELECT count(*) FROM work_error_details WHERE stage='source_scan' AND error_code='scan_time_budget'"
     ).fetchone()[0]
@@ -403,7 +404,43 @@ def _injection_checks(report, conn):
         "injection_safety",
         "held" if report.injection_quarantined + report.injection_pending_review else "clear",
         f"quarantined={report.injection_quarantined}; pending_review={report.injection_pending_review}; "
-        f"scan_deadlines={report.injection_scan_deadlines}",
+        f"scan_deadlines={report.injection_scan_deadlines}; pending_by_rule={report.injection_review['by_rule']}; "
+        f"pending_by_origin={report.injection_review['by_origin']}; "
+        f"oldest_pending={report.injection_review['oldest_scanned_at']}; "
+        f"pending_last_24h={report.injection_review['last_24h']}",
+    )
+
+
+def _injection_review_summary(conn):
+    """Count pending source versions from scan metadata without reading source words."""
+    import json
+    from collections import Counter
+    from types import SimpleNamespace
+
+    from ..core.source_records import source_origin
+
+    rules, origins = Counter(), Counter()
+    now = datetime.now(UTC)
+    oldest, recent = None, 0
+    for row in conn.execute(
+        "SELECT e.origin,e.source_original_origin,e.import_provenance_sha256,s.rules_json,s.scanned_at "
+        "FROM source_safety s JOIN source_events e "
+        "ON e.event_id=s.source_ref AND e.source_revision=s.source_revision "
+        "WHERE s.state='pending_review' AND e.read_blocked=0 ORDER BY julianday(s.scanned_at)"
+    ):
+        record = dict(row)
+        origins[
+            source_origin(SimpleNamespace(event=record, import_provenance_sha256=record["import_provenance_sha256"]))
+        ] += 1
+        rules.update(set(json.loads(record["rules_json"])))
+        oldest = oldest or record["scanned_at"]
+        scanned = datetime.fromisoformat(record["scanned_at"].replace("Z", "+00:00"))
+        recent += now - timedelta(hours=24) <= scanned <= now
+    return dict(
+        by_rule=dict(sorted(rules.items())),
+        by_origin=dict(sorted(origins.items())),
+        oldest_scanned_at=oldest,
+        last_24h=recent,
     )
 
 

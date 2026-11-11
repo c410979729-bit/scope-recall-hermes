@@ -23,9 +23,12 @@ from .injection_schema import DEFAULT_RULES
 STRIDE = 2048
 MARGIN = 2048
 COMPILER_VERSION = "bounded-structured-payload-3"
+OWNER_QUOTE_COMPILER_VERSION = "bounded-owner-quotes-1"
 # Each window owns STRIDE characters and inspects at most two margins of context.
 # Body and metadata share this allowance; larger groups resume on the local queue.
 SCAN_WINDOWS = 128
+# This reserved origin row stores an optional exception, not an executable rule.
+OWNER_QUOTE_SETTING = ("auto_release_owner_quotes", "setting", "origin", "human_direct", "pending_review")
 _SIMPLE_FOLD = re.compile(r"[\x00-\x7f\u4e00-\u9fff\uff01-\uff5e]*")
 _WIDE_ASCII = str.maketrans({cp: cp - 0xFEE0 for cp in range(0xFF01, 0xFF5F)})
 _FLAGS = tuple(
@@ -53,6 +56,7 @@ class ScanResult:
     rules: tuple[str, ...] = ()
     progress: dict | None = None
     windows: int = 0
+    quoted_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,7 @@ class Policy:
 
     rules: tuple
     fingerprint: str
+    auto_release_owner_quotes: bool = False
 
 
 @lru_cache(maxsize=256)
@@ -88,9 +93,18 @@ def load_policy(conn, deadline=None):
     required = {rule[0]: (rule[1], rule[2], rule[3] if rule[2] == "unicode" else None) for rule in DEFAULT_RULES}
     found = {}
     active = []
+    auto_release = False
     for row in rows:
         if deadline is not None and time.perf_counter() >= deadline:
             raise TimeoutError
+        if row["rule_id"] == OWNER_QUOTE_SETTING[0]:
+            if (
+                tuple(row[name] for name in ("rule_id", "category", "matcher", "pattern", "disposition"))
+                != OWNER_QUOTE_SETTING
+            ):
+                raise ValueError("owner quote setting")
+            auto_release = bool(row["enabled"])
+            continue
         if not row["enabled"]:
             continue
         matcher, pattern = row["matcher"], row["pattern"]
@@ -108,11 +122,13 @@ def load_policy(conn, deadline=None):
         active.append((row["rule_id"], matcher, compiled, row["disposition"]))
     if len(rows) > 64 or any(found.get(key) != category for key, category in required.items()):
         raise ValueError("incomplete policy")
-    return Policy(tuple(active), _policy_digest(rows))
+    return Policy(tuple(active), _policy_digest(rows), auto_release)
 
 
 def _policy_digest(rows):
-    return hashlib.sha256((COMPILER_VERSION + json.dumps([tuple(row) for row in rows])).encode()).hexdigest()
+    enabled = any(row["rule_id"] == OWNER_QUOTE_SETTING[0] and row["enabled"] for row in rows)
+    compiler = OWNER_QUOTE_COMPILER_VERSION if enabled else COMPILER_VERSION
+    return hashlib.sha256((compiler + json.dumps([tuple(row) for row in rows])).encode()).hexdigest()
 
 
 def policy_fingerprint(conn):
@@ -338,7 +354,7 @@ def scan_events(tx, events, *, remaining_seconds=None, policy=None, progress=Non
         (json.dumps({k: v for k, v in event.items() if k != "content"}, ensure_ascii=False), False) for event in events
     )
     cursor = dict(progress or {})
-    matches = dict(cursor.get("matches", {}))
+    matches, annotation = _scan_matches(policy, cursor)
     windows = 0
     for index in range(cursor.get("value", 0), len(values)):
         value, discussion = values[index]
@@ -346,39 +362,101 @@ def scan_events(tx, events, *, remaining_seconds=None, policy=None, progress=Non
         tracker = _QuotedSpans(value, cursor.get("quotes")) if discussion else None
         for offset in range(first_offset, len(value), STRIDE):
             if max_windows is not None and windows >= max_windows:
-                return _verdict(matches, _checkpoint(index, offset, matches, tracker), windows=windows)
+                return _verdict(
+                    matches,
+                    _checkpoint(index, offset, matches, tracker, annotation),
+                    windows=windows,
+                    annotation=annotation,
+                )
             if deadline is not None and time.perf_counter() >= deadline:
-                return _verdict(matches, _checkpoint(index, offset, matches, tracker), "scan_time_budget", windows)
+                return _verdict(
+                    matches,
+                    _checkpoint(index, offset, matches, tracker, annotation),
+                    "scan_time_budget",
+                    windows,
+                    annotation=annotation,
+                )
             raw, text, owned, folded_owned = _window(value, offset)
             if len(text) > 32768:
                 return ScanResult("pending_review", ("scan_normalization_budget",), windows=windows + 1)
             quotes = tracker.window(raw, text, offset) if tracker is not None else ()
             for rule in policy.rules:
                 if deadline is not None and time.perf_counter() >= deadline:
-                    return _verdict(matches, _checkpoint(index, offset, matches, tracker), "scan_time_budget", windows)
+                    return _verdict(
+                        matches,
+                        _checkpoint(index, offset, matches, tracker, annotation),
+                        "scan_time_budget",
+                        windows,
+                        annotation=annotation,
+                    )
                 hit = _hits(rule, raw, text, discussion, owned, folded_owned, quotes)
                 if hit:
-                    state = rule[3] if hit != "pending_review" else "pending_review"
-                    if matches.get(rule[0]) != "quarantined":
-                        matches[rule[0]] = state
-                    if hit == "pending_review":
-                        matches["quoted_instruction"] = "pending_review"
+                    _record_hit(matches, annotation, rule, hit)
             windows += 1
         cursor = {}
-    return _verdict(matches, windows=windows)
+    return _verdict(matches, windows=windows, annotation=annotation)
 
 
-def _checkpoint(index, offset, matches, tracker):
-    return dict(value=index, offset=offset, matches=matches, quotes=tracker.checkpoint() if tracker else None)
+def _scan_matches(policy, cursor):
+    """Decode real rule verdicts separately from the quotation summary.
+
+    Disabled checkpoints retain the established flat representation and order.
+    Enabled checkpoints carry explicit quote proof; a cursor lacking that proof
+    can never authorize an automatic release.
+    """
+    raw = dict(cursor.get("matches", {}))
+    names = {rule[0] for rule in policy.rules}
+    extended = policy.auto_release_owner_quotes
+    matches = dict(raw)
+    if not extended and "quoted_instruction" not in names:
+        matches.pop("quoted_instruction", None)
+    annotation = dict(
+        order=list(cursor.get("rule_order", raw)),
+        quoted=cursor.get("quoted", "quoted_instruction" in raw),
+        unquoted=cursor.get("unquoted", bool(cursor)),
+        extended=extended,
+    )
+    return matches, annotation
 
 
-def _verdict(matches, progress=None, reason="scan_work_budget", windows=0):
+def _record_hit(matches, annotation, rule, hit):
+    """Keep blocking verdicts monotonic even when a rule shares the summary's label."""
+    name = rule[0]
+    state = "pending_review" if hit == "pending_review" else rule[3]
+    if matches.get(name) != "quarantined":
+        matches[name] = state
+    if name not in annotation["order"]:
+        annotation["order"].append(name)
+    if hit == "pending_review":
+        annotation["quoted"] = True
+        if "quoted_instruction" not in annotation["order"]:
+            annotation["order"].append("quoted_instruction")
+    else:
+        annotation["unquoted"] = True
+
+
+def _checkpoint(index, offset, matches, tracker, annotation):
+    stored = (
+        matches
+        if annotation["extended"]
+        else {name: matches.get(name, "pending_review") for name in annotation["order"]}
+    )
+    cursor = dict(value=index, offset=offset, matches=stored, quotes=tracker.checkpoint() if tracker else None)
+    if annotation["extended"]:
+        cursor.update(rule_order=annotation["order"], quoted=annotation["quoted"], unquoted=annotation["unquoted"])
+    return cursor
+
+
+def _verdict(matches, progress=None, reason="scan_work_budget", windows=0, *, annotation=None):
     state = (
         "quarantined"
         if "quarantined" in matches.values()
         else "pending_review"
-        if matches or progress is not None
+        if matches or progress is not None or annotation and annotation["quoted"]
         else "clear"
     )
-    rules = tuple(matches) + ((reason,) if progress is not None else ())
-    return ScanResult(state, rules, progress, windows)
+    rules = tuple(annotation["order"] if annotation is not None else matches) + (
+        (reason,) if progress is not None else ()
+    )
+    quoted_only = bool(matches and annotation and annotation["quoted"] and not annotation["unquoted"])
+    return ScanResult(state, rules, progress, windows, quoted_only)

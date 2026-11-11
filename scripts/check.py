@@ -276,6 +276,9 @@ SUITES = {
         "tests/contract/test_injection_revision.py",
         "tests/contract/test_injection_screening.py",
         "tests/contract/test_injection_merged.py",
+        "tests/contract/test_owner_quote_policy.py",
+        "tests/contract/test_source_review_batch.py",
+        "tests/contract/test_source_review_repairs.py",
     ],
     "claims": [
         "tests/test_denial_values.py",

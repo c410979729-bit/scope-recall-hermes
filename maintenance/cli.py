@@ -129,7 +129,15 @@ def _replay_sessions(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _source_review(argv: list[str]) -> int:
+    from .source_review import main
+
+    return main(argv)
+
+
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
+    "review-sources": ("preview and decide a batch of pending source reviews as the local owner", _source_review),
+    "injection-policy": ("inspect or set the store's optional owner quote exception", _source_review),
     "replay-sessions": ("preview or recover missed host session records", _replay_sessions),
     "ui": ("open the local owner's memory management page", _ui),
     "memory": ("browse, correct, mute or forget memories as the local store owner", _memory),

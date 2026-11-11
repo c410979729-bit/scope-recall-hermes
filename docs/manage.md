@@ -258,6 +258,85 @@ a mute. For a snapshot predating management, it prepares the original deletion-l
 executable understands. Both paths preserve deletions; only the complete checkpoint can release an older mute.
 
 
+## Review held sources
+
+Injection scanning withholds instructions before recall or extraction. A matching instruction inside an existing
+quotation or code span is ambiguous: it can be a harmless example or an instruction copied from somewhere else.
+Such hits become `pending_review`; unquoted blocking hits become `quarantined`. Neither state participates in
+recall or background extraction. The local page's **Held content** view shows the text and matched rules, and its
+Review release action binds confirmation to the displayed revision and content SHA-256.
+
+`doctor` reports both totals and `injection_review`: pending versions counted by matched rule and verified source
+origin, `oldest_scanned_at`, and `last_24h` (currently pending versions scanned in the last 24 hours, not a historical
+arrival count). A source can match several rules, so rule counts can exceed the pending total. These are on-demand
+diagnostics; host-side
+notifications are not provided. Holds have no expiration policy: time alone neither releases them nor converts a
+pending review into quarantine.
+
+For a batch, first save and inspect the JSON preview, then explicitly apply the saved selection:
+
+```sh
+scope-recall review-sources --root /path/to/store --rule quoted_instruction --origin human_direct --before 2026-11-01T00:00:00Z --limit 100 > source-review.json
+scope-recall review-sources --root /path/to/store --preview source-review.json --apply
+```
+
+The default `--state pending_review` is the only supported state. `--rule` and `--origin` may each be repeated and
+match any supplied value within their respective filter. Origins use recorded provenance, including the verified
+original origin for imports. `--after` and `--before` are exclusive bounds on the scan time, require an ISO 8601
+timestamp with timezone, and can be combined. `--limit` selects at most 1,000 versions (100 by default), oldest
+first. The preview reports the selected count, rule and origin distributions, exact versions and content hashes,
+and excerpts of at most 240 characters each. `more: true` means matching versions remain beyond this batch.
+The preview file is trusted local input, not a signed or tamper-evident receipt. Execution rechecks each listed
+target's permissions, state and content hash, but a replacement authorized pending source with its correct hash
+can also be executed; excerpts and counts do not authenticate the selection. Keep the file on the local machine,
+protect it from edits and delete it after review.
+
+To confirm continued withholding, create a preview with `--decision retain` and apply that preview. This completes
+the existing rejection review and changes those pending versions to `quarantined`. The default decision is
+`release`. A retain preview selects only current versions, as required by the native rejection flow; release can
+also select older held versions. Applying requires `--apply --preview FILE`; selection filters cannot replace the
+saved preview during
+confirmation. Every version uses the existing owner-authorized release or rejection path. Changed content or a new
+quarantine fails that item while the rest continue. The result counts `succeeded`, `failed` and unchanged completed
+decisions `skipped`; failures include references and error codes. Repeating an unchanged completed decision is safe.
+A release returns that version to normal admission and work scheduling; any other hold on its message group still
+withholds the group. To work through more batches, create a fresh preview after each completed batch.
+
+### Optional owner quote exception
+
+The per-store `auto_release_owner_quotes` setting is off by default. Inspect it, then explicitly enable it:
+
+```sh
+scope-recall injection-policy --root /path/to/store
+scope-recall injection-policy --root /path/to/store --auto-release-owner-quotes on --apply
+scope-recall injection-policy --root /path/to/store --auto-release-owner-quotes off --apply
+```
+
+The setting lives in the store's existing `injection_rules` table as a reserved origin-policy record; it is not a
+runtime configuration field. It applies across entries using that store. Enabling it does not revisit completed
+holds; use the batch command for the existing review queue. Disabling it affects future scans and does not revoke
+existing releases.
+
+Every entry reading the store needs a scanner that understands the setting while it is enabled. Disable the
+exception before reverting to an earlier scanner: it treats the unrecognized enabled policy record as an invalid
+policy and withholds new content. No schema migration is required for this setting.
+
+Only a complete successful scan consisting entirely of quoted instruction hits can use the exception. Every part
+must be a recorded `human_direct` message whose verified human speaker the host's trusted owner binding identifies
+as this store's owner. Another verified person, a missing speaker or owner binding, and every import stay pending;
+an import's original human category does not prove local ownership. A message's claim to be the owner confers no
+authority. When a host or worker cannot supply owner proof, it cannot use the exception: a store that is not
+attached through a shared entry has no owner binding to check, and a background worker that finishes a scan on its
+own has none either, so the same quoted message stays pending there. Assistant messages, tool
+output and external documents keep their review holds. Any unquoted hit, blocking rule, invalid policy,
+normalization limit or unfinished scan still withholds the source. Quote recognition is unchanged.
+
+Automatic releases retain a `source_safety` row with state `released`, the matched rules and the
+`auto_release_owner_quotes` reason, so the owner can inspect them later. They are policy decisions, without a
+human review timestamp. The held-content review flow does not re-quarantine released versions; ordinary mute and
+delete controls remain available. The exception trusts the owner's choice to retain their quoted examples; it
+does not certify quoted content as safe instructions.
+
 ## Review observations
 
 The Review page lists unconfirmed cross-session observations. The held-content page also presents their induction review controls.

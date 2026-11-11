@@ -120,11 +120,64 @@ def complete_events(rows):
 
 def evidence_verdict(tx, events, verdict):
     """Keep content whose evidence is held unavailable at either publication boundary."""
-    if verdict.state == "clear":
+    if verdict.state in {"clear", "released"}:
         evidence = tuple(ref.rsplit("@", 1)[0] for event in events for ref in event.get("evidence_refs", ()))
         if blocked_refs(tx, "event", evidence):
             return ScanResult("pending_review", ("held_evidence",), windows=verdict.windows)
     return verdict
+
+
+def owner_quote_verdict(tx, rows, verdict, policy, *, fresh=()):
+    """Apply the store exception only to complete quotes proven to be the owner's.
+
+    A replay cannot release a completed review hold. Incomplete capture groups
+    and checkpointed scans may finish under the currently selected policy.
+    """
+    if not (
+        policy is not None
+        and policy.auto_release_owner_quotes
+        and verdict.state == "pending_review"
+        and verdict.quoted_only
+        and verdict.progress is None
+    ):
+        return verdict
+    continuing = (
+        tx._check()
+        .execute(
+            "SELECT 1 FROM source_scan_progress WHERE source_ref=? AND source_revision=?",
+            (rows[0]["event_id"], rows[0]["source_revision"]),
+        )
+        .fetchone()
+    )
+    owner_memo = {}
+    for row in rows:
+        if not _owner_source(tx.context, stored_source(row, len(rows)), owner_memo):
+            return verdict
+        key = (row["event_id"], row["source_revision"])
+        if key not in fresh:
+            old = (
+                tx._check()
+                .execute("SELECT rules_json FROM source_safety WHERE source_ref=? AND source_revision=?", key)
+                .fetchone()
+            )
+            if old is not None and json.loads(old[0]) != ["incomplete_scan_group"] and not continuing:
+                return verdict
+    return ScanResult("released", (*verdict.rules, "auto_release_owner_quotes"), windows=verdict.windows)
+
+
+def _owner_source(context, source, memo):
+    """Require the host's owner attestation for this recorded human; imports supply no ownership proof."""
+    principal = source.event.get("source_principal")
+    resolve = context.owner_resolver
+    if (
+        source.event["origin"] != "human_direct"
+        or principal is None
+        or principal.get("kind") != "human"
+        or principal.get("resolution") != "verified"
+        or resolve is None
+    ):
+        return False
+    return resolve(source.entry_id, principal, memo) == context.binding.installation_id
 
 
 def _group_verdict(tx, rows, remaining_seconds, policy, max_windows, *, expired=False):
@@ -157,7 +210,7 @@ def _record_verdict(tx, rows, verdict, now, *, fresh=()):
             if old is not None:
                 conn.execute("DELETE FROM source_safety WHERE source_ref=? AND source_revision=?", key)
         else:
-            if old is None:
+            if old is None and verdict.state != "released":
                 new_holds.add(row["scope_id"])
             conn.execute(
                 """INSERT INTO source_safety(source_ref,source_revision,state,rules_json,scanned_at)
@@ -224,6 +277,9 @@ def screen_sources(tx, sources, now, *, remaining_seconds=None):
         )
         left = None if deadline is None else max(0, deadline - time.perf_counter())
         verdict = _group_verdict(tx, rows, left, policy, windows, expired=expired)
+        verdict = owner_quote_verdict(tx, rows, verdict, policy, fresh=inserted)
+        if verdict.state == "released":
+            verdict = evidence_verdict(tx, complete_events(rows), verdict)
         windows -= verdict.windows
         _record_verdict(tx, rows, verdict, now, fresh=inserted)
         held = blocked_refs(tx, "event", (row["event_id"] for row in rows))
