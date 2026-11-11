@@ -462,6 +462,44 @@ def test_setup_reports_real_host_delivery_evidence(fake_user):
         assert check["host_reasons"] == ["brief_safety_unconfirmed"] * 3
 
 
+@pytest.mark.parametrize("host", ["workbuddy", "claude-code"])
+def test_setup_probe_hooks_run_an_installed_entrys_budget(fake_user, monkeypatch, host):
+    """The probe's entry has no runtime config of its own; its prompts still get the time an installed entry's do."""
+    from scope_recall.adapters.clients import CodexHookHandler
+    from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+
+    original, budgets = CodexHookHandler._hook_budget, []
+
+    def budget(self):
+        budgets.append(original(self))
+        return budgets[-1]
+
+    monkeypatch.setattr(CodexHookHandler, "_hook_budget", budget)
+    installed(fake_user, host)
+    assert budgets and set(budgets) == {RuntimeInstanceConfig.hook_processing_seconds}
+
+
+def test_setup_retries_a_client_prompt_that_ran_out_of_time(fake_user, monkeypatch):
+    """A client hook that spent its budget before delivering is read again; only a delivered marker is ready."""
+    from scope_recall.adapters.clients.prompt_recall import PromptRecall
+
+    original, calls = PromptRecall.own, []
+
+    def own(self, *args, **kwargs):
+        calls.append(True)
+        if len(calls) == 2:
+            # The first call is the probe's capture prompt; this one is its first read.
+            self._hook.note("deadline_exceeded")
+            return {}
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(PromptRecall, "own", own)
+    _, result = installed(fake_user)
+    check = result["hosts"][0]["verification"]["readback"]
+    assert check["method"] == "host_adapter" and check["status"] == "passed"
+    assert check["host_reasons"] == ["deadline_exceeded", "marker_recalled"]
+
+
 def test_setup_records_a_host_read_error_without_retry(fake_user, monkeypatch):
     """A host exception preserves its attempt and numeric error without disclosing text or repeating the call."""
     from scope_recall.maintenance import setup_verify

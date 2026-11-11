@@ -37,7 +37,17 @@ READBACK_SECONDS = 10.0
 # Cold delivery checks can exhaust their first short window. Two warmed host
 # reads allow recovery while bounding work when the injection path is broken.
 HOST_READ_ATTEMPTS = 3
-_UNCONFIRMED = frozenset({"brief_safety_unconfirmed", "brief_delivery_unconfirmed", "injection_delivery_unconfirmed"})
+# What a host reports when its own time or safety check ran out before it could deliver: the delivery reasons of
+# both adapters, and the exits of a client prompt whose recall did not finish within the hook's allowance.
+_UNCONFIRMED = frozenset(
+    {
+        "brief_safety_unconfirmed",
+        "brief_delivery_unconfirmed",
+        "injection_delivery_unconfirmed",
+        "deadline_exceeded",
+        "recall_incomplete",
+    }
+)
 # Unknown gap codes remain failures even when their names resemble deadline or
 # confirmation codes. These are the explicit deadline exits of Core recall.
 _READBACK_WAITING_GAPS = frozenset(
@@ -56,15 +66,19 @@ _READBACK_WAITING_GAPS = frozenset(
 )
 
 
-def _host_answer(answer, reason):
+def _host_answer(answer, *reasons):
     """Carry only fixed diagnostics when a host leaves delivery unconfirmed."""
-    if MARKER not in json.dumps(answer, ensure_ascii=False) and reason in _UNCONFIRMED:
+    reason = next((reason for reason in reasons if reason in _UNCONFIRMED), None)
+    if MARKER not in json.dumps(answer, ensure_ascii=False) and reason is not None:
         return dict(unconfirmed=reason)
     return answer
 
 
 def _client(home: Path, host: str, session: str, prompt: str) -> dict:
-    with closing(CodexHookHandler.from_home(str(home), host)) as handler:
+    # The check entry's runtime config is kept outside its home, so that no hook starts a worker for it; its
+    # prompts get the allowance of an installed entry all the same.
+    budget = RuntimeInstanceConfig.hook_processing_seconds
+    with closing(CodexHookHandler.from_home(str(home), host, prompt_budget=budget)) as handler:
         answer = handler.handle_payload(
             dict(
                 hook_event_name="UserPromptSubmit",
@@ -76,7 +90,7 @@ def _client(home: Path, host: str, session: str, prompt: str) -> dict:
                 prompt=prompt,
             )
         )
-        return _host_answer(answer, handler.diagnostics.delivery_reason)
+        return _host_answer(answer, handler.diagnostics.delivery_reason, handler.diagnostics.last_reason)
 
 
 def _hermes(home: Path, session: str, prompt: str, *, capture: bool, agent_identity: str):
