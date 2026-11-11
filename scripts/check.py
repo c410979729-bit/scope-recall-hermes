@@ -21,11 +21,10 @@ ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_PACKAGING_UV = ""
 DEFAULT_WATCHDOG_SECONDS = 180
 RELEASE_WATCHDOG_SECONDS = 600
-#: GitHub's Windows runner executes the integration baseline roughly an order
-#: of magnitude slower than the Linux runners; the 118-file selection needs
-#: tens of minutes of real work there. Cap the integration tier so the
-#: watchdog bounds a hang, not a slow-but-healthy suite.
-INTEGRATION_WATCHDOG_SECONDS = 2700
+#: On GitHub's Windows runner, 189 integration files completed about 4,510 of
+#: an estimated 5,708 tests in 2,700 seconds, projecting about 3,400 seconds.
+#: Allow 50% headroom so the watchdog bounds a hang, not a healthy suite.
+INTEGRATION_WATCHDOG_SECONDS = 5100
 #: Headroom granted per selected test file, on top of the 180s floor.  A flat
 #: 180s times out a tier of 1,048 tests across 66 files with nothing hung, only
 #: a bigger suite, and a gate that reports a timeout instead of a result is not
@@ -80,7 +79,7 @@ def pytest_watchdog_seconds(
 ) -> int:
     """Bounded suite watchdog, scaled to how much this run selected.
 
-    Release and integration keep fixed budgets of 600s and 2700s respectively.
+    Release and integration keep fixed budgets of 600s and 5100s respectively.
     Every other tier keeps 180s as a floor and adds twenty seconds per selected
     file, capped at the integration budget so no run -- hung or merely large --
     waits forever; each of ``selected_paths`` that builds a whole store then
@@ -92,10 +91,8 @@ def pytest_watchdog_seconds(
     if type(selected_files) is not int or type(selected_files) is bool or selected_files < 0:
         selected_files = 0
     if tier == "integration":
-        # The GitHub Windows runner executes the 118-file integration baseline
-        # tens of times slower than Linux: a shared cap of 600s fired with the
-        # suite 25% done and still printing progress.  The tier carries its own
-        # fixed budget, sized to that run, the way release carries 600s.
+        # Integration keeps a fixed budget sized to the GitHub Windows runner,
+        # just as release keeps its own fixed budget.
         return INTEGRATION_WATCHDOG_SECONDS
     paths = selected_paths if isinstance(selected_paths, (list, tuple)) else ()
     heavy = sum(HEAVY_FILE_SECONDS.get(path, 0) for path in {str(path).replace("\\", "/") for path in paths})
@@ -177,6 +174,7 @@ SUITES = {
         "tests/unit/test_setup_discovery.py",
         "tests/unit/test_trusted_context.py",
         "tests/unit/test_check_runner.py",
+        "tests/unit/test_failure_reporting.py",
         "tests/unit/test_secret_patterns.py",
         "tests/unit/test_recall_budget.py",
         "tests/unit/test_query_time.py",

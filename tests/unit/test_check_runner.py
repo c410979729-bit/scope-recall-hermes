@@ -135,9 +135,9 @@ def test_watchdog_seconds_are_bounded_and_release_is_600() -> None:
     assert check.pytest_watchdog_seconds("contract") == 180
     assert check.pytest_watchdog_seconds("packaging") == 180
     assert check.pytest_watchdog_seconds("release") == 600
-    # The GitHub Windows runner needs tens of minutes for the 118-file
-    # integration baseline; the tier's floor must exceed the release budget.
-    assert check.pytest_watchdog_seconds("integration", 118) == check.INTEGRATION_WATCHDOG_SECONDS
+    # Integration keeps its fixed Windows runner budget regardless of selection size.
+    assert check.INTEGRATION_WATCHDOG_SECONDS == 5100
+    assert check.pytest_watchdog_seconds("integration", 189) == check.INTEGRATION_WATCHDOG_SECONDS
     assert check.INTEGRATION_WATCHDOG_SECONDS > check.RELEASE_WATCHDOG_SECONDS
     assert check.pytest_watchdog_seconds("integration", 0) == check.INTEGRATION_WATCHDOG_SECONDS
 
@@ -155,7 +155,7 @@ def test_the_retrieval_tier_s_watchdog_carries_the_recall_bench_s_own_allowance(
     assert check.pytest_watchdog_seconds("retrieval", len(rest), rest) == 180 + 20 * len(rest)
     assert check.pytest_watchdog_seconds("retrieval", len(selected), selected) == 180 + 20 * len(selected) + heavy
     assert check.pytest_watchdog_seconds("retrieval", 1, [bench]) == 800
-    assert check.pytest_watchdog_seconds("retrieval", 200, [bench]) == check.INTEGRATION_WATCHDOG_SECONDS + 600
+    assert check.pytest_watchdog_seconds("retrieval", 10_000, [bench]) == check.INTEGRATION_WATCHDOG_SECONDS + 600
 
 
 def test_release_wrapper_records_actual_600s_watchdog(monkeypatch, tmp_path: Path) -> None:
