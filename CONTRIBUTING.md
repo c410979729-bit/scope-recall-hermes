@@ -84,7 +84,8 @@ hand says how, in the pull request and in `CHANGELOG.md`.
    then `uv run --no-sync python scripts/quality.py`. When you fixed findings it
    asks you to record the lower numbers with `--update`.
 3. If you changed the version, run `python scripts/build.package_manifest.py --write`
-   so the plugin manifests and the wheel allowlist follow `_version.py`.
+   so the adapter manifest and the wheel allowlist follow `_version.py`; the catalog
+   manifest follows it too when the version is a release.
 4. Update `CHANGELOG.md`, and `README.md` or `docs/` when behaviour visible to an
    operator or a host changed.
 

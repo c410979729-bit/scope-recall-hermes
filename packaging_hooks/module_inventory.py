@@ -193,6 +193,9 @@ def expected_manifest(text: str, version: str, relative: str) -> str | None:
 
     Hermes installs the catalog directory from the default branch, so its core
     must remain a published release while the source version is in development.
+    During development only the manifest's own consistency is checked: its version
+    line names a release and its pin equals it. Whether that release is the newest
+    one published is not something this check can see.
     """
     catalog = relative == "distribution/hermes/plugin.yaml"
     if catalog and ".dev" in version:
