@@ -279,8 +279,19 @@ RELATION_WEIGHT = 0.5
 class _VectorPool:
     """What one collection round's vector search ranked, admitted or not (``RetrievalPipeline._vector_candidates``)."""
 
-    searched: bool = False
+    searched_scopes: set[str] = field(default_factory=set)
     keys: set[tuple[str, str, int]] = field(default_factory=set)
+
+    def note(self, context, candidates, searched_scopes, gaps):
+        """Record returned hits and fully checked scopes; report incomplete coverage without dropping partial hits."""
+        # Ordinary ports promise a complete search. Runtime ports additionally
+        # report the scopes whose physical partitions all completed.
+        allowed = context.trusted_context.allowed_scope_ids
+        checked = allowed if searched_scopes is None else searched_scopes
+        self.searched_scopes.update(checked)
+        self.keys.update(candidate.key for candidate in candidates)
+        if checked != allowed:
+            gaps.append("vector_search_incomplete")
 
 
 @dataclass
@@ -376,7 +387,11 @@ class RetrievalPipeline:
         pool: _VectorPool | None = None,
     ) -> tuple[CandidateRef, ...]:
         """The vector hits admitted against the recall's best hit; ``pool`` also learns every hit ranked."""
-        if self.vector_port is None or context.limits.vector_limit == 0:
+        if (
+            self.vector_port is None
+            or not getattr(self.vector_port, "available", True)
+            or context.limits.vector_limit == 0
+        ):
             gaps.append("vector_unavailable")
             return ()
         limit = context.limits.vector_limit
@@ -393,12 +408,15 @@ class RetrievalPipeline:
         vector_context = replace(context, deadline=context.deadline - remaining * 0.25)
         # The embedding asked for when the recall started is this round's only if the round kept its query.
         early = {"prefetched": prefetched} if context.query in _asked_early(prefetched) else {}
+        searched_scopes: set[str] = set()
+        tracked = getattr(self.vector_port, "reports_searched_scopes", False)
+        coverage = {"searched_scopes": searched_scopes} if tracked else {}
         try:
             raw = tuple(
                 islice(
                     iter(
                         self.vector_port.search(
-                            vector_context, limit=limit, remaining_seconds=remaining * 0.75, **early
+                            vector_context, limit=limit, remaining_seconds=remaining * 0.75, **early, **coverage
                         )
                         or ()
                     ),
@@ -416,8 +434,7 @@ class RetrievalPipeline:
         if budget is not None:
             budget.spend(channel, len(raw))
         if pool is not None:
-            pool.searched = True
-            pool.keys.update(candidate.key for candidate in raw)
+            pool.note(context, raw, searched_scopes if tracked else None, gaps)
         admitted = []
         # The current message is never recalled, so it neither sets the best hit nor takes a place in the ranking.
         current = context.current_source_refs
@@ -520,7 +537,7 @@ class RetrievalPipeline:
         directly, so an unrelated candidate cannot suppress that fallback.
         For a named time window, the dated channel owns relaxed lexical
         admission; ordinary fallback would bypass that window.  Lexical hits
-        the vector search passed over are dropped (``_semantically_unrelated``).
+        a completed scope's vector search passed over are dropped (``_outside_vector_pool``).
         """
         for candidate in raw:
             note_candidate(
@@ -541,16 +558,16 @@ class RetrievalPipeline:
         if context.time is None:
             qualified_keys = {candidate.key for candidate in qualified}
             qualified += [candidate for candidate in passing if candidate.key not in qualified_keys]
-        unrelated = self._semantically_unrelated(tx, qualified, context, pool)
-        return [candidate for candidate in qualified if candidate.source != "lexical" or candidate.key not in unrelated]
+        outside = self._outside_vector_pool(tx, qualified, context, pool)
+        return [candidate for candidate in qualified if candidate.source != "lexical" or candidate.key not in outside]
 
-    def _semantically_unrelated(
+    def _outside_vector_pool(
         self, tx, candidates: list[CandidateRef], context: SearchContext, pool: _VectorPool | None
     ) -> frozenset[tuple[str, str, int]]:
-        """Lexical hits an automatic recall leaves out: assistant replies that are embedded, so the vector search
-        could rank them, yet absent from all it ranked.  Their words match the question and their meaning does not;
-        on LongMemEval-S such hits were most of what reached another question's history and a third of every packet,
-        nearly all long replies sharing a common word.
+        """Embedded assistant lexical hits absent from the finite vector pool in fully searched scopes.
+
+        Absence is a ranking signal, not proof of irrelevance: a question about an earlier assistant reply can lose
+        its answer here. Explicit lookup retains it. Unchecked scopes cannot supply this negative signal.
 
         The owner's own messages stay: an aggregate question ("how many times did I ...") is answered by many of
         them that its words find and its meaning ranks too low.  So does a reply not embedded yet (a message said a
@@ -558,18 +575,18 @@ class RetrievalPipeline:
         identifier, which words find and meaning does not.
         """
         reader = getattr(self.storage_reader, "embedded_replies", None)
-        if pool is None or not pool.searched or not callable(reader):
+        if pool is None or not pool.searched_scopes or not callable(reader):
             return frozenset()
         loose = [
             candidate for candidate in candidates if candidate.source == "lexical" and candidate.key not in pool.keys
         ]
         if not loose or hard_identifiers(self._admission_query(context)):
             return frozenset()
-        unrelated = cast(frozenset[tuple[str, str, int]], reader(tx, loose))
+        outside = cast(frozenset[tuple[str, str, int]], reader(tx, loose, searched_scopes=pool.searched_scopes))
         for candidate in loose:
-            if candidate.key in unrelated:
-                note_candidate(candidate, "semantic_mismatch")
-        return unrelated
+            if candidate.key in outside:
+                note_candidate(candidate, "outside_vector_pool")
+        return outside
 
     def _collect(
         self,
@@ -686,7 +703,7 @@ class RetrievalPipeline:
         if optional:
             return admitted()
         # A search that ran re-qualifies even with nothing admitted: what it ranked decides which lexical hits stay.
-        return admitted(quiet=True) if pool is not None and pool.searched else ready
+        return admitted(quiet=True) if pool is not None and (pool.searched_scopes or pool.keys) else ready
 
     # -- hydration and admission ----------------------------------------------
 

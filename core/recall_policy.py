@@ -44,7 +44,7 @@ VECTOR_SCORE_TOLERANCE = 1e-6
 #: The score a recall's best vector hit must reach before the vector channel admits anything.  Gemini embedding 2
 #: scores sit between 0.6 and 0.8: on LongMemEval-S a question's best hit in its own history has a median of 0.72-0.74,
 #: its best hit in another question's history a median of 0.62 and a 75th percentile of 0.65, and over half of the
-#: turns holding an answer score below 0.70.  Replayed on 150 held-out questions, 0.66 found 0.78 of the answer turns
+#: turns holding an answer score below 0.70.  On the 150-question tuning replay, 0.66 found 0.78 of the answer turns
 #: against 0.69 at 0.70, and 0.64 only 0.01 more while injecting into 4 % more unrelated histories.
 BUILTIN_VECTOR_THRESHOLD = 0.66
 #: Once the best hit reaches the threshold, the hits ranked in the channel's first ``BUILTIN_VECTOR_NEAR_RANK`` are

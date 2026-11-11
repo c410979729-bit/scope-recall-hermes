@@ -46,13 +46,14 @@ def overflow(packet):
     return [item for item in packet["items"] if item.get("qualification_reason") == LABEL]
 
 
-def ordinary(core, ctx, query, monkeypatch):
+def ordinary(core, ctx, query, monkeypatch, *, ambient=True):
+    """Return full evidence under the same caller intent, with optional excerpts disabled."""
     from scope_recall.core import recall_packet as module
 
     with monkeypatch.context() as patch:
         if hasattr(module, "append_overflow"):
             patch.setattr(module, "append_overflow", lambda storage, context, result, packet, *args: packet)
-        return core.recall_packet(ctx, query, deadline_seconds=10)
+        return core.recall_packet(ctx, query, background_without_evidence=ambient, deadline_seconds=10)
 
 
 @pytest.mark.parametrize("language", ["en", "zh"])
@@ -211,10 +212,16 @@ def test_one_session_has_one_row_and_restatements_do_not_add_rows(restatement_st
 @pytest.mark.parametrize("count,max_items,listed", [(3, 6, False), (8, 6, False), (8, 3, True)])
 @pytest.mark.parametrize("language", ["en", "zh"])
 def test_small_session_distributions_obey_the_overflow_threshold(app, count, max_items, listed, language):
+    """Explicit matching lists retain their breadth threshold for otherwise admitted sources."""
     core, ctx = app
     sources(app, count=count, language=language)
-    query = "List all Orchard deployment ports." if language == "en" else "列出测试果园部署的所有数据库端口"
-    packet = core.recall_packet(ctx, recall_request(query=query, max_items=max_items), deadline_seconds=10)
+    query = "Orchard deployment database port" if language == "en" else "测试果园部署数据库端口"
+    packet = core.recall_packet(
+        ctx,
+        recall_request(query=query, max_items=max_items),
+        background_without_evidence=False,
+        deadline_seconds=10,
+    )
     assert bool(overflow(packet)) is listed
 
 
@@ -657,3 +664,92 @@ def test_overflow_hydrates_only_a_bounded_session_prefix(app, monkeypatch):
     assert len(hydrated) <= 36
     selected = {ref for item in packet["items"] for ref in item["evidence_refs"]}
     assert not {f"{candidate.ref}@{candidate.revision}" for candidate in hydrated}.intersection(selected)
+
+
+@pytest.mark.parametrize("mode,ambient", [("auto", True), ("auto", False), ("current", True)])
+def test_only_ambient_overflow_omits_assistant_excerpts(app, monkeypatch, mode, ambient):
+    """Full assistant answers stay available; caller intent controls only optional excerpts."""
+    core, ctx = app
+    sources(app, count=14)
+    assistant_refs = set()
+    for index in range(9):
+        actor = replace(
+            ctx,
+            session_id=f"TEST-overflow-assistant-{index}",
+            actor_origin="assistant_visible",
+            source_principal=TrustedSourcePrincipal("assistant", "verified", "principal:assistant:TEST-overflow"),
+        )
+        saved = core.record_event(
+            actor,
+            source_event(
+                source_event_key=f"TEST-overflow-assistant-{index}",
+                role="assistant",
+                origin="assistant_visible",
+                content=f"Orchard deployment record {index}; database port {6200 + index}.",
+                occurred_at=f"2026-09-{20 + index:02d}T12:00:00Z",
+            ),
+            scope_id="TEST-scope",
+            remaining_seconds=10,
+        )
+        assistant_refs.update(f"{ref.ref}@{ref.revision}" for ref in saved.event_refs)
+    query = recall_request(query="Orchard deployment port", mode=mode)
+    base = ordinary(core, ctx, query, monkeypatch, ambient=ambient)
+    packet = core.recall_packet(ctx, query, background_without_evidence=ambient, deadline_seconds=10)
+    assert packet["items"][: len(base["items"])] == base["items"]
+    assert assistant_refs.intersection(ref for item in base["items"] for ref in item["evidence_refs"])
+    assert overflow(packet)
+    listed = {ref for item in overflow(packet) for ref in item["evidence_refs"]}
+    assert bool(assistant_refs.intersection(listed)) == (mode != "auto" or not ambient)
+
+
+@pytest.mark.parametrize("mode,ambient", [("auto", True), ("auto", False), ("current", True)])
+@pytest.mark.parametrize("language", ["en", "zh"])
+def test_a_single_non_assistant_excerpt_survives_only_in_ambient_recall(app, monkeypatch, mode, ambient, language):
+    """One non-assistant record can hold the answer omitted by the ordinary six-item packet."""
+    core, ctx = app
+    captured = sources(app, count=7, language=language)
+    query = recall_request(
+        query="Orchard deployment port" if language == "en" else "测试果园 部署 数据库端口", mode=mode
+    )
+    base = ordinary(core, ctx, query, monkeypatch, ambient=ambient)
+    packet = core.recall_packet(ctx, query, background_without_evidence=ambient, deadline_seconds=10)
+    assert packet["items"][: len(base["items"])] == base["items"]
+    views = overflow(packet)
+    assert bool(views) == (mode == "auto" and ambient)
+    if views:
+        assert len(views[0]["evidence_refs"]) == 1
+        assert {ref for item in packet["items"] for ref in item["evidence_refs"]} == {
+            f"{source.ref}@1" for source in captured
+        }
+
+
+@pytest.mark.parametrize(
+    "role,origin",
+    [
+        ("tool", "tool_observation"),
+        ("system", "host_generated"),
+        ("document", "external_document"),
+        ("unknown", "origin_unknown"),
+    ],
+)
+def test_ambient_excerpt_keeps_non_assistant_roles_beyond_user_messages(app, role, origin):
+    """The optional excerpt admits tool, system, document and unknown sources as well as user messages."""
+    core, ctx = app
+    sources(app, count=6)
+    actor = replace(ctx, session_id=f"TEST-overflow-{role}", actor_origin=origin)
+    saved = core.record_event(
+        actor,
+        source_event(
+            source_event_key=f"TEST-overflow-{role}",
+            role=role,
+            origin=origin,
+            content="Orchard deployment database port is 6101.",
+            occurred_at="2026-08-31T12:00:00Z",
+        ),
+        scope_id="TEST-scope",
+        remaining_seconds=10,
+    )
+    packet = core.recall_packet(ctx, recall_request(query="Orchard deployment database port"), deadline_seconds=10)
+    views = overflow(packet)
+    assert len(views) == 1
+    assert views[0]["evidence_refs"] == [f"{saved.event_refs[0].ref}@1"]

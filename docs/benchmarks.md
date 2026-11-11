@@ -15,6 +15,10 @@ python -X utf8 tests/recall_bench/recall_bench.py --no-latency
 python -X utf8 tests/recall_bench/recall_bench.py --split heldout --no-latency
 ```
 
+Lexical ranking discounts unusually long sources using SQLite's metadata-only
+`octet_length`, available in SQLite 3.43 and later. Older linked engines retain
+hit-count and recency ordering without reading matching bodies to measure length.
+
 The synthetic benchmark includes two- and three-hop questions with aliases
 across sessions, and questions about an assistant's unconfirmed words. A join
 earns credit for each supporting edge delivered. Assistant words remain source

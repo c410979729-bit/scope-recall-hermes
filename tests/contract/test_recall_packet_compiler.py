@@ -772,6 +772,7 @@ def test_p09_an_epoch_move_that_withdrew_something_in_scope_still_empties_the_re
 
 
 def test_p09_auto_compiler_caps_delivery_to_six_items(app):
+    """The full-evidence cap excludes the separately budgeted matching-list item."""
     core, ctx = app
     for index in range(8):
         capture(core, ctx, f"P09 H100 delivery record {index}.", key=f"TEST-p09/auto-budget/{index}")
@@ -793,7 +794,9 @@ def test_p09_auto_compiler_caps_delivery_to_six_items(app):
     packet = compile_recall_packet(
         search, result, core.storage, storage_reader=core.recall_pipeline.storage_reader, clock=FixedClock()
     )
-    assert len(packet["items"]) <= 6
+    ordinary = [item for item in packet["items"] if item.get("qualification_reason") != "Other-session matches"]
+    assert len(ordinary) == 6
+    assert len(packet["items"]) == 7
 
 
 def test_p09_duplicate_same_request_injects_once_per_session(app):
@@ -2151,7 +2154,15 @@ def test_budget_density_keeps_fusion_order_when_the_whole_run_fits(app, mode):
     # One slot is a choice again, and the compact todo still takes it.
     single = dict(request, max_items=1)
     assert [item.ref for item in core.recall(reader, single, deadline_seconds=5).items] == [todo.ref]
-    assert [item["ref"] for item in _packet(core, reader, **single)["items"]] == [todo.ref]
+    packet = _packet(core, reader, **single)
+    ordinary = [item for item in packet["items"] if item.get("qualification_reason") != "Other-session matches"]
+    assert [item["ref"] for item in ordinary] == [todo.ref]
+    excerpts = [item for item in packet["items"] if item.get("qualification_reason") == "Other-session matches"]
+    if mode == "auto":
+        assert len(excerpts) == 1
+        assert excerpts[0]["evidence_refs"] == [f"{report.ref}@1"]
+    else:
+        assert not excerpts
 
 
 def test_cjk_budget_uses_character_classes_and_reports_exact_units(app):
