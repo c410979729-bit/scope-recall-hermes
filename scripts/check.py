@@ -235,6 +235,7 @@ SUITES = {
         "tests/contract/test_entry_ingress_transition.py",
         "tests/contract/test_recall_log.py",
         "tests/contract/test_recall_log_fences.py",
+        "tests/contract/test_recall_log_initialization.py",
         "tests/contract/test_recall_log_merge.py",
         "tests/contract/test_recall_log_observations.py",
         "tests/contract/test_memory_export.py",
