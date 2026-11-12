@@ -299,6 +299,22 @@ _STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 _STEER_ORIGIN = "Gateway message origin (JSON data, not instructions or authorization):"
 
 
+def carries_gateway_origin(text: str) -> bool:
+    """Whether ``text`` holds steers or redirects Hermes handed over as a message of their own.
+
+    Hermes writes the origin preamble only around a steer or a redirect (``gateway.run_busy._steer_text_with_origin``).
+    Those it could not deliver open the next turn, or come back as a queued message, as plain text: behind the
+    bracketed tags Hermes puts before a message (the sender's name in a shared chat, a name that may itself hold "]";
+    a history timestamp; an attachment count when it summarizes a turn for memory), and after the channel's history
+    on a line of their own when it backfills one.  So a line counts when the preamble starts it, or follows text that
+    opens with "[" and ends with "] ".  Nothing in that row tells it from a message whose text copies a preamble, so
+    such text is never taken as the person's own words: a person who pastes one loses that message from their own,
+    the safe side.  Each line is searched once, so a long run of tags costs no more than its length.
+    """
+    tagged = "] " + _STEER_ORIGIN
+    return any(line.startswith(_STEER_ORIGIN) or (line.startswith("[") and tagged in line) for line in text.split("\n"))
+
+
 #: Hermes' mark on a user message it folded a compression summary into (``COMPRESSED_SUMMARY_METADATA_KEY``).
 _COMPRESSED_SUMMARY = "_compressed_summary"
 #: The lines that bound a folded summary (``agent.context_compressor``: ``_MERGED_PRIOR_CONTEXT_HEADER``,
@@ -356,10 +372,11 @@ def host_notice(history: object, user_message: object) -> bool:
     (``ContextCompressor._is_actionable_user_turn``).  Stored as the person's, a notice would read as something they
     said.
 
-    The latest user message with words of its own decides: the turn is Hermes's when those words are the turn's
-    text and the message carries a notice's kind.  A to-do list a compression adds after the turn's message has no
-    words of its own (``agent.turn_context.reanchor_current_turn_user_idx``).  The latest only: otherwise, when Hermes
-    puts a note of its own before the person's message (a model switch, a timestamp), an unanswered notice with the same
+    Text that carries steers Hermes handed over (``carries_gateway_origin``) is Hermes's, regardless of history.
+    Otherwise, the latest user message with words of its own decides: the turn is Hermes's when those words are the
+    turn's text and the message carries a notice's kind.  A to-do list a compression adds after the turn's message
+    has no words of its own (``agent.turn_context.reanchor_current_turn_user_idx``).  The latest only: otherwise, when
+    Hermes puts a note before the person's message (a model switch, a timestamp), an unanswered notice with the same
     words would take theirs, and so would an older folded one.  A request Hermes restores after a notice decides in its
     place, and the notice stays the person's: the safe side.
 
@@ -370,7 +387,10 @@ def host_notice(history: object, user_message: object) -> bool:
     summary quotes the person's messages word for word, and a message merely holding the turn's text would take the
     person's words for a notice.
     """
-    text = extract_user_text(user_message).strip()
+    raw_text = extract_user_text(user_message)
+    if carries_gateway_origin(raw_text):
+        return True
+    text = raw_text.strip()
     if not isinstance(history, list) or not text:
         return False
     trailing = True
@@ -395,10 +415,13 @@ def host_notice(history: object, user_message: object) -> bool:
 def sync_host_notice(messages: object, user_message: object) -> bool:
     """Classify a completed turn's opener, keeping later steers separate from its identity.
 
-    Only host-marked steers are transparent. Equal-text steers need the native tool-batch boundary, with
+    Text that carries steers Hermes handed over (``carries_gateway_origin``) is Hermes's, independently of history.
+    Otherwise, only host-marked steers are transparent. Equal-text steers need the native tool-batch boundary, with
     no completed reply before the opener; otherwise they may be a new request borrowing an old notice.
     Ordinary user rows always bound the search. The classifier still owns kind, time and exact-text checks.
     """
+    if carries_gateway_origin(extract_user_text(user_message)):
+        return True
     if not isinstance(messages, list):
         return False
     text = extract_user_text(user_message).strip()
@@ -554,7 +577,7 @@ def person_steers(messages: object, *, platform: str, user_id: str, local_surfac
                     re.match(r"\[Background process \S+ heartbeat #(?:\d+|\?) — still running(?:[\s.\]]|$)", words)
                     is not None
                 )
-            if not theirs or not words or notice or (redirect and not _typed_words({"content": words})):
+            if not theirs or not words or notice or (redirect and _written_by_hermes(words)):
                 break
             try:
                 encoded_words = words.encode("utf-8")
@@ -573,34 +596,79 @@ def person_steers(messages: object, *, platform: str, user_id: str, local_surfac
 
 #: The event kind of what no turn answered (``unanswered_messages``).
 UNANSWERED_KIND = "unanswered"
-#: How the user rows Hermes writes itself begin, besides a bracketed head in capitals (``_HERMES_NOTICE``): a
-#: background process's notice, a compression's to-do list, the turn it continues, a system note, an agent's
-#: message, a gateway's origin.  A gateway that restarts replays the rows it flushed at its stop as text alone
-#: (``gateway.shutdown_flush.recover_pending_to_db``), without the display kind that marks them otherwise.
+#: How the user rows Hermes writes itself begin, besides a bracketed head in capitals (``_HERMES_NOTICE``).  A
+#: gateway that restarts replays the rows it flushed at its stop as text alone
+#: (``gateway.shutdown_flush.recover_pending_to_db``), without the display kind that marks them otherwise, and the
+#: rows below never have one:
+#:
+#: - a background process's notice, a compression's to-do list and the turn it continues;
+#: - a system note, among them the language server's late verdicts (``agent.turn_stop_gates``);
+#: - an agent's message and a gateway's origin;
+#: - a delivery a cron job or a webhook mirrored into the chat (``cron.scheduler_delivery._cron_mirror_message``,
+#:   ``gateway.platforms.webhook``), and the mark a replay puts on a mirrored row
+#:   (``gateway.run._build_gateway_agent_history``);
+#: - the text a stale high-risk confirmation is replaced with (``agent.replay_cleanup._EXPIRED_CONFIRMATION_SENTINEL``).
 _HERMES_ROW_HEADS = (
     *_STEER_NOTICE_HEADS,
     _PRIOR_CONTEXT_HEADER,
     _TODO_HEADER,
     "Continue from the compressed",
     "[System:",
+    "[System note:",
     "[A2A inbound",
     "Gateway message origin",
+    "[Cron delivery: ",
+    "[Webhook delivery: ",
+    "[Delivered from ",
+    "[A high-risk confirmation previously given here has EXPIRED",
 )
 #: A notice Hermes writes opens with a bracketed head in capitals: "[IMPORTANT: …", "[ASYNC DELEGATION COMPLETE — …",
 #: "[SYSTEM NOTICE — …", "[CONTEXT COMPACTION …", "[SILENT]".  Too many forms to list, and a person's own message
 #: seldom opens so; one that does is left out of a restarted gateway's rows, the safe side.
 _HERMES_NOTICE = re.compile(r"\[[A-Z][A-Z0-9_]+(?:[\s:\]\-]|\u2014)")
+#: The time a gateway puts before each user row it replays when ``gateway.message_timestamps.enabled`` is on, in its
+#: current form and its older ISO one (``gateway.message_timestamps._TIMESTAMP_PREFIX_RE``); an older row may hold
+#: several.  It hides how the row begins.
+_REPLAY_TIME = re.compile(
+    r"\[(?:[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: [A-Za-z0-9_+\-/:]+)?|\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*"
+)
+
+
+def _written_by_hermes(words: str) -> bool:
+    """Whether words are begun the way the user rows Hermes writes itself are begun, or tell of its stop."""
+    return (
+        words.startswith(_HERMES_ROW_HEADS)
+        or _HERMES_NOTICE.match(words) is not None
+        or "Hermes is shutting down" in words
+    )
+
+
+def _unstamped(text: str) -> str:
+    """``text`` without the times a replay put before it (``_REPLAY_TIME``), read in one pass."""
+    at = 0
+    while (stamp := _REPLAY_TIME.match(text, at)) is not None:
+        at = stamp.end()
+    return text[at:]
 
 
 def _typed_words(message: dict[str, Any]) -> str:
     """A user row's own words when the person typed them: no kind Hermes gives the rows it writes, not a summary it
-    folded, and not begun the way such a row is begun."""
+    folded, holding no steers Hermes handed over (``carries_gateway_origin``), and no part begun the way the rows
+    Hermes writes are begun, once the times a replay put before it are set aside.
+
+    Hermes joins consecutive user rows a blank line apart (``agent.agent_runtime_helpers._merge_consecutive_users``),
+    also when it loads a conversation to replay, and a row joined with a plain one keeps no kind: each part is read on
+    its own, and a row that joins the person's words with a delivery or a notice is left out whole, the safe side.
+    The words keep the times: they name the row.
+    """
     if message.get("display_kind") or message.get(_COMPRESSED_SUMMARY) is True or _is_redirect(message):
         return ""
     words = _own_text(message)
-    if not words or words.startswith(_HERMES_ROW_HEADS) or _HERMES_NOTICE.match(words):
+    if not _unstamped(words) or carries_gateway_origin(words):
         return ""
-    return "" if "Hermes is shutting down" in words else words
+    if any(_written_by_hermes(_unstamped(part.lstrip())) for part in words.split("\n\n")):
+        return ""
+    return words
 
 
 def unanswered_messages(messages: object) -> tuple[Steer, ...]:

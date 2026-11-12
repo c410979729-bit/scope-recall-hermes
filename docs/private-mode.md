@@ -258,6 +258,24 @@ a client that is offline.
   match its platform; local input needs no gateway origin. Host notifications are
   excluded. A redirect without a timestamp
   keeps an unknown occurrence time for privacy checks.
+- An opening message in which a line begins with the gateway's origin preamble,
+  after any of Hermes's own bracketed tags (a sender's name in a shared chat, a
+  history timestamp, an attachment count), is recorded as host-generated. Hermes
+  opens the next turn this way with steers and redirects it could not deliver,
+  and delivers them so when it queues them again; nothing in that row tells them
+  from a message that copies the preamble, so none of its parts is stored as the
+  person's own words. When a restarted gateway replays the messages no turn
+  answered in a private chat, such rows, Hermes notices behind a history
+  timestamp, and the cron and webhook deliveries it mirrors into the chat are
+  not stored as the person's messages either. Hermes joins consecutive user
+  messages a blank line apart, so each paragraph of a recovered message is read
+  on its own: a message with any paragraph that begins like one of these is left
+  out whole, the person's words in it included. Hermes text that begins in none
+  of the ways its own messages begin cannot be told apart from the person's.
+  The rule reads the text as the adapter
+  receives it: a person who pastes a preamble loses that message from their own
+  words, and messages stored before this rule keep the origin they were stored
+  with.
 - A shared-store client's local MCP server uses that MCP server process's
   working directory as its project directory when the host gives no workspace,
   so a project `full` interval also gates its `recall`, `profile`, `entity` and
