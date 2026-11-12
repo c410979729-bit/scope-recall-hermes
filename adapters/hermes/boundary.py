@@ -461,9 +461,11 @@ _STEER_NOTICE_HEADS = ("[Background process ", "[IMPORTANT: Background process",
 
 
 class Steer(NamedTuple):
-    """What the person sent while a turn ran, or what no turn answered (``unanswered_messages``): its name, their
-    words, when they were sent, and which of the two it is, the event kind of its source key.  ``alike`` are the times
-    of the conversation's other messages said with the same words, answered or not (``unanswered_messages``)."""
+    """A delivered steer or redirect, or an unmarked row no turn answered: key, words, time and source kind.
+
+    Unanswered rows have unknown authors. ``alike`` holds the times of other rows with the same words, including
+    answered rows, for matching against stored sources.
+    """
 
     key: str
     words: str
@@ -594,7 +596,7 @@ def person_steers(messages: object, *, platform: str, user_id: str, local_surfac
     return tuple(found.values())
 
 
-#: The event kind of what no turn answered (``unanswered_messages``).
+#: The event kind of unmarked rows no turn answered, whose authors are unknown (``unanswered_messages``).
 UNANSWERED_KIND = "unanswered"
 #: How the user rows Hermes writes itself begin, besides a bracketed head in capitals (``_HERMES_NOTICE``).  A
 #: gateway that restarts replays the rows it flushed at its stop as text alone
@@ -651,8 +653,8 @@ def _unstamped(text: str) -> str:
     return text[at:]
 
 
-def _typed_words(message: dict[str, Any]) -> str:
-    """A user row's own words when the person typed them: no kind Hermes gives the rows it writes, not a summary it
+def _unmarked_words(message: dict[str, Any]) -> str:
+    """A user row's words without recognizable Hermes markers: no kind Hermes gives the rows it writes, not a summary it
     folded, holding no steers Hermes handed over (``carries_gateway_origin``), and no part begun the way the rows
     Hermes writes are begun, once the times a replay put before it are set aside.
 
@@ -672,13 +674,13 @@ def _typed_words(message: dict[str, Any]) -> str:
 
 
 def unanswered_messages(messages: object) -> tuple[Steer, ...]:
-    """The person's messages in ``messages`` that no turn answered, in order and each once.
+    """Unmarked user rows no turn answered, in order and each once; their authors are unknown.
 
     A gateway that stops while messages wait for a busy agent keeps them, and when it starts again puts them into the
     conversation without opening a turn for them (``gateway.shutdown_flush.recover_pending_to_db``): no hook is handed
-    them, and the person's next message opens a turn after them.  A message a turn opened on has a reply after it, or
-    the note that the turn was interrupted, before the person's next; their last is the turn now running, which
-    ``pre_llm_call`` stores.  Named by their time and words, so one read again is the same capture.  Each carries the
+    them. Hermes also writes unmarked user rows, so recognizable Hermes rows are excluded but the remaining rows do
+    not prove their authors. A row a turn opened on can still be unanswered if the gateway stopped before its reply.
+    Rows are named by their time and words, so one read again is the same capture. Each carries the
     times of the conversation's other messages said with the same words (``alike``): looked up by words and moment,
     every one of them takes its own stored copy in turn, and a second "继续" is not taken for the first.
     """
@@ -687,17 +689,17 @@ def unanswered_messages(messages: object) -> tuple[Steer, ...]:
     rows = [
         message for message in messages if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
     ]
-    typed = [index for index, row in enumerate(rows) if row["role"] == "user" and _typed_words(row)]
+    unmarked = [index for index, row in enumerate(rows) if row["role"] == "user" and _unmarked_words(row)]
     unanswered: list[int] = []
     said: dict[str, set[str | None]] = {}
-    for position, index in enumerate(typed):
-        said.setdefault(_typed_words(rows[index]), set()).add(_message_time(rows[index]))
-        following = typed[position + 1] if position + 1 < len(typed) else len(rows)
+    for position, index in enumerate(unmarked):
+        said.setdefault(_unmarked_words(rows[index]), set()).add(_message_time(rows[index]))
+        following = unmarked[position + 1] if position + 1 < len(unmarked) else len(rows)
         if following < len(rows) and not any(row["role"] == "assistant" for row in rows[index + 1 : following]):
             unanswered.append(index)
     found: dict[str, Steer] = {}
     for index in unanswered:
-        words, occurred_at = _typed_words(rows[index]), _message_time(rows[index])
+        words, occurred_at = _unmarked_words(rows[index]), _message_time(rows[index])
         key = "text:" + hashlib.sha256(f"{occurred_at}\x00{words}".encode()).hexdigest()[:32]
         alike = tuple(sorted(said[words] - {occurred_at}, key=lambda moment: (moment is None, moment or "")))
         found.setdefault(key, Steer(key, words, occurred_at, UNANSWERED_KIND, alike))
@@ -794,7 +796,7 @@ def steer_source_event(
     steer: Steer,
     recorded_at: str,
 ) -> tuple[SourceEvent | None, tuple[str, ...], SourceIdentity | None]:
-    """Store a delivered steer or an unanswered historical row in its first observed session.
+    """Build a delivered steer or unattributed historical row with the context's origin in its first observed session.
 
     Untimed redirects and unanswered history keep an unknown occurrence so Core can enforce historical privacy
     intervals. A steer may use the instant its request hook first observes it.

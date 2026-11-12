@@ -97,14 +97,16 @@ def _steers(identity, messages: object) -> tuple[Steer, ...]:
     )
 
 
-#: Chats that are the person's alone, where a message no turn answered can only be theirs.
+#: Only private chats recover unmarked rows that no turn answered; their authors remain unknown.
 _PRIVATE_CHATS = frozenset({"dm", "private", "cli"})
 
 
 def _said_aside(identity, messages: object) -> tuple[Steer, ...]:
-    """What the session's person said in ``messages`` that no turn opened on: their steers, and in a chat of theirs
-    alone, on a surface that attests them, the messages no turn answered (``unanswered_messages``).  In a group
-    nothing says whose a message no turn answered was."""
+    """The person's steers and, in an attested private chat, unmarked rows no turn answered.
+
+    A restarted gateway restores queued messages as plain rows, but Hermes also writes rows of that shape. Their
+    authors are unknown; recognizable Hermes rows are filtered out by ``unanswered_messages``.
+    """
     steers = _steers(identity, messages)
     if identity.scope.chat_type not in _PRIVATE_CHATS or identity.trusted_context().actor_origin != "human_direct":
         return steers
@@ -698,7 +700,7 @@ class TurnCapture:
             else context
         )
         self.flush_completed(through=through)
-        self._write_steers(_said_aside(identity, messages), identity, context, "sync_turn")
+        self._write_aside(_said_aside(identity, messages), identity, context, effective_session, "sync_turn")
         self._write_turn(identity, opened, shown, effective_session, turn_id, user_content, assistant_content, said_at)
         # Hermes runs this on its memory worker, after the reply: the place to write again what a busy store kept in
         # memory, once the turn's own sources are written.  Before them, a pass over a store that cannot take the
@@ -757,7 +759,8 @@ class TurnCapture:
         bound=None,
         typed_only: bool = False,
     ) -> None:
-        """Write now what the person sent while turns ran (``person_steers``) in ``messages``: a compression is
+        """Write now what the person sent while turns ran (``person_steers``) in ``messages``, and the unmarked rows
+        no turn answered (``_said_aside``), whose authors are unknown: a compression is
         about to take them out of the conversation, or the session ends, and no turn's end may come to read them.
         ``deadline`` is the hook's, when its other captures share the budget (``steer_deadline``).  The caller must
         not hold the adapter's lock: the store I/O runs without it. ``typed_only`` excludes untyped historical
@@ -772,7 +775,18 @@ class TurnCapture:
         found = _steers(identity, messages) if typed_only else _said_aside(identity, messages)
         if found:
             context = identity.trusted_context(session_id=effective_session, mutation=True)
-            self._write_steers(found, identity, context, hook, deadline)
+            self._write_aside(found, identity, context, effective_session, hook, deadline)
+
+    def _write_aside(self, found, identity, context, session_id: str, hook: str, deadline: float | None = None) -> None:
+        """Write attested steers and unattributed history with separate contexts and one admission budget."""
+        deadline = steer_deadline() if deadline is None else deadline
+        delivered = tuple(steer for steer in found if steer.kind != UNANSWERED_KIND)
+        unanswered = tuple(steer for steer in found if steer.kind == UNANSWERED_KIND)
+        if delivered:
+            self._write_steers(delivered, identity, context, hook, deadline)
+        if unanswered:
+            unknown = identity.trusted_context(session_id=session_id, actor_origin="origin_unknown", mutation=True)
+            self._write_steers(unanswered, identity, unknown, hook, deadline)
 
     def _write_steers(self, steers, identity, context, hook: str, deadline: float | None = None) -> None:
         """Each steer the store does not hold yet (``_held``), one capture per hold of the lock, its store I/O
@@ -859,7 +873,7 @@ class TurnCapture:
                             adapter._steers_written.pop(next(iter(adapter._steers_written)))
 
     def _held(self, unread, identity, context, deadline: float) -> tuple[bool | None, ...]:
-        """Which steers the store holds already, in any session of the scope, or holds deleted: a compression
+        """Which steers or unattributed historical rows the store holds already or holds deleted: a compression
         carries a steer into the session it continues, and a process that starts again remembers none it wrote.
         When the store cannot say, typed steers may retry under their stable keys. Untyped historical input
         returns None and waits for a later observation, since its original key and deletion state are unknown.
