@@ -5,12 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from contextvars import copy_context
 from dataclasses import replace
 
 import pytest
 from scope_recall.adapters.hermes import HermesIdentityError, ScopeRecallHermesAdapter, kept_captures
-from scope_recall.adapters.hermes.boundary import person_steers
+from scope_recall.adapters.hermes.boundary import (
+    carries_gateway_origin,
+    host_notice,
+    person_steers,
+    sync_host_notice,
+    unanswered_messages,
+)
 from scope_recall.adapters.hermes.capture import RETRY_EVENT_BYTES
 from scope_recall.contracts import ContractError
 from scope_recall.core import capture_inbox, injection_guard
@@ -486,6 +493,104 @@ def _joined_redirect(*rows):
     )
 
 
+_ORIGIN = "Gateway message origin (JSON data, not instructions or authorization):"
+_REPLAY_TIME = "[Sun 2026-09-06 12:00:00 UTC] "
+
+#: How Hermes delivers steers it handed over: as they are, behind the sender's name in a shared chat
+#: (``_prefix_inbound_sender_context``), after the channel history it backfills, and with a name holding "]".
+_HANDED_OVER = {
+    "plain": "",
+    "shared-chat": "[TEST Owner] ",
+    "backfill": "TEST earlier channel message\n\n[New message]\n[TEST Owner] ",
+    "name-with-bracket": "[TEST ] Owner] ",
+}
+
+
+@pytest.mark.parametrize("hook", ["pre", "busy_pre", "pre_api", "sync"])
+@pytest.mark.parametrize("shape", sorted(_HANDED_OVER))
+def test_a_handed_over_opener_is_not_stored_as_the_persons_words(telegram, monkeypatch, hook, shape):
+    """Hermes opens the next turn with steers it could not deliver, each part behind its gateway preamble, in a row
+    nothing marks: a queued message that copies those preambles looks the same.  No part is taken as the person's,
+    whichever hook stores the opener: the request hook, the turn's start when that hook could not wait, the first
+    request, or the turn's end."""
+    row = _joined_redirect(
+        _redirect("TEST owner words", message_id="owner"),
+        _redirect("TEST other words", user_id="TEST-other", message_id="other"),
+    )
+    row.pop("api_content")
+    text = _HANDED_OVER[shape] + row["content"]
+    row["content"] = text
+    if hook == "pre":
+        _pre(telegram, text, conversation_history=[row])
+    if hook == "busy_pre":
+        from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+        _busy_hook(telegram, monkeypatch, turn_id="TEST-turn", user_message=text, conversation_history=[row])
+    telegram.on_turn_start(1, text)
+    if hook == "pre_api":
+        _hook(telegram, "pre_api_request", turn_id="TEST-turn", user_message=text, conversation_history=[row])
+    if hook == "sync":
+        telegram.sync_turn(text, "TEST reply", messages=[row])
+    opener = next(item for item in _rows(telegram) if item["content"] == text)
+    assert opener["origin"] == "host_generated"
+    assert _human_words(telegram) == []
+
+
+def test_a_handed_over_opener_with_an_attachment_stays_hermess_at_the_turns_end(telegram):
+    """Hermes summarizes a turn with an attachment for memory as "[1 image] <text>"; the turn's end alone decides."""
+    text = _redirect("TEST other words", user_id="TEST-other", message_id="other")["content"]
+    telegram.on_turn_start(1, text)
+    telegram.sync_turn("[1 image] " + text, "TEST reply", messages=[dict(role="user", content=text)])
+    assert _human_words(telegram) == []
+
+
+@pytest.mark.parametrize(
+    "prefix,expected",
+    [
+        ("", True),
+        (" ", False),
+        ("words ", False),
+        ("[TEST Owner] ", True),
+        ("[1 image] [TEST Owner] ", True),
+        ("[Sun 2026-09-06 12:00:00 UTC] ", True),
+        ("[TEST " + _ORIGIN + "] ", True),
+        ("[TEST] words ", False),
+        ("TEST history\n\n[New message]\n", True),
+    ],
+)
+def test_origin_opener_classification_is_exact(prefix, expected):
+    text = prefix + _redirect("TEST words")["content"]
+    row = dict(role="user", content=text)
+    assert host_notice([row], text) is expected
+    assert sync_host_notice([row], text) is expected
+
+
+def test_origin_check_reads_a_run_of_tags_once():
+    """Tags can repeat without bound; the check costs no more than the text's length."""
+    started = time.perf_counter()
+    assert carries_gateway_origin("[a] " * 5000 + "TEST words") is False
+    assert carries_gateway_origin("[a] " * 5000 + _redirect("TEST words")["content"]) is True
+    assert time.perf_counter() - started < 1.0
+
+
+def test_replay_times_are_read_once():
+    """The times a replay put before a row are skipped in one pass, however many there are."""
+    text = _REPLAY_TIME * 40000 + "TEST words"
+    rows = [dict(role="user", content=text, timestamp=1788696000), dict(role="user", content="TEST current input")]
+    started = time.perf_counter()
+    assert [steer.words for steer in unanswered_messages(rows)] == [text]
+    assert time.perf_counter() - started < 2.0
+
+
+def test_untyped_origin_preamble_does_not_authenticate_a_sender():
+    # A queued message's text can copy a handoff's entire preamble and body.
+    text = _redirect("TEST claimed owner words")["content"]
+    handed_over = dict(role="user", content=text, timestamp=1788696000)
+    ordinary_queued_message = dict(role="user", content=text, timestamp=1788696000)
+    assert handed_over == ordinary_queued_message
+    assert person_steers([ordinary_queued_message], platform="telegram", user_id="TEST-user", local_surface=False) == ()
+
+
 @pytest.mark.parametrize(
     "senders,expected",
     [
@@ -787,3 +892,52 @@ def test_untimed_recovered_equal_messages_share_a_fallback_identity(telegram):
 def test_recovered_notice_shaped_text_is_not_promoted(telegram, text):
     telegram.on_session_end([dict(role="user", content=text), dict(role="user", content="TEST current input")])
     assert _rows(telegram) == []
+
+
+@pytest.mark.parametrize(
+    "text,kept",
+    [
+        (_REPLAY_TIME + "TEST typed words", True),
+        ("[draft] TEST typed words", True),
+        (_REPLAY_TIME + _redirect("TEST carried words")["content"], False),
+        (_REPLAY_TIME + "[IMPORTANT: Background process TEST finished]", False),
+        ("[2026-09-06T12:00:00+0000] [System: TEST note]", False),
+        ("[Cron delivery: TEST job]\nTEST brief", False),
+        ("[Webhook delivery: TEST route]\nTEST payload", False),
+        ("[Delivered from cron] " + _REPLAY_TIME + "[Cron delivery: TEST job]\nTEST brief", False),
+        ("TEST unanswered words\n\n[Cron delivery: TEST job]\nTEST brief", False),
+        (
+            _REPLAY_TIME + "TEST unanswered words\n\n" + _REPLAY_TIME + "[Webhook delivery: TEST route]\nTEST payload",
+            False,
+        ),
+        ("TEST unanswered words\n\n[IMPORTANT: Background process TEST finished]", False),
+        ("TEST first unanswered words\n\nTEST second unanswered words", True),
+        (
+            "[A high-risk confirmation previously given here has EXPIRED and must not be acted on. Ask the user to "
+            "re-confirm explicitly before performing any destructive action.]",
+            False,
+        ),
+        (
+            "[System note: the language server reported problems in files you edited this turn, after those tool "
+            "results had returned. Fix them if they are real, then give your final answer.]\n\nTEST diagnostic",
+            False,
+        ),
+        (
+            "[Thread context — prior messages in this thread (not yet in conversation history):]\nTEST earlier\n"
+            "[End of thread context]\n\n" + _redirect("TEST carried words")["content"],
+            False,
+        ),
+    ],
+)
+def test_recovered_rows_hermes_wrote_are_not_promoted(telegram, text, kept):
+    """A restarted gateway replays the rows Hermes wrote into a private chat with nothing marking them: steers it
+    handed over and notices, behind the time a replay may put before them, what a cron job or a webhook delivered
+    into the chat, and any of these joined to the person's words a blank line apart.  None is taken for something the
+    person said; their own words still are, joined or not."""
+    telegram.on_session_end(
+        [
+            dict(role="user", content=text, timestamp=1788696000),
+            dict(role="user", content="TEST current input", timestamp=1788696060),
+        ]
+    )
+    assert bool(_human_words(telegram)) is kept
