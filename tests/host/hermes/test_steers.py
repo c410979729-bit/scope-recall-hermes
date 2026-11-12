@@ -676,8 +676,8 @@ def test_messages_a_restarted_gateway_put_back_are_stored_once_whichever_hook_re
     telegram.sync_turn("TEST 继续啊", "TEST 好，继续。", session_id="TEST-session-tg", messages=history + history[2:4])
     telegram.on_session_end([dict(message) for message in history])
     said = [(content, origin) for _role, content, origin in _stored(hermes_home)]
-    assert said.count(("TEST 游戏里能正确显示中文吗", "human_direct")) == 1
-    assert said.count(("TEST 还没做好吗", "human_direct")) == 1
+    assert said.count(("TEST 游戏里能正确显示中文吗", "origin_unknown")) == 1
+    assert said.count(("TEST 还没做好吗", "origin_unknown")) == 1
     assert not any(content.startswith(("[ASYNC", "[IMPORTANT", "[SYSTEM")) for content, _origin in said), "notices"
     assert not any(content == "TEST 做游戏" for content, _origin in said), "a message a turn answered is its turn's"
     with sqlite3.connect(hermes_home / "scope-recall" / "memory.sqlite3") as conn:
@@ -867,7 +867,7 @@ def test_the_message_the_running_turn_opened_on_is_left_to_the_turn(telegram, he
         ("private", "origin_unknown", False),
     ],
 )
-def test_only_a_chat_of_the_person_s_alone_says_whose_a_message_put_back_was(chat_type, origin, taken):
+def test_only_an_attested_private_chat_recovers_unanswered_rows(chat_type, origin, taken):
     from types import SimpleNamespace
 
     from scope_recall.adapters.hermes import turn_capture
