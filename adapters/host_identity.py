@@ -235,3 +235,27 @@ def entry_owner(binding: InstanceBinding, entry_id: str, principal: SourcePrinci
     if principal is None:
         return binding.installation_id
     return binding.installation_id if (principal.get("kind"), principal.get("principal_ref")) in expected else None
+
+
+def owner_subjects(
+    binding: InstanceBinding, entry_id: str, subject: str | None, *, current: SourcePrincipal | None = None
+) -> tuple[str, ...]:
+    """Read human subject equivalents from the same approvals used by claim ordering.
+
+    Only a local stdio entry supplies its approved capture identity as ``current``;
+    that approval does not compare OS accounts at runtime.
+    A gateway must name its message's principal; knowing the entry owner alone
+    does not identify whoever is speaking. No audience grant is returned here.
+    """
+    memo: dict = {}
+    if entry_owner(binding, entry_id, None, memo) is None:
+        return ()
+    if subject is None:
+        if current is None or current.get("kind") != "human" or entry_owner(binding, entry_id, current, memo) is None:
+            return ()
+        subject = current.get("principal_ref")
+    grants = memo[("owner_grants", binding.installation_id, str(binding.data_directory))]
+    humans = {ref for speakers in grants.values() for kind, ref in speakers if kind == "human"}
+    if type(subject) is not str or subject not in humans:
+        return ()
+    return (subject, *sorted(humans - {subject}))

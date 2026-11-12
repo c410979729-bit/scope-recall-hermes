@@ -13,6 +13,49 @@ from scope_recall.core.schema import SUPPRESSION_TRIGGERS
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def replay_capture_inbox(core, context, *, host, timeout=30.0):
+    """Replay the context's due inbox rows with the host's real authorization until they are drained.
+
+    Fail when a replayable row makes no progress for ``timeout`` seconds; deferred and terminal rows are not due.
+    """
+    from scope_recall.adapters.clients.authorization import build_ingress_authorizer as client_authorizer
+    from scope_recall.adapters.hermes.authorization import build_ingress_authorizer as hermes_authorizer
+    from scope_recall.core.capture_inbox import replay_inbox
+    from scope_recall.core.inbox_rules import deferred_path, replayable
+
+    binding = core.storage.binding
+    authorize = (hermes_authorizer if host == "hermes" or binding.installation_kind == "shared" else client_authorizer)(
+        binding
+    )
+    last_rows = None
+    progress_deadline = time.monotonic() + timeout
+    while True:
+        now = datetime.fromisoformat(core.clock.utc_now().replace("Z", "+00:00"))
+        with core.storage.read(context) as tx:
+            rows = tuple(
+                (token, code)
+                for token, code, scope, project, branch in tx._check().execute(
+                    "SELECT token,last_error_code,scope_id,project_id,branch_id FROM capture_inbox ORDER BY token"
+                )
+                if scope in context.allowed_scope_ids
+                and project == context.project_id
+                and branch == context.branch_id
+                and code != "VERSION_CONFLICT"
+                and deferred_path(code) != "rekey"
+                and replayable(code, now)
+            )
+        if not rows:
+            return
+        if rows != last_rows:
+            last_rows = rows
+            progress_deadline = time.monotonic() + timeout
+        remaining = progress_deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"capture inbox replay made no progress for {timeout}s: {rows!r}")
+        replay_inbox(core.storage, core.clock, context, authorize=authorize, remaining_seconds=remaining)
+        time.sleep(min(0.05, remaining))
+
+
 @dataclass
 class FixedInputs:
     now: datetime = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)

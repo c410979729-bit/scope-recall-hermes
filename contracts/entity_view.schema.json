@@ -187,6 +187,16 @@
               "unknown"
             ]
           },
+          "entries": {
+            "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["id", "name"],
+              "properties": {
+                "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$"},
+                "name": {"type": "string", "minLength": 1, "maxLength": 32}
+              }
+            }
+          },
           "source_contexts": {
             "type": "array",
             "maxItems": 8,
@@ -212,6 +222,27 @@
               }
             }
           }
+        }
+      }
+    },
+    "candidate_groups": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["audience", "statements"],
+        "properties": {
+          "audience": {
+            "type": "object", "additionalProperties": false,
+            "required": ["scope_id", "project_id", "branch_id"],
+            "properties": {
+              "scope_id": {"type": "string", "minLength": 1, "maxLength": 240},
+              "project_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 240},
+              "branch_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 240}
+            }
+          },
+          "statements": {"$ref": "#/properties/statements"}
         }
       }
     },
@@ -292,6 +323,7 @@
           "statements": {
             "maxItems": 0
           },
+          "candidate_groups": {"maxItems": 0},
           "answerability": {
             "const": "unknown"
           }

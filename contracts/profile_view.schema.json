@@ -83,6 +83,20 @@
     "disputed": {
       "$ref": "#/$defs/items"
     },
+    "candidate_groups": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["audience", "sections", "disputed"],
+        "properties": {
+          "audience": {"$ref": "#/$defs/audience"},
+          "sections": {"$ref": "#/properties/sections"},
+          "disputed": {"$ref": "#/$defs/items"}
+        }
+      }
+    },
     "gaps": {
       "type": "array",
       "maxItems": 16,
@@ -143,6 +157,16 @@
     "unmet_needs"
   ],
   "$defs": {
+    "audience": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope_id", "project_id", "branch_id"],
+      "properties": {
+        "scope_id": {"type": "string", "minLength": 1, "maxLength": 240},
+        "project_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 240},
+        "branch_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 240}
+      }
+    },
     "items": {
       "type": "array",
       "maxItems": 30,
@@ -255,6 +279,16 @@
               "unknown"
             ]
           },
+          "entries": {
+            "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["id", "name"],
+              "properties": {
+                "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$"},
+                "name": {"type": "string", "minLength": 1, "maxLength": 32}
+              }
+            }
+          },
           "source_contexts": {
             "type": "array",
             "maxItems": 8,
@@ -320,6 +354,7 @@
           "disputed": {
             "maxItems": 0
           },
+          "candidate_groups": {"maxItems": 0},
           "answerability": {
             "const": "unknown"
           }

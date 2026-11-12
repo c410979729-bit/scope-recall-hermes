@@ -14,11 +14,11 @@ from scope_recall.adapters.clients import CodexHookHandler
 from scope_recall.adapters.clients.boundary import host_source_key, is_scope_recall_tool
 from scope_recall.adapters.clients.config import CodexConfigError, install_codex_scope_recall, load_codex_config
 from scope_recall.adapters.clients.hook_answer import emit_result
-from scope_recall.adapters.clients.identity import resolve_runtime_audience
+from scope_recall.adapters.clients.identity import resolve_runtime_audience, trusted_context
 from scope_recall.core.retrieval import RetrievalResult
 
 from tests.host.codex.source_bootstrap import HOOK_ENTRY_BOOTSTRAP, subprocess_env
-from tests.v11_support import recall_item, source_event
+from tests.v11_support import recall_item, replay_capture_inbox, source_event
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -43,6 +43,7 @@ def test_exact_human_pause_and_resume_commands_are_not_captured(handler, install
     assert result["decision"] == "block"
     assert owner.private_status(session="TEST-session-1")["mode"] == "none"
     hook.handle_payload(_payload(project_root, "UserPromptSubmit", turn="TEST-turn-4", prompt="TEST after resume"))
+    replay_capture_inbox(core, ctx, host="client")
     with core.storage.read(ctx) as tx:
         contents = [row[0] for row in tx._check().execute("SELECT content FROM source_events")]
     assert "TEST after resume" in contents
@@ -156,6 +157,10 @@ def test_continue_and_chinese_prompts_are_not_filtered(handler, installed):
     for prompt in ("continue", "继续"):
         result = hook.handle_payload(_payload(project_root, "UserPromptSubmit", turn=f"turn-{prompt}", prompt=prompt))
         assert result == {}
+        writer = trusted_context(
+            config, resolve_runtime_audience(config, str(project_root)), session_id="TEST-session-1"
+        )
+        replay_capture_inbox(hook.core, writer, host="client")
         with sqlite3.connect(config.data_directory / "memory.sqlite3") as db:
             count = db.execute("SELECT count(*) FROM source_events WHERE content=?", (prompt,)).fetchone()[0]
         assert count == 1
@@ -336,6 +341,8 @@ def test_stop_never_loops_and_records_only_present_assistant_text(handler, insta
     hook, project_root, config = handler
     assert hook.handle_payload(_payload(project_root, "Stop", last_assistant_message="final answer")) == {}
     assert hook.handle_payload(_payload(project_root, "Stop", turn="turn-blank", last_assistant_message="")) == {}
+    writer = trusted_context(config, resolve_runtime_audience(config, str(project_root)), session_id="TEST-session-1")
+    replay_capture_inbox(hook.core, writer, host="client")
     with sqlite3.connect(config.data_directory / "memory.sqlite3") as db:
         rows = db.execute("SELECT content FROM source_events WHERE role='assistant'").fetchall()
     assert len(rows) == 1
@@ -365,6 +372,8 @@ def test_post_tool_use_provenance_for_own_tools(handler, installed):
             tool_response="ok",
         )
     )
+    writer = trusted_context(config, resolve_runtime_audience(config, str(project_root)), session_id="TEST-session-1")
+    replay_capture_inbox(hook.core, writer, host="client")
     with sqlite3.connect(config.data_directory / "memory.sqlite3") as db:
         origins = [
             row[0] for row in db.execute("SELECT origin FROM source_events WHERE role='tool' ORDER BY source_event_key")
@@ -391,6 +400,8 @@ def test_interrupt_and_session_end_are_host_generated_without_model_calls(handle
     assert guarded.handle_payload(_payload(project_root, "Interrupt")) == {}
     assert guarded.handle_payload(_payload(project_root, "SessionEnd", turn="", reason="completed")) == {}
     assert core_calls["recall"] == 0
+    writer = trusted_context(config, resolve_runtime_audience(config, str(project_root)), session_id="TEST-session-1")
+    replay_capture_inbox(core, writer, host="client")
     with sqlite3.connect(config.data_directory / "memory.sqlite3") as db:
         origins = [row[0] for row in db.execute("SELECT origin FROM source_events WHERE role='system'")]
     assert origins == ["host_generated", "host_generated"]
@@ -709,6 +720,8 @@ def test_new_session_uses_distinct_source_keys(handler, installed):
     hook, project_root, config = handler
     hook.handle_payload(_payload(project_root, "UserPromptSubmit", session="session-a", turn="turn-1", prompt="one"))
     hook.handle_payload(_payload(project_root, "UserPromptSubmit", session="session-b", turn="turn-1", prompt="one"))
+    writer = trusted_context(config, resolve_runtime_audience(config, str(project_root)), session_id="session-a")
+    replay_capture_inbox(hook.core, writer, host="client")
     with sqlite3.connect(config.data_directory / "memory.sqlite3") as db:
         keys = [row[0] for row in db.execute("SELECT source_event_key FROM source_events")]
     assert len(keys) == 2

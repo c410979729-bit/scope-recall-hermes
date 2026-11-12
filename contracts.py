@@ -749,6 +749,8 @@ def _validate_compaction(sequence: int | None, epoch: str | None) -> None:
 
 @dataclass(frozen=True)
 class TrustedContext:
+    """Host-attested request identity and scope grants, with runtime proofs kept outside model payloads."""
+
     binding: InstanceBinding
     session_id: str
     allowed_scope_ids: frozenset[str]
@@ -782,12 +784,25 @@ class TrustedContext:
     owner_resolver: Callable[[str, SourcePrincipal | None, dict], str | None] | None = dataclass_field(
         default=None, compare=False, repr=False
     )
+    #: Read-view subjects approved as the same owner, with the queried principal first.
+    #: None asks for the approved capture owner only when a local stdio entry explicitly enables it.
+    #: This runtime-only proof identifies subjects and never grants scopes or mutation authority.
+    subject_resolver: Callable[[str | None], tuple[str, ...]] | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.binding, InstanceBinding):
             raise ContractError("IDENTITY_UNBOUND")
-        if self.owner_resolver is not None and not callable(self.owner_resolver):
-            raise ContractError("IDENTITY_UNBOUND", "owner_resolver")
+        if (self.owner_resolver is not None and not callable(self.owner_resolver)) or (
+            self.subject_resolver is not None and not callable(self.subject_resolver)
+        ):
+            field = (
+                "owner_resolver"
+                if self.owner_resolver is not None and not callable(self.owner_resolver)
+                else "subject_resolver"
+            )
+            raise ContractError("IDENTITY_UNBOUND", field)
         if self.entry_id is not None and (type(self.entry_id) is not str or not ENTRY_ID.fullmatch(self.entry_id)):
             raise ContractError("IDENTITY_UNBOUND", "entry_id")
         if type(self.session_id) is not str or not self.session_id.strip() or len(self.session_id) > 240:
