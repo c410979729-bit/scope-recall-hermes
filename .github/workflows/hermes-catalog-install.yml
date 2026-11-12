@@ -16,6 +16,10 @@ on:
       - ".github/workflows/hermes-catalog-install.yml"
       - ".github/scripts/hermes_catalog_install.sh"
       - ".github/scripts/loopback_chat_model.py"
+      - "scripts/hermes_surface.py"
+      - "fixtures/hermes/**"
+  schedule:
+    - cron: "23 8 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -43,3 +47,32 @@ jobs:
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           WHEELS: ${{ runner.temp }}/wheels
         run: bash .github/scripts/hermes_catalog_install.sh
+      - name: Compare the installed Hermes source with the reviewed inventory
+        if: always()
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          # install.sh defaults to HERMES_HOME/hermes-agent; the install step
+          # overrides HOME within its own shell, so reconstruct that same home.
+          home="$RUNNER_TEMP/hermes-catalog-install/home"
+          root="${HERMES_INSTALL_DIR:-${HERMES_HOME:-$home/.hermes}/hermes-agent}"
+          if [[ ! -f "$root/run_agent.py" || ! -f "$root/hermes_cli/plugins.py" || ! -f "$root/agent/memory_provider.py" ]]; then
+            printf 'Hermes source was not found. Searched: %s\nExpected run_agent.py, hermes_cli/plugins.py and agent/memory_provider.py.\n' "$root" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          output="$RUNNER_TEMP/hermes-surface-diff.txt"
+          status=0
+          python scripts/hermes_surface.py diff fixtures/hermes/surface-0.23.0.json "$root" > "$output" 2>&1 || status=$?
+          cat "$output"
+          {
+            printf '### Hermes source surface\n\n```text\n'
+            cat "$output"
+            printf '\n```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Default diff fails only for missing dependencies or stale inventories.
+          # Pull requests report those findings while retaining input failures.
+          if [[ "$status" -eq 1 && "$EVENT_NAME" == "pull_request" ]]; then
+            exit 0
+          fi
+          exit "$status"
