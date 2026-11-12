@@ -18,6 +18,9 @@ from .recall_log_storage import RecallLogStore
 
 _WRITERS: weakref.WeakSet = weakref.WeakSet()
 
+# Readers wait at most this long; after that they see only committed records.
+VIEW_WAIT_SECONDS = 2.0
+
 
 class RecallLogWriter:
     """Own a bounded queue; start lazily and retire after the queue becomes idle."""
@@ -151,8 +154,10 @@ class RecallLogWriter:
             except OSError:
                 pass
 
-    def flush(self, timeout: float = 2.0) -> bool:
+    def flush(self, timeout: float | None = None) -> bool:
         """Wait only for explicit readers, tests and orderly process exit."""
+        if timeout is None:
+            timeout = VIEW_WAIT_SECONDS
         until = time.monotonic() + timeout
         with self.queue.all_tasks_done:
             while self.queue.unfinished_tasks:

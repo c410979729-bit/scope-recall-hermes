@@ -232,7 +232,7 @@ class RecallLogStore:
         limit=30,
         now=None,
     ):
-        """Read one bounded newest-first page; missing logs are an empty history."""
+        """Read one bounded newest-first page; absent or uninitialized logs are empty."""
         if not self.path.exists():
             return []
         clauses, values = [], []
@@ -252,6 +252,9 @@ class RecallLogStore:
             clauses.append("sequence<?")
             values.append(before)
         with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.05)) as conn:
+            # The initial schema is committed atomically with the first write.
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempts'").fetchone():
+                return []
             if now is not None:
                 setting = conn.execute("SELECT days FROM retention WHERE singleton=1").fetchone()
                 clauses.append("timestamp>=?")

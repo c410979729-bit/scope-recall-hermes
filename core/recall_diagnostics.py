@@ -120,7 +120,7 @@ class RecallDiagnostics:
         if self.path.is_file():
             self.writer.submit(dict(prune_at=now))
 
-    def flush(self, timeout: float = 2.0) -> bool:
+    def flush(self, timeout: float | None = None) -> bool:
         """Drain for inspection or orderly shutdown; never called by recall."""
         return self.writer.flush(timeout)
 
