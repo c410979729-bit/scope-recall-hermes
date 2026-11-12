@@ -148,10 +148,8 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         #: after a compression switches the session id
         #: mid-turn, ``sync_turn`` would store it again under the new session's key.
         self._user_captured_turns: dict[str, None] = {}
-        #: Turns Hermes opened itself (``host_notice``), with the text of the message that opened each, kept like
-        #: ``_user_captured_turns`` under ``_said_lock``: that message is stored as the host's wherever it is stored, by
-        #: ``pre_llm_call`` or by ``sync_turn``. The text must match as well as the turn identity.
-        self._notice_turns: dict[str, str] = {}
+        #: Each turn's opener origin and observed text variants, guarded like ``_user_captured_turns``.
+        self._opener_origins: dict[str, tuple[tuple[str, ...], str]] = {}
         self._session_watermark = 0
         self._current_source_refs: list[str] = []
         #: This turn captured more sources than the fence holds; recall stays

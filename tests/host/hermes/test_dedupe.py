@@ -245,7 +245,7 @@ def test_what_the_person_sent_mid_turn_is_recorded_as_their_words(adapter, herme
     assert origins["TEST 顺便把截止日期改成周五"][1] == "2026-09-21T14:15:00.500000Z"
 
 
-_NOTICE = "[IMPORTANT: Background process TEST-proc finished (exit code 0).\nCommand: TEST make build]"
+_NOTICE = "TEST process finished (exit code 0).\nCommand: TEST make build"
 
 
 def test_a_message_hermes_writes_itself_is_stored_as_the_host_s(adapter, hermes_home):
@@ -400,7 +400,10 @@ def test_a_notice_hermes_folded_a_summary_into_is_the_host_s(adapter, hermes_hom
 def test_only_a_folded_message_s_own_words_make_it_the_turn_s():
     """A summary quotes the person's messages word for word, so a folded notice that merely holds the turn's text is
     not the turn's own; otherwise the person's words would be stored as the host's."""
-    from scope_recall.adapters.hermes.boundary import host_notice
+    from scope_recall.adapters.hermes.boundary import opener_origin
+
+    def host_notice(history, message):
+        return opener_origin(history, message, local_surface=True) == "host_generated"
 
     tail = [{"role": "assistant", "content": "TEST 上一步"}]
     assert host_notice([_folded(_NOTICE, display_kind="process_complete"), *tail], _NOTICE)
@@ -444,7 +447,10 @@ def test_only_a_folded_message_s_own_words_make_it_the_turn_s():
 
 def test_a_folded_notice_is_read_as_hermes_reads_it_back():
     """List content, the restatement Hermes adds after the end line, and a to-do list folded in before the summary."""
-    from scope_recall.adapters.hermes.boundary import host_notice
+    from scope_recall.adapters.hermes.boundary import opener_origin
+
+    def host_notice(history, message):
+        return opener_origin(history, message, local_surface=True) == "host_generated"
 
     tail = [{"role": "assistant", "content": "TEST 上一步"}]
     listed = _folded(_NOTICE, display_kind="internal_notification")
@@ -459,7 +465,10 @@ def test_a_folded_notice_is_read_as_hermes_reads_it_back():
 def test_a_notice_a_to_do_list_was_appended_to_is_still_the_host_s():
     """A compression appends the open to-do list to the last user message Hermes counts as a real one, a
     delegation's result included (``_fold_todo_snapshot``); read back without it, the notice is still found."""
-    from scope_recall.adapters.hermes.boundary import host_notice
+    from scope_recall.adapters.hermes.boundary import opener_origin
+
+    def host_notice(history, message):
+        return opener_origin(history, message, local_surface=True) == "host_generated"
 
     notice = {"role": "user", "content": _DELEGATED + "\n\n" + _TODO, "display_kind": "internal_notification"}
     assert host_notice([{"role": "assistant", "content": "TEST 好。"}, notice], _DELEGATED)
@@ -469,7 +478,10 @@ def test_a_note_before_the_person_s_message_keeps_an_unanswered_notice_from_taki
     """Hermes puts a note of its own before the person's message (a model switch, a timestamp) and hands
     ``pre_llm_call`` their words alone.  An unanswered notice before it with the same words does not take them, folded
     or not: the latest user message with words of its own decides."""
-    from scope_recall.adapters.hermes.boundary import host_notice
+    from scope_recall.adapters.hermes.boundary import opener_origin
+
+    def host_notice(history, message):
+        return opener_origin(history, message, local_surface=True) == "host_generated"
 
     reply = {"role": "assistant", "content": "TEST 好。"}
     noted = {"role": "user", "content": "[Note: model was just switched from TEST-a to TEST-b.]\n\n" + _NOTICE}
@@ -482,7 +494,10 @@ def test_a_note_before_the_person_s_message_keeps_an_unanswered_notice_from_taki
 def test_the_turn_s_own_message_says_whether_hermes_opened_it():
     """A compression at the turn's start can add user messages after the turn's own: a to-do list, a turn it
     restored.  The turn's own message is the last one holding its text; one not found is the person's."""
-    from scope_recall.adapters.hermes.boundary import host_notice
+    from scope_recall.adapters.hermes.boundary import opener_origin
+
+    def host_notice(history, message):
+        return opener_origin(history, message, local_surface=True) == "host_generated"
 
     notice = {"role": "user", "content": _NOTICE, "display_kind": "internal_notification"}
     asked = {"role": "user", "content": "TEST 跑一下构建"}

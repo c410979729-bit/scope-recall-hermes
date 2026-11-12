@@ -362,9 +362,55 @@ _NOTICE_TIMESTAMP = re.compile(
     r"(?: [A-Za-z0-9_+\-/:]+)?\]\s+"
 )
 
+#: Synthetic user-row markers from ``agent.conversation_compression`` and ``agent.turn_stop_gates``.
+_SYNTHETIC_USER_FLAGS = (
+    "_todo_snapshot_synthetic",
+    "_empty_recovery_synthetic",
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+    "_dropped_toolcall_nudge",
+    "_kanban_stop_synthetic",
+)
+#: What Hermes records on a user row that absorbed the rows after it (``agent.agent_runtime_helpers.
+#: _merge_consecutive_users``, ``agent.message_metadata.record_absorbed_message``): the text it held before, when
+#: there was any, and the absorbed rows' ids.  The joined row keeps the first row's dictionary, platform id included.
+_MERGED_PREFIX = "_merged_turn_prefix"
+_MERGE_WITNESSES = (_MERGED_PREFIX, "_absorbed_message_uids", "_absorbed_row_ids")
 
-def host_notice(history: object, user_message: object) -> bool:
-    """Whether the turn ``pre_llm_call`` opens is one Hermes opened itself, not the person.
+
+def _platform_id(message: dict[str, Any]) -> bool:
+    """Whether a user row carries the id of a platform message: ``platform_message_id`` on the row Hermes stages for a
+    turn (``agent.turn_context``, from the gateway's ``persist_user_platform_id``), ``message_id`` on a row it replays
+    from its session store."""
+    return any(
+        message.get(key) is not None and str(message[key]).strip() for key in ("platform_message_id", "message_id")
+    )
+
+
+def _kind_notice(message: dict[str, Any], text: str, *, trailing: bool) -> bool:
+    """Whether ``message`` is a notice Hermes marked by kind and ``text`` is its words.
+
+    Past the last reply (``trailing`` false) the message must be one Hermes folded and marked.  A compression at the
+    turn's start can fold its summary into the turn's own message (``ContextCompressor._merge_summary_into_tail_row``)
+    and put the reply it folded away after it (``_reply_insertion_index``), and a delegation result would be stored as
+    the person's that way.  Anything else before the last reply belongs to an earlier turn.  Its own words only: a
+    summary quotes the person's messages word for word, and a message merely holding the turn's text would take the
+    person's words for a notice.
+    """
+    words = _own_text(message)
+    notice = _notice_kind(message)
+    # Rendered history and the hook's clean input differ by this prefix.
+    # A display kind and a valid host timestamp must attest the row first;
+    # human text and steers are never normalized into host authority.
+    if words != text and notice and _message_time(message) is not None:
+        prefix = _NOTICE_TIMESTAMP.match(words)
+        if prefix is not None:
+            words = words[prefix.end() :]
+    return bool(words and words == text and notice and (trailing or message.get(_COMPRESSED_SUMMARY) is True))
+
+
+def opener_origin(history: object, user_message: object, *, local_surface: bool, staged: bool = False) -> str:
+    """The origin of the message the turn ``pre_llm_call`` opens on: the person's, Hermes's, or unknown.
 
     Hermes marks the user messages it writes itself with a display kind: a finished background process, a
     delegation's result, a wake-up, a plugin's message (``gateway.response_filters.display_kind_for_event``, the
@@ -372,87 +418,191 @@ def host_notice(history: object, user_message: object) -> bool:
     (``ContextCompressor._is_actionable_user_turn``).  Stored as the person's, a notice would read as something they
     said.
 
-    Text that carries steers Hermes handed over (``carries_gateway_origin``) is Hermes's, regardless of history.
-    Otherwise, the latest user message with words of its own decides: the turn is Hermes's when those words are the
-    turn's text and the message carries a notice's kind.  A to-do list a compression adds after the turn's message
-    has no words of its own (``agent.turn_context.reanchor_current_turn_user_idx``).  The latest only: otherwise, when
-    Hermes puts a note before the person's message (a model switch, a timestamp), an unanswered notice with the same
-    words would take theirs, and so would an older folded one.  A request Hermes restores after a notice decides in its
-    place, and the notice stays the person's: the safe side.
-
-    Past the last reply the message must be one Hermes folded and marked.  A compression at the turn's start can
-    fold its summary into the turn's own message (``ContextCompressor._merge_summary_into_tail_row``) and put the
-    reply it folded away after it (``_reply_insertion_index``), and a delegation result would be stored as the
-    person's that way.  Anything else before the last reply belongs to an earlier turn.  Its own words only: a
-    summary quotes the person's messages word for word, and a message merely holding the turn's text would take the
-    person's words for a notice.
+    ``staged`` says the conversation is the one Hermes hands ``pre_llm_call``: it has just appended the turn's own row
+    (``agent.turn_context``), so that row is known by its place (``_staged_row``) and its platform id needs no
+    comparison of words.  Later hooks see the conversation after Hermes joined rows, compacted it and added steers;
+    there the latest user row with words of its own decides, skipping later steers and redirects unless they match
+    the opener, and its words must match (``_attests``).  The turn's own tool calls and their results may follow
+    its row; past a reply that called no tool, the row belongs to an answered earlier turn and lends no platform id,
+    unless it is a marked folded row whose reply a compression moved after it.  A to-do list alone has no words of
+    its own.  The row and the opener go through the evidence order of ``_classify_opener``.
     """
     raw_text = extract_user_text(user_message)
-    if carries_gateway_origin(raw_text):
-        return True
     text = raw_text.strip()
-    if not isinstance(history, list) or not text:
-        return False
     trailing = True
-    for message in reversed(history):
+    answered = False
+    row = None
+    for message in reversed(history if isinstance(history, list) else []):
         if not isinstance(message, dict) or message.get("role") != "user":
             trailing = False
+            tool_step = isinstance(message, dict) and (
+                message.get("role") == "tool"
+                or (message.get("role") == "assistant" and bool(message.get("tool_calls")))
+            )
+            answered = answered or not tool_step
             continue
         words = _own_text(message)
+        if words and (message.get("display_kind") == STEER_KIND or _is_redirect(message)) and words != text:
+            continue
         if words:
-            notice = _notice_kind(message)
-            # Rendered history and the hook's clean input differ by this prefix.
-            # A display kind and a valid host timestamp must attest the row first;
-            # human text and steers are never normalized into host authority.
-            if words != text and notice and _message_time(message) is not None:
-                prefix = _NOTICE_TIMESTAMP.match(words)
-                if prefix is not None:
-                    words = words[prefix.end() :]
-            return words == text and notice and (trailing or message.get(_COMPRESSED_SUMMARY) is True)
-    return False
+            row = message
+            break
+    notice = row is not None and _kind_notice(row, text, trailing=trailing)
+    placed = _staged_row(history) if staged else None
+    if placed is not None:
+        return _classify_opener(history, raw_text, placed, notice, local_surface=local_surface, exact=False)
+    evidence_row = row if row and (not answered or row.get(_COMPRESSED_SUMMARY) is True) else None
+    return _classify_opener(history, raw_text, evidence_row, notice, local_surface=local_surface)
 
 
-def sync_host_notice(messages: object, user_message: object) -> bool:
-    """Classify a completed turn's opener, keeping later steers separate from its identity.
+def _staged_row(history: object) -> dict[str, Any] | None:
+    """The row Hermes staged for the turn, from the conversation it hands ``pre_llm_call``; None if unclear.
 
-    Text that carries steers Hermes handed over (``carries_gateway_origin``) is Hermes's, independently of history.
-    Otherwise, only host-marked steers are transparent. Equal-text steers need the native tool-batch boundary, with
-    no completed reply before the opener; otherwise they may be a new request borrowing an old notice.
-    Ordinary user rows always bound the search. The classifier still owns kind, time and exact-text checks.
+    Hermes appends the turn's row and calls the hook with that conversation, the row last
+    (``agent.turn_context``).  Hermes 0.22 compacts the conversation first: the compaction can fold its summary into
+    that row, marking it (``_COMPRESSED_SUMMARY``), and put the reply it folded away and a to-do list after it.  So
+    replies, tool results and marked scaffolding with no words of its own are passed over, and a row found past a
+    reply must be the marked folded one.
     """
-    if carries_gateway_origin(extract_user_text(user_message)):
-        return True
+    past_reply = False
+    for message in reversed(history if isinstance(history, list) else []):
+        if not isinstance(message, dict):
+            return None
+        role = message.get("role")
+        if role in ("assistant", "tool"):
+            past_reply = True
+            continue
+        if role != "user":
+            return None
+        if any(message.get(flag) is True for flag in _SYNTHETIC_USER_FLAGS) and not _own_text(message):
+            continue
+        return message if not past_reply or message.get(_COMPRESSED_SUMMARY) is True else None
+    return None
+
+
+def sync_opener_origin(messages: object, user_message: object, *, local_surface: bool) -> str:
+    """The origin of a completed turn's opener, keeping later steers separate from its identity.
+
+    Walking back from the turn's end, later redirects and marked scaffolding without the opener are transparent.
+    Equal-text steers need the native tool-batch boundary, with no completed reply before the opener. Other user rows,
+    including unmarked system notes, bound the search and can leave no evidence for the opener. A request hook's
+    earlier classification is retained by the caller and does not depend on this later search.
+    """
+    raw_text = extract_user_text(user_message)
     if not isinstance(messages, list):
-        return False
-    text = extract_user_text(user_message).strip()
+        return _classify_opener(messages, raw_text, None, False, local_surface=local_surface)
+    text = raw_text.strip()
     end = len(messages)
     matching_steer = False
+    row = None
     while end:
         message = messages[end - 1]
         if not isinstance(message, dict):
-            return False
+            break
         role = message.get("role")
         if role in ("assistant", "tool"):
             if matching_steer and role == "assistant" and not message.get("tool_calls"):
-                return False
+                break
             end -= 1
             continue
         if role == "user" and message.get("display_kind") == STEER_KIND:
             words = _own_text(message)
             if not words:
-                return False
+                break
             pieces = _steer_pieces(words)
             if words == text or any(piece == text for _origin, piece in pieces):
                 # Hermes emits native steers after tool results, never after a completed turn's answer.
                 before = messages[end - 2] if end > 1 else None
                 if not pieces or not isinstance(before, dict) or before.get("role") != "tool":
-                    return False
+                    break
                 matching_steer = True
             end -= 1
             continue
+        if role == "user" and _is_redirect(message) and _own_text(message) != text:
+            end -= 1
+            continue
+        if (
+            role == "user"
+            and any(message.get(flag) is True for flag in _SYNTHETIC_USER_FLAGS)
+            and not _holds(message, _unstamped(text).strip())
+        ):
+            end -= 1
+            continue
         # The located row owns this identity; the classifier must not search behind an empty user boundary.
-        return role == "user" and host_notice([message], user_message)
-    return False
+        if role == "user":
+            row = message
+        break
+    notice = row is not None and _kind_notice(row, text, trailing=True)
+    return _classify_opener(messages, raw_text, row, notice, local_surface=local_surface)
+
+
+def _holds(message: dict[str, Any], said: str) -> bool:
+    """Whether a row Hermes marked as scaffolding may hold the turn's message ``said``: as its own words (a compaction
+    appends its to-do list to the turn's row and marks that row), or as the last part a join put after it."""
+    own = _unstamped(_own_text(message).strip()).strip()
+    full = extract_user_text(message.get("content")).rstrip()
+    last = _unstamped(full.rsplit("\n\n", 1)[-1].strip()).strip() if "\n\n" in full else ""
+    return bool(said) and (own == said or own.startswith(said + "\n\n") or last == said)
+
+
+def _attests(row: dict[str, Any], words: str, said: str, *, exact: bool) -> bool:
+    """Whether ``row``'s platform id vouches for the turn's text ``said``; ``words`` are the row's own words.
+
+    Hermes joins adjacent user rows into the first row's dictionary, a blank line apart, so a joined row's id names
+    only its first part, the text it held before (``_MERGE_WITNESSES``); a joined row that held none names no words.
+    The row Hermes has just staged (``exact`` false) is the turn's by its place, and its words are those Hermes shows
+    the model, which can wrap the message it hands the hook (a platform's routing note, a group's observed context).
+    Elsewhere the row's words, replay times aside, must be the turn's text or begin with it and a blank line.
+    """
+    joined = any(row.get(key) for key in _MERGE_WITNESSES)
+    if not exact and not joined:
+        return True
+    first = words
+    if joined:
+        prefix = row.get(_MERGED_PREFIX)
+        if not isinstance(prefix, str) or not prefix.strip():
+            return False
+        first = _unstamped(prefix.strip()).strip()
+    return first == said or first.startswith(said + "\n\n")
+
+
+def _classify_opener(
+    history: object,
+    text: str,
+    row: dict[str, Any] | None,
+    notice: bool,
+    *,
+    local_surface: bool,
+    exact: bool = True,
+) -> str:
+    """The origin of a turn's opener from the turn's own ``row`` and ``text``, strongest evidence first.
+
+    1. Text carrying steers Hermes handed over (``carries_gateway_origin``), and a turn whose row Hermes marked as a
+       notice (``_kind_notice``), are Hermes's.
+    2. The turn's row carrying the id of a platform message makes the opener the person's, when that id vouches for
+       the turn's text (``_attests``).  The id identifies a platform delivery, not the author of every word: skill
+       and command expansions, webhook deliveries and viewer submissions carry ids too, and Hermes gives a goal's
+       kickoff the command's id and a viewer submission an admission id.
+    3. Text beginning with a known Hermes row prefix or the goal continuation prefix, after replay timestamps,
+       is Hermes's. Only below the ID: someone who pastes such a line into a delivered message keeps their words.
+    4. On a local surface the rest is treated as the person's.
+    5. If no user row has an ID, or history is unavailable, retain the earlier human fallback. This also covers older
+       hosts, platforms without IDs, and the first turn of some host-created sessions.
+    6. Otherwise the origin is unknown: the selected row may lack an ID, fail to match, or have lost it in a merge.
+    """
+    if carries_gateway_origin(text) or notice:
+        return "host_generated"
+    said = _unstamped(text.strip()).strip()
+    words = _unstamped(_own_text(row).strip()).strip() if row else ""
+    if row and _platform_id(row) and words and said and _attests(row, words, said, exact=exact):
+        return "human_direct"
+    if _unstamped(text).startswith((*_HERMES_ROW_HEADS, _GOAL_CONTINUATION_HEAD)):
+        return "host_generated"
+    if local_surface or not isinstance(history, list):
+        return "human_direct"
+    if not any(isinstance(item, dict) and item.get("role") == "user" and _platform_id(item) for item in history):
+        return "human_direct"
+    return "origin_unknown"
 
 
 #: How Hermes 0.21.5 begins the notices it delivers into a running turn the way it delivers a steer, with the chat's
@@ -624,6 +774,9 @@ _HERMES_ROW_HEADS = (
     "[Delivered from ",
     "[A high-risk confirmation previously given here has EXPIRED",
 )
+#: The standing-goal continuation templates (``hermes_cli.goals``) queued as ordinary opener messages
+#: (``gateway.run_goals._synthetic_prompt_event``); the same words can be a person's redirect.
+_GOAL_CONTINUATION_HEAD = "[Continuing toward your standing goal"
 #: A notice Hermes writes opens with a bracketed head in capitals: "[IMPORTANT: …", "[ASYNC DELEGATION COMPLETE — …",
 #: "[SYSTEM NOTICE — …", "[CONTEXT COMPACTION …", "[SILENT]".  Too many forms to list, and a person's own message
 #: seldom opens so; one that does is left out of a restarted gateway's rows, the safe side.

@@ -266,6 +266,28 @@ a client that is offline.
   from a message that copies the preamble, so none of its parts is stored as the
   person's own words. The rule reads the text as the adapter receives it: a
   person who pastes a preamble loses that message from their own words.
+- A turn's opening message is recorded as the person's own words on evidence: the
+  ID of the platform message that started the turn, which Hermes puts on the row
+  it adds for the turn. The adapter reads it when Hermes hands the turn to its
+  request hook with that row just added. The text Hermes shows the model there can
+  wrap the message (a Discord routing note, a group's observed context), so no
+  wording is compared at that point. Later hooks and the end of the turn reuse
+  that result for the same turn and text. When they have to decide on their own,
+  the row's words must match the message, and a row Hermes joined with the rows
+  after it vouches only for its first part. An ID identifies a delivery, not the
+  author of every word: skill and command expansions, webhook deliveries and viewer
+  submissions carry one, and so does a goal's initial command. A row beginning with
+  the to-do snapshot header has no own words as Hermes reads it, even if it has an
+  ID.
+  Recognizable host notices and unnumbered fixed host prefixes are host-generated.
+  Other local input is treated as the person's. On a messaging platform, an opener
+  is stored with unknown origin when other user rows have IDs but its own evidence
+  is absent or does not match, including when a merge lost its ID. This can affect
+  `/retry` and Discord voice-channel transcripts. When no user row has an ID, the
+  earlier human fallback applies: this includes older hosts, platforms such as
+  SimpleX, and first turns of host-created sessions such as scheduled jobs or `/bg`.
+  If the resolved platform is A2A, human input is capped at unknown origin; A2A
+  input routed through a local platform is outside that check.
 - In a private chat on a platform that identifies the person, the messages no
   turn answered that a restarted gateway replays are stored with an unknown
   origin, not as the person's own words:

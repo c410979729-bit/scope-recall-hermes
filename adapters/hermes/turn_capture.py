@@ -24,16 +24,16 @@ from .boundary import (
     UNANSWERED_KIND,
     Steer,
     extract_user_text,
-    host_notice,
     interim_messages,
     interim_source_event,
     interim_source_key,
+    opener_origin,
     person_steers,
     pre_llm_source_event,
     steer_source_event,
     steer_source_key,
     sync_assistant_key,
-    sync_host_notice,
+    sync_opener_origin,
     sync_turn_source_events,
     tool_call_source_event,
     unanswered_messages,
@@ -97,6 +97,24 @@ def _steers(identity, messages: object) -> tuple[Steer, ...]:
     )
 
 
+def _opener_origin(identity, history: object, message: object, *, sync: bool = False, staged: bool = False) -> str:
+    """Classify the opener, applying the resolved platform's ``person_origin`` to a human result.
+
+    ``staged``: ``history`` is the conversation Hermes hands ``pre_llm_call``, its turn row just appended.
+    """
+    local = identity.scope.platform == "cli" or identity.scope.platform in LOCAL_PLATFORMS
+    if sync:
+        origin = sync_opener_origin(history, message, local_surface=local)
+    else:
+        origin = opener_origin(history, message, local_surface=local, staged=staged)
+    return identity.person_origin if origin == "human_direct" else origin
+
+
+def _shows_rows(history: object) -> bool:
+    """Whether a hook's conversation shows any user row: a classification made without one rests on fallbacks alone."""
+    return isinstance(history, list) and any(isinstance(row, dict) and row.get("role") == "user" for row in history)
+
+
 #: Only private chats recover unmarked rows that no turn answered; their authors remain unknown.
 _PRIVATE_CHATS = frozenset({"dm", "private", "cli"})
 
@@ -108,7 +126,7 @@ def _said_aside(identity, messages: object) -> tuple[Steer, ...]:
     authors are unknown; recognizable Hermes rows are filtered out by ``unanswered_messages``.
     """
     steers = _steers(identity, messages)
-    if identity.scope.chat_type not in _PRIVATE_CHATS or identity.trusted_context().actor_origin != "human_direct":
+    if identity.scope.chat_type not in _PRIVATE_CHATS or identity.person_origin != "human_direct":
         return steers
     return (*steers, *unanswered_messages(messages))
 
@@ -168,11 +186,11 @@ class _TurnBinding:
 
 @dataclass(frozen=True)
 class _Opening:
-    """The latest accepted opening hook, including host-proven origin when admission was skipped."""
+    """The latest accepted opening hook and its classification when admission was skipped."""
 
     turn_id: str
     skipped: bool
-    notice: bool
+    origin: str
 
 
 @dataclass(frozen=True)
@@ -247,23 +265,25 @@ class TurnCapture:
         return known is not None and (known is not self._current_binding or known.turn_id != turn_id)
 
     def note_skipped(self, kwargs: dict) -> None:
-        """Keep the skipped UUID and host-proven origin atomically without retaining another user body."""
+        """Keep the skipped UUID and origin atomically without retaining another user body."""
         turn_id = str(kwargs.get("turn_id") or "").strip()
-        notice = host_notice(kwargs.get("conversation_history"), kwargs.get("user_message"))
+        history = kwargs.get("conversation_history")
+        origin = _opener_origin(self._adapter._require_identity(), history, kwargs.get("user_message"), staged=True)
         with self._adapter._said_lock:
             if not turn_id or self._late_opening(turn_id):
                 return
-            self._note_opening(turn_id, skipped=True, notice=notice)
-            self._note_origin(turn_id, notice, kwargs.get("user_message"))
+            self._note_opening(turn_id, skipped=True, origin=origin)
+            if _shows_rows(history):
+                self._note_origin(turn_id, origin, kwargs.get("user_message"))
 
-    def _note_opening(self, turn_id: str, *, skipped: bool, notice: bool) -> None:
+    def _note_opening(self, turn_id: str, *, skipped: bool, origin: str) -> None:
         """Replace the candidate under the observation lock; latest or already started openings are replays."""
         binding = self._current_binding
         if (binding is None or binding.turn_id != turn_id) and (
             self._opening is None or self._opening.turn_id != turn_id
         ):
             self._opening_count += 1
-        self._opening = _Opening(turn_id, skipped, notice)
+        self._opening = _Opening(turn_id, skipped, origin)
 
     def _request_binding(self, turn_id: str, message: object) -> _TurnBinding | None:
         """The started turn's binding when a request hook is that turn's own, settling its UUID; else None.
@@ -289,26 +309,40 @@ class TurnCapture:
             self._adapter._active_turn_id = turn_id
             return binding
 
-    def note_opener(self, turn_id: str, history: object, user_message: object) -> bool:
-        """Remember whether Hermes opened ``turn_id`` itself (``host_notice``), and with which text; True if it did."""
-        notice = host_notice(history, user_message)
-        with self._adapter._said_lock:
-            self._note_origin(turn_id, notice, user_message)
-        return notice
+    def note_opener(
+        self, turn_id: str, history: object, user_message: object, identity, *, staged: bool = False
+    ) -> str:
+        """Classify the opener and remember it for later callbacks when the conversation showed the turn's rows."""
+        origin = _opener_origin(identity, history, user_message, staged=staged)
+        if _shows_rows(history):
+            with self._adapter._said_lock:
+                self._note_origin(turn_id, origin, user_message)
+        return origin
 
-    def _note_origin(self, turn_id: str, notice: bool, message: object) -> None:
-        """Retain the host's typed opening classification under the observation lock."""
-        self._adapter._notice_turns.pop(turn_id, None)
-        if notice:
-            self._adapter._notice_turns[turn_id] = extract_user_text(message).strip()
-            while len(self._adapter._notice_turns) > _USER_CAPTURED_TURNS:
-                self._adapter._notice_turns.pop(next(iter(self._adapter._notice_turns)))
+    def _note_origin(self, turn_id: str, origin: str, message: object) -> None:
+        """Retain the classification and up to four text variants under the observation lock.
 
-    def opened_by_host(self, turn_id: str, user_content: str) -> bool:
-        """Whether ``user_content`` is the message Hermes opened ``turn_id`` with."""
+        ``pre_llm_call`` sees the turn's row just staged, before Hermes joins rows and compacts the conversation, when
+        its evidence is clearest; later callbacks see redacted text, joined rows, steers and scaffolding.  A callback
+        whose text is one of the turn's remembered texts reuses the classification.  Another classification of the
+        same turn replaces it; a turn pushed out by newer ones, or forgotten at a session switch, is classified again
+        from what its callback sees.  Only classifications made with the conversation's rows in view are kept: one
+        made without them rests on the fallback rules and must not outweigh what a later callback sees.
+        """
+        previous = self._adapter._opener_origins.pop(turn_id, None)
+        text = extract_user_text(message).strip()
+        texts = previous[0] if previous and previous[1] == origin else ()
+        if text not in texts:
+            texts = (*texts, text)[-4:]
+        self._adapter._opener_origins[turn_id] = (texts, origin)
+        while len(self._adapter._opener_origins) > _USER_CAPTURED_TURNS:
+            self._adapter._opener_origins.pop(next(iter(self._adapter._opener_origins)))
+
+    def remembered_origin(self, turn_id: str, user_content: str) -> str | None:
+        """Return a remembered origin only for one of its observed opening texts."""
         with self._adapter._said_lock:
-            opener = self._adapter._notice_turns.get(turn_id)
-        return opener is not None and opener == user_content.strip()
+            opener = self._adapter._opener_origins.get(turn_id)
+        return opener[1] if opener is not None and user_content.strip() in opener[0] else None
 
     def start(self, turn_number: int, message: str, **kwargs) -> None:
         """Associate the inline host start with its pre-hook UUID and recover a busy hook's input."""
@@ -327,11 +361,12 @@ class TurnCapture:
             self.bind_turn(turn_id, message, confirmed=bool(explicit))
             skipped = bool(claimed and claimed.skipped and claimed.turn_id == turn_id)
             recover = skipped and (accounted or explicit == turn_id)
-            notice = bool(claimed and skipped and claimed.notice)
-            if skipped:
-                # Host redaction may change the body between the hook and the
-                # inline callback. Its typed origin survives that transformation.
-                self._note_origin(turn_id, notice, message)
+            origin = claimed.origin if claimed and skipped else "human_direct"
+            if skipped and (recover or origin != "human_direct"):
+                # Host redaction may change the body between the hook and the inline callback, so the start's text is
+                # remembered as the turn's.  A person's origin needs the start proven to be that turn: another text
+                # would otherwise take it.
+                self._note_origin(turn_id, origin, message)
         session_id = self._adapter._effective_session_id(str(kwargs.get("session_id") or ""))
         with self._adapter._said_lock:
             pending = self._adapter._pending_private_receipt
@@ -346,7 +381,7 @@ class TurnCapture:
         self._adapter._outcomes.open_turn(session_id, turn_id)
         if recover:
             self._capture_opener(
-                dict(session_id=session_id, turn_id=turn_id, user_message=message), notice=notice, current=True
+                dict(session_id=session_id, turn_id=turn_id, user_message=message), origin=origin, current=True
             )
 
     def pre_api(self, **kwargs) -> bool:
@@ -362,10 +397,10 @@ class TurnCapture:
                 if turn_id and self._opening is not None and self._opening.turn_id == turn_id:
                     self._note_gap(TURN_START_MISSING_GAP)
             return False
-        notice = self.opened_by_host(turn_id, extract_user_text(kwargs.get("user_message"))) or host_notice(
-            kwargs.get("conversation_history"), kwargs.get("user_message")
+        origin = self.remembered_origin(turn_id, extract_user_text(kwargs.get("user_message"))) or self.note_opener(
+            turn_id, kwargs.get("conversation_history"), kwargs.get("user_message"), binding.identity
         )
-        self._capture_opener(kwargs, notice=notice, current=True, bound=binding.identity)
+        self._capture_opener(kwargs, origin=origin, current=True, bound=binding.identity)
         return True
 
     def pre_llm(self, **kwargs) -> bool:
@@ -378,7 +413,7 @@ class TurnCapture:
                 if turn_id != self._adapter._active_turn_id:
                     self.reset_source_refs()
                 self._adapter._active_turn_id = turn_id
-                self._note_opening(supplied, skipped=False, notice=False)
+                self._note_opening(supplied, skipped=False, origin="human_direct")
             carried = self._sync_binding.get()
             identity = carried.identity if not current and carried else self._adapter._require_identity()
         if current:
@@ -387,15 +422,17 @@ class TurnCapture:
             message = kwargs.get("user_message")
             if type(message) is str and message:
                 self._adapter._current_task_message = without_private(message)[0][:8192]
-            notice = self.opened_by_host(turn_id, extract_user_text(message)) or self.note_opener(
-                turn_id, kwargs.get("conversation_history"), message
+            origin = self.remembered_origin(turn_id, extract_user_text(message)) or self.note_opener(
+                turn_id, kwargs.get("conversation_history"), message, identity, staged=True
             )
         else:
-            notice = host_notice(kwargs.get("conversation_history"), kwargs.get("user_message"))
-        self._capture_opener(dict(kwargs, turn_id=turn_id), notice=notice, current=current, bound=identity)
+            origin = _opener_origin(
+                identity, kwargs.get("conversation_history"), kwargs.get("user_message"), staged=True
+            )
+        self._capture_opener(dict(kwargs, turn_id=turn_id), origin=origin, current=current, bound=identity)
         return current
 
-    def _capture_opener(self, kwargs: dict, *, notice: bool, current: bool, bound=None) -> None:
+    def _capture_opener(self, kwargs: dict, *, origin: str, current: bool, bound=None) -> None:
         """Store a delivered opener under its UUID; late delivery cannot alter active bookkeeping."""
         identity = bound or self._adapter._require_identity()
         turn_id = str(kwargs.get("turn_id") or "turn")
@@ -407,9 +444,7 @@ class TurnCapture:
             return
         session_id = str(kwargs.get("session_id") or identity.session_id)
         current_message = kwargs.get("user_message")
-        context = identity.trusted_context(
-            session_id=session_id, actor_origin="host_generated" if notice else None, mutation=True
-        )
+        context = identity.trusted_context(session_id=session_id, actor_origin=origin, mutation=True)
         if (
             current
             and direct_owner_cli(identity)
@@ -645,7 +680,11 @@ class TurnCapture:
             limited = self._write_messages(
                 interim_source_event, {item.turn_id: said}, identity, shown, item.session_id, limit=_INTERIM_PER_TURN
             )
-            context = identity.trusted_context(session_id=item.session_id, mutation=True)
+            # Steers Hermes marked as such, each behind an origin it wrote naming the session's person
+            # (``person_steers``): their own words.
+            context = identity.trusted_context(
+                session_id=item.session_id, actor_origin=identity.person_origin, mutation=True
+            )
             self._write_steers(steers, identity, context, "completed_turn")
             if limited:
                 with adapter._lock, adapter._said_lock:
@@ -689,16 +728,18 @@ class TurnCapture:
             if not identity.runtime_audience.allowed_scope_ids:
                 adapter._diagnostics.capability_gaps = identity.runtime_audience.capability_gaps
                 return
-        context = identity.trusted_context(session_id=effective_session, mutation=True)
-        shown = identity.trusted_context(session_id=effective_session, actor_origin="assistant_visible", mutation=True)
-        notice = self.opened_by_host(turn_id, user_content)
-        if not notice and not user_captured:
-            notice = sync_host_notice(messages, user_content)
-        opened = (
-            identity.trusted_context(session_id=effective_session, actor_origin="host_generated", mutation=True)
-            if notice
-            else context
+        # The context of the person's steers and redirects (``_write_aside``): their own words.
+        context = identity.trusted_context(
+            session_id=effective_session, actor_origin=identity.person_origin, mutation=True
         )
+        shown = identity.trusted_context(session_id=effective_session, actor_origin="assistant_visible", mutation=True)
+        origin = self.remembered_origin(turn_id, user_content)
+        if origin is None:
+            # A captured opener is not written again; this context only matters for an uncaptured opener.
+            origin = (
+                identity.person_origin if user_captured else _opener_origin(identity, messages, user_content, sync=True)
+            )
+        opened = identity.trusted_context(session_id=effective_session, actor_origin=origin, mutation=True)
         self.flush_completed(through=through)
         self._write_aside(_said_aside(identity, messages), identity, context, effective_session, "sync_turn")
         self._write_turn(identity, opened, shown, effective_session, turn_id, user_content, assistant_content, said_at)
@@ -774,7 +815,10 @@ class TurnCapture:
             effective_session = session_id or identity.session_id
         found = _steers(identity, messages) if typed_only else _said_aside(identity, messages)
         if found:
-            context = identity.trusted_context(session_id=effective_session, mutation=True)
+            # The context of the person's steers and redirects; unanswered rows get one of their own (``_write_aside``).
+            context = identity.trusted_context(
+                session_id=effective_session, actor_origin=identity.person_origin, mutation=True
+            )
             self._write_aside(found, identity, context, effective_session, hook, deadline)
 
     def _write_aside(self, found, identity, context, session_id: str, hook: str, deadline: float | None = None) -> None:

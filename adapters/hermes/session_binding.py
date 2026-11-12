@@ -116,7 +116,7 @@ class SessionBinding:
                 self._adapter._active_turn_id = ""
                 self._adapter._turns.reset_binding()
                 self._adapter._turns.clear_completed()
-                self._adapter._notice_turns.clear()
+                self._adapter._opener_origins.clear()
                 self._adapter._user_captured_turns.clear()
             self._adapter._session_watermark = 0
             self._adapter._turns.reset_source_refs()
@@ -198,7 +198,7 @@ class SessionBinding:
                 # late finds no turn to keep its copy for.
                 self._adapter._active_turn_id = ""
                 self._adapter._turns.clear_completed()
-                self._adapter._notice_turns.clear()
+                self._adapter._opener_origins.clear()
                 self._adapter._user_captured_turns.clear()
         self._adapter._identity = fresh
         runtime_audience = fresh.runtime_audience

@@ -95,17 +95,27 @@ class NoticeSyncTests(unittest.TestCase):
         self.assertEqual(self.finish(history), "host_generated")
 
     def test_missing_pre_llm_history_cache_uses_completed_history(self):
-        self.assertFalse(self.provider._turns.note_opener("TEST-turn", [], NOTICE))
+        # Without rows in view the request falls back to the person; that fallback is not kept for later callbacks.
+        self.assertEqual(
+            self.provider._turns.note_opener("TEST-turn", [], NOTICE, self.provider._identity), "human_direct"
+        )
+        self.assertIsNone(self.provider._turns.remembered_origin("TEST-turn", NOTICE))
         self.assertEqual(self.finish([notice_row(), {"role": "assistant", "content": ANSWER}]), "host_generated")
 
     def test_existing_host_cache_remains_authoritative_without_history(self):
-        self.assertTrue(self.provider._turns.note_opener("TEST-turn", [notice_row()], NOTICE))
+        self.assertEqual(
+            self.provider._turns.note_opener("TEST-turn", [notice_row()], NOTICE, self.provider._identity),
+            "host_generated",
+        )
         self.assertEqual(self.finish(None), "host_generated")
 
     def _assert_notice_and_steer_origins(self, *, cached, words="TEST please keep both origins separate"):
         """A completed turn keeps its opener and a later human message as distinct sources."""
         if cached:
-            self.assertTrue(self.provider._turns.note_opener("TEST-turn", [notice_row()], NOTICE))
+            self.assertEqual(
+                self.provider._turns.note_opener("TEST-turn", [notice_row()], NOTICE, self.provider._identity),
+                "host_generated",
+            )
         steer = {
             "role": "user",
             "display_kind": "steer",
@@ -139,7 +149,10 @@ class NoticeSyncTests(unittest.TestCase):
         self._assert_notice_and_steer_origins(cached=False, words="[Background process report] TEST human follow-up")
 
     def test_unrecognized_folded_steer_blocks_older_notice(self):
-        from scope_recall.adapters.hermes.boundary import sync_host_notice
+        from scope_recall.adapters.hermes.boundary import sync_opener_origin
+
+        def sync_host_notice(history, message):
+            return sync_opener_origin(history, message, local_surface=True) == "host_generated"
 
         steer = {
             "role": "user",
@@ -173,7 +186,10 @@ class NoticeSyncTests(unittest.TestCase):
         self.assertEqual(self.finish(history), "human_direct")
 
     def test_wrapped_same_text_steer_does_not_reuse_old_notice(self):
-        from scope_recall.adapters.hermes.boundary import sync_host_notice
+        from scope_recall.adapters.hermes.boundary import sync_opener_origin
+
+        def sync_host_notice(history, message):
+            return sync_opener_origin(history, message, local_surface=True) == "host_generated"
 
         steer = {
             "role": "user",
@@ -187,7 +203,10 @@ class NoticeSyncTests(unittest.TestCase):
         self.assertFalse(sync_host_notice([*history, {"role": "assistant", "content": ANSWER}], NOTICE))
 
     def test_empty_human_row_blocks_older_folded_notice(self):
-        from scope_recall.adapters.hermes.boundary import sync_host_notice
+        from scope_recall.adapters.hermes.boundary import sync_opener_origin
+
+        def sync_host_notice(history, message):
+            return sync_opener_origin(history, message, local_surface=True) == "host_generated"
 
         history = [
             self.folded(NOTICE),
@@ -208,7 +227,8 @@ class NoticeSyncTests(unittest.TestCase):
             conversation_history=[{"role": "user", "content": NOTICE}],
         )
         with patch(
-            "scope_recall.adapters.hermes.turn_capture.sync_host_notice", side_effect=AssertionError("already captured")
+            "scope_recall.adapters.hermes.turn_capture.sync_opener_origin",
+            side_effect=AssertionError("already captured"),
         ):
             self.assertEqual(self.finish([notice_row(), {"role": "assistant", "content": ANSWER}]), "human_direct")
 
@@ -230,12 +250,17 @@ class NoticeSyncTests(unittest.TestCase):
         ]
         self.assertEqual(self.finish(history), "human_direct")
 
-    def test_human_pasted_notice_has_no_host_authority(self):
+    def test_known_notice_prefix_is_host_generated(self):
         text = "[IMPORTANT: Background process TEST finished]"
         self.assertEqual(
             self.finish([{"role": "user", "content": text}, {"role": "assistant", "content": ANSWER}], text),
-            "human_direct",
+            "host_generated",
         )
+
+    def test_human_pasted_notice_in_a_delivered_message_has_no_host_authority(self):
+        text = "[IMPORTANT: Background process TEST finished]"
+        row = {"role": "user", "content": text, "platform_message_id": "TEST-id"}
+        self.assertEqual(self.finish([row, {"role": "assistant", "content": ANSWER}], text), "human_direct")
 
     def test_steer_kind_is_not_host_authority(self):
         self.assertEqual(
@@ -264,7 +289,10 @@ class NoticeSyncTests(unittest.TestCase):
         self.assertEqual(self.finish([row, {"role": "assistant", "content": ANSWER}]), "human_direct")
 
     def test_invalid_timestamp_does_not_strip_presentation(self):
-        from scope_recall.adapters.hermes.boundary import sync_host_notice
+        from scope_recall.adapters.hermes.boundary import sync_opener_origin
+
+        def sync_host_notice(history, message):
+            return sync_opener_origin(history, message, local_surface=True) == "host_generated"
 
         for stamp in (None, True, "1793577600", 0, -1, float("nan"), float("inf"), 1e300):
             with self.subTest(timestamp=stamp):
@@ -288,7 +316,10 @@ class NoticeSyncTests(unittest.TestCase):
         self.assertEqual(self.finish(None), "human_direct")
 
     def test_unknown_tail_role_refuses_even_folded_notice(self):
-        from scope_recall.adapters.hermes.boundary import sync_host_notice
+        from scope_recall.adapters.hermes.boundary import sync_opener_origin
+
+        def sync_host_notice(history, message):
+            return sync_opener_origin(history, message, local_surface=True) == "host_generated"
 
         row = self.folded(NOTICE)
         for tail in ({"role": "system", "content": "TEST unknown"}, {"role": "unknown"}, {}, None):
@@ -378,7 +409,10 @@ def test_native_tool_boundary_preserves_notice_and_human_origins(adapter, hermes
 
 def test_same_text_steer_after_tools_cannot_cross_a_completed_turn():
     """A completed reply still fences off an earlier notice when later tool rows exist."""
-    from scope_recall.adapters.hermes.boundary import sync_host_notice
+    from scope_recall.adapters.hermes.boundary import sync_opener_origin
+
+    def sync_host_notice(history, message):
+        return sync_opener_origin(history, message, local_surface=True) == "host_generated"
 
     history = [
         notice_row(),
