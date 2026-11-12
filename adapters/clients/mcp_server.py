@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -312,13 +313,16 @@ class CodexMCPServer:
             self._host_runtime.rebind_session(thread_id, self.audience.allowed_scope_ids)
         # Codex Hook stores the raw host session_id; MCP must use the same
         # value so Core current_human evidence can interoperate.
-        return trusted_context(
-            self.config,
-            self.audience,
-            session_id=thread_id,
-            actor_origin=origin,
-            mutation=mutation,
-            project_root=str(self.workspace),
+        return replace(
+            trusted_context(
+                self.config,
+                self.audience,
+                session_id=thread_id,
+                actor_origin=origin,
+                mutation=mutation,
+                project_root=str(self.workspace),
+            ),
+            subject_resolver=self.context.subject_resolver,
         )
 
     def _capability_gaps(self, ctx: Context) -> tuple[str, ...]:

@@ -5,9 +5,13 @@ locks (``self._adapter``) and writes through the adapter's ``CaptureWriter``."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 import time
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from scope_recall.contracts import ContractError
@@ -38,14 +42,18 @@ from .capture import CAPTURE_TIMEOUT_S, GAP_CURRENT_SOURCE_REFS_LIMIT
 from .tool_surface import TOOL_NAMES
 
 if TYPE_CHECKING:
+    from .identity import HermesIdentity
     from .provider import ScopeRecallHermesAdapter
 
 #: The adapter's log name, the provider module's, which this module logs under as well: a host writes it into each
 #: line, and a logging configuration may name it.
 _log = logging.getLogger("scope_recall.adapters.hermes.provider")
 
-#: Turns whose opening message ``pre_llm_call`` stored, remembered across a compression's session switch.
+#: Recent openers captured, excluded as controls or terminally refused for privacy; retained across compression.
 _USER_CAPTURED_TURNS = 64
+#: Completed snapshots cover the same recent-turn window as opener deduplication. A skipped memory task must
+#: not retain an unbounded conversation; eviction reports a gap rather than silently losing an observation.
+_CACHED_TURNS = _USER_CAPTURED_TURNS
 #: What one turn showed between tool calls, written message by message after the reply: the first ones are
 #: kept, the answer is always written, and a turn past this says so (``capture_gap:interim_limit``).  With no
 #: bound a turn of three hundred tool steps would hold the adapter lock for minutes while each waited for the store.
@@ -53,9 +61,8 @@ _INTERIM_PER_TURN = 64
 #: Steers this process wrote or found stored, by their key: read again at every turn's end, compression and session
 #: end, each is looked up and written once.
 _STEERS_WRITTEN = 4096
-#: How long one hook spends on the steers it reads, the look-up and the writes.  A steer it has no time left for is kept
-#: to retry without a store call (``CaptureWriter.defer``), and the hook returns: the buffer's next pass, the next hook
-#: or, past a shutdown, the next start writes it.
+#: Soft store-admission budget for a steer pass. Parsing and lock reacquisition can extend the whole callback;
+#: captures without admission time are deferred to the existing retry path.
 _STEERS_SECONDS = 2.0
 
 
@@ -69,7 +76,7 @@ def direct_owner_cli(identity) -> bool:
 
 
 def steer_deadline() -> float:
-    """When a hook that starts now must be done with the steers it reads (``_STEERS_SECONDS``)."""
+    """End of a new steer pass's soft store-admission budget (``_STEERS_SECONDS``)."""
     return time.monotonic() + _STEERS_SECONDS
 
 
@@ -129,22 +136,171 @@ def _is_memory_tool_name(tool_name: object) -> bool:
     return _is_scope_recall_tool_name(tool_name) or (type(tool_name) is str and tool_name in _HOST_MEMORY_TOOL_NAMES)
 
 
+#: Said when Hermes sends an inference request for a turn it opened (``pre_llm_call``) and never started
+#: (``on_turn_start``).  A context that still carries the turn before it then hands that turn's binding to the
+#: completion that follows, which is stored under the earlier turn or taken for a repeat of it.
+TURN_START_MISSING_GAP = "capture_gap:turn_start_missing"
+
+
+def _text_digest(message: object) -> str:
+    """A message's words, whitespace aside: the start receives flattened text, the hooks the content parts."""
+    return hashlib.sha256(" ".join(extract_user_text(message).split()).encode()).hexdigest()
+
+
+@dataclass
+class _TurnBinding:
+    """Content-free turn identity carried by Hermes' copied background context.
+
+    Only the inline host start creates this object. The turn's own request corrects its UUID in place so copied
+    contexts share the correction; ``started_with`` (``_text_digest``) is how that request is known.  Starting
+    another turn leaves queued work's object intact.
+    """
+
+    identity: HermesIdentity
+    turn_id: str
+    sequence: int
+    started_with: str
+    confirmed: bool = False
+    delivery: str | None = None
+
+
+@dataclass(frozen=True)
+class _Opening:
+    """The latest accepted opening hook, including host-proven origin when admission was skipped."""
+
+    turn_id: str
+    skipped: bool
+    notice: bool
+
+
+@dataclass(frozen=True)
+class _CompletedTurn:
+    """The original identity, session and start order of both completed-message caches."""
+
+    identity: HermesIdentity
+    session_id: str
+    turn_id: str
+    sequence: int
+
+
 class TurnCapture:
-    """A Hermes adapter's turns; one per adapter."""
+    """A Hermes adapter's turns; one per adapter.
+
+    Each adapter owns its ContextVar so nested providers in one host context cannot replace each other's turn.
+    A long-lived context retains that variable and its last binding, including the immutable identity. Shutdown
+    clears the calling context; copies already queued by the host retain their bindings until those copies end.
+    """
 
     def __init__(self, adapter: ScopeRecallHermesAdapter) -> None:
         self._adapter = adapter
+        self._sync_binding: ContextVar[_TurnBinding | None] = ContextVar("hermes_capture_turn", default=None)
+        self._current_binding: _TurnBinding | None = None
+        self._sequence = 0
+        self._known_turns: dict[str, _TurnBinding] = {}
+        self._completed: dict[str, _CompletedTurn] = {}
+        self._opening: _Opening | None = None
+        self._opening_count = 0
+        self._last_start: int | None = None
+        self.capture_gaps: tuple[str, ...] = ()
+
+    # All turn identity state uses _said_lock. A delivered or skipped opening replaces the pending record;
+    # replay of the latest or already started UUID contributes no additional input to the host ordinal count.
+    # Only delivered openings change active state. Known older openings cannot change either. Start always clears
+    # the record and creates the sole context binding; claiming requires ordinals to account for every opener.
+    # The first start may claim without an ordinal baseline, but skipped text needs ordinal or explicit UUID proof.
+    # A request can confirm only the current, unconfirmed object carried by its host context, and give it another
+    # UUID only with the text the turn started with; any other request writes nothing and changes no state, and one
+    # for an opening no start claimed is reported. Post always witnesses time before applying that proof and
+    # caches bodies only for the active UUID. Sync snapshots its carried binding, accepting one completion
+    # payload per object; a missing or reused binding uses the active baseline identity. Sync alone drains
+    # completed bodies with their original metadata. Reset clears caller state, leaving queued copies intact.
+    def bind_turn(self, turn_id: str, message: object, *, confirmed: bool = False) -> None:
+        """Bind the inline start's caller under the observation lock; only the host start creates bindings."""
+        self._sequence += 1
+        self._current_binding = _TurnBinding(
+            self._adapter._require_identity(), turn_id, self._sequence, _text_digest(message), confirmed
+        )
+        self._remember_binding(turn_id, self._current_binding)
+        self._sync_binding.set(self._current_binding)
+
+    def reset_binding(self) -> None:
+        """Clear the caller's binding on a fresh session without altering queued contexts."""
+        with self._adapter._said_lock:
+            self._current_binding = None
+            self._sync_binding.set(None)
+            self._known_turns.clear()
+            self._opening = None
+            self._opening_count = 0
+            self._last_start = None
+
+    def _remember_binding(self, turn_id: str, binding: _TurnBinding) -> None:
+        """Keep a bounded witness of UUIDs already claimed by a started turn, including corrected aliases."""
+        self._known_turns[turn_id] = binding
+        while len(self._known_turns) > _USER_CAPTURED_TURNS:
+            self._known_turns.pop(next(iter(self._known_turns)))
+
+    def _late_opening(self, turn_id: str) -> bool:
+        """Recognize recent older opening UUIDs; worker contexts cannot establish a new opener's order."""
+        known = self._known_turns.get(turn_id)
+        return known is not None and (known is not self._current_binding or known.turn_id != turn_id)
+
+    def note_skipped(self, kwargs: dict) -> None:
+        """Keep the skipped UUID and host-proven origin atomically without retaining another user body."""
+        turn_id = str(kwargs.get("turn_id") or "").strip()
+        notice = host_notice(kwargs.get("conversation_history"), kwargs.get("user_message"))
+        with self._adapter._said_lock:
+            if not turn_id or self._late_opening(turn_id):
+                return
+            self._note_opening(turn_id, skipped=True, notice=notice)
+            self._note_origin(turn_id, notice, kwargs.get("user_message"))
+
+    def _note_opening(self, turn_id: str, *, skipped: bool, notice: bool) -> None:
+        """Replace the candidate under the observation lock; latest or already started openings are replays."""
+        binding = self._current_binding
+        if (binding is None or binding.turn_id != turn_id) and (
+            self._opening is None or self._opening.turn_id != turn_id
+        ):
+            self._opening_count += 1
+        self._opening = _Opening(turn_id, skipped, notice)
+
+    def _request_binding(self, turn_id: str, message: object) -> _TurnBinding | None:
+        """The started turn's binding when a request hook is that turn's own, settling its UUID; else None.
+
+        Hermes sends the request hooks for every inference made under the session.  A review it runs after a
+        reply (``agent/background_review.py``) shares the session, copies the finished turn's context and has a
+        turn id of its own, with no opening hook and no start.  So the carried object says nothing about an unknown
+        UUID: a turn not yet confirmed takes one only from a request with the text it started with.  Hermes scrubs
+        secrets from the start's text alone; such a turn keeps the id its start chose.
+        """
+        with self._adapter._said_lock:
+            binding = self._current_binding
+            if not turn_id or binding is None or self._sync_binding.get() is not binding:
+                return None
+            if binding.turn_id != turn_id:
+                if binding.confirmed or binding.started_with != _text_digest(message):
+                    return None
+                self.reset_source_refs()
+                binding.turn_id = turn_id
+            if not binding.confirmed:
+                binding.confirmed = True
+                self._remember_binding(turn_id, binding)
+            self._adapter._active_turn_id = turn_id
+            return binding
 
     def note_opener(self, turn_id: str, history: object, user_message: object) -> bool:
         """Remember whether Hermes opened ``turn_id`` itself (``host_notice``), and with which text; True if it did."""
         notice = host_notice(history, user_message)
         with self._adapter._said_lock:
-            self._adapter._notice_turns.pop(turn_id, None)
-            if notice:
-                self._adapter._notice_turns[turn_id] = extract_user_text(user_message).strip()
-                while len(self._adapter._notice_turns) > _USER_CAPTURED_TURNS:
-                    self._adapter._notice_turns.pop(next(iter(self._adapter._notice_turns)))
+            self._note_origin(turn_id, notice, user_message)
         return notice
+
+    def _note_origin(self, turn_id: str, notice: bool, message: object) -> None:
+        """Retain the host's typed opening classification under the observation lock."""
+        self._adapter._notice_turns.pop(turn_id, None)
+        if notice:
+            self._adapter._notice_turns[turn_id] = extract_user_text(message).strip()
+            while len(self._adapter._notice_turns) > _USER_CAPTURED_TURNS:
+                self._adapter._notice_turns.pop(next(iter(self._adapter._notice_turns)))
 
     def opened_by_host(self, turn_id: str, user_content: str) -> bool:
         """Whether ``user_content`` is the message Hermes opened ``turn_id`` with."""
@@ -153,56 +309,108 @@ class TurnCapture:
         return opener is not None and opener == user_content.strip()
 
     def start(self, turn_number: int, message: str, **kwargs) -> None:
-        self._adapter._turn_counter = int(turn_number)
-        ordinal_turn_id = str(kwargs.get("turn_id") or turn_number)
-        skipped, self._adapter._skipped_turn_id = self._adapter._skipped_turn_id, None
-        if skipped and not kwargs.get("turn_id") and not self._adapter._pre_llm_pending:
-            # This turn's pre_llm_call was skipped (``HostBackpressure.busy``): its turn id is the one the turn is
-            # known by.
-            ordinal_turn_id = skipped
-        # Hermes calls this after pre_llm_call. Preserve that UUID and its
-        # current-source fence until prefetch/sync consume this turn. If no
-        # UUID arrived, the ordinal is the bounded fallback.
-        if not self._adapter._pre_llm_pending:
-            if ordinal_turn_id != self._adapter._active_turn_id:
+        """Associate the inline host start with its pre-hook UUID and recover a busy hook's input."""
+        with self._adapter._said_lock:
+            number = int(turn_number)
+            opening, count = self._opening, self._opening_count
+            accounted = count == number - (self._last_start or 0)
+            claimed = opening if self._last_start is None or accounted else None
+            self._opening, self._opening_count, self._last_start = None, 0, number
+            self._adapter._turn_counter = number
+            explicit = str(kwargs.get("turn_id") or "")
+            turn_id = explicit or (claimed.turn_id if claimed else "") or str(number)
+            if turn_id != self._adapter._active_turn_id:
                 self.reset_source_refs()
-            self._adapter._active_turn_id = ordinal_turn_id
+            self._adapter._active_turn_id = turn_id
+            self.bind_turn(turn_id, message, confirmed=bool(explicit))
+            skipped = bool(claimed and claimed.skipped and claimed.turn_id == turn_id)
+            recover = skipped and (accounted or explicit == turn_id)
+            notice = bool(claimed and skipped and claimed.notice)
+            if skipped:
+                # Host redaction may change the body between the hook and the
+                # inline callback. Its typed origin survives that transformation.
+                self._note_origin(turn_id, notice, message)
         session_id = self._adapter._effective_session_id(str(kwargs.get("session_id") or ""))
-        pending = self._adapter._pending_private_receipt
-        stored_session = self._adapter._require_identity().stored_session_id(session_id)
-        if pending is not None and pending[0] == stored_session:
-            removed = self._adapter._private_span_receipts.pop(pending, 0)
-            if removed:
-                self._adapter._private_span_receipts[(stored_session, self._adapter._active_turn_id)] = removed
-            self._adapter._pending_private_receipt = None
+        with self._adapter._said_lock:
+            pending = self._adapter._pending_private_receipt
+            stored_session = self._adapter._require_identity().stored_session_id(session_id)
+            if pending is not None and pending[0] == stored_session:
+                removed = self._adapter._private_span_receipts.pop(pending, 0)
+                if removed:
+                    self._adapter._private_span_receipts[(stored_session, turn_id)] = removed
+                self._adapter._pending_private_receipt = None
         if type(message) is str and message:
             self._adapter._current_task_message = without_private(message)[0][:8192]
-        self._adapter._outcomes.open_turn(session_id, self._adapter._active_turn_id)
+        self._adapter._outcomes.open_turn(session_id, turn_id)
+        if recover:
+            self._capture_opener(
+                dict(session_id=session_id, turn_id=turn_id, user_message=message), notice=notice, current=True
+            )
 
-    def pre_llm(self, **kwargs) -> None:
-        """Capture raw current input only; never inject a second recall context."""
+    def pre_api(self, **kwargs) -> bool:
+        """Recover the started turn's missing opener before inference, under the request's UUID; True for that turn.
 
-        identity = self._adapter._require_identity()
+        Any other request writes nothing (``_request_binding``): a review's prompt would be stored as the person's
+        words.  An earlier turn's late request loses nothing by it, its completion writes the message.
+        """
+        turn_id = str(kwargs.get("turn_id") or "").strip()
+        binding = self._request_binding(turn_id, kwargs.get("user_message"))
+        if binding is None:
+            with self._adapter._said_lock:
+                if turn_id and self._opening is not None and self._opening.turn_id == turn_id:
+                    self._note_gap(TURN_START_MISSING_GAP)
+            return False
+        notice = self.opened_by_host(turn_id, extract_user_text(kwargs.get("user_message"))) or host_notice(
+            kwargs.get("conversation_history"), kwargs.get("user_message")
+        )
+        self._capture_opener(kwargs, notice=notice, current=True, bound=binding.identity)
+        return True
+
+    def pre_llm(self, **kwargs) -> bool:
+        """Observe an opener UUID without binding the helper thread's context to a new turn."""
+        with self._adapter._said_lock:
+            supplied = str(kwargs.get("turn_id") or "").strip()
+            turn_id = supplied or self._adapter._active_turn_id or str(self._adapter._turn_counter or "turn")
+            current = not self._late_opening(turn_id)
+            if current:
+                if turn_id != self._adapter._active_turn_id:
+                    self.reset_source_refs()
+                self._adapter._active_turn_id = turn_id
+                self._note_opening(supplied, skipped=False, notice=False)
+            carried = self._sync_binding.get()
+            identity = carried.identity if not current and carried else self._adapter._require_identity()
+        if current:
+            session = self._adapter._effective_session_id(str(kwargs.get("session_id") or ""))
+            self._adapter._outcomes.open_turn(session, turn_id)
+            message = kwargs.get("user_message")
+            if type(message) is str and message:
+                self._adapter._current_task_message = without_private(message)[0][:8192]
+            notice = self.opened_by_host(turn_id, extract_user_text(message)) or self.note_opener(
+                turn_id, kwargs.get("conversation_history"), message
+            )
+        else:
+            notice = host_notice(kwargs.get("conversation_history"), kwargs.get("user_message"))
+        self._capture_opener(dict(kwargs, turn_id=turn_id), notice=notice, current=current, bound=identity)
+        return current
+
+    def _capture_opener(self, kwargs: dict, *, notice: bool, current: bool, bound=None) -> None:
+        """Store a delivered opener under its UUID; late delivery cannot alter active bookkeeping."""
+        identity = bound or self._adapter._require_identity()
+        turn_id = str(kwargs.get("turn_id") or "turn")
+        with self._adapter._said_lock:
+            if turn_id in self._adapter._user_captured_turns:
+                return
         if identity.read_only or not identity.runtime_audience.allowed_scope_ids:
             self._adapter._diagnostics.capability_gaps = identity.runtime_audience.capability_gaps
             return
-        session_id = self._adapter._effective_session_id(str(kwargs.get("session_id") or ""))
-        supplied_turn_id = str(kwargs.get("turn_id") or "").strip()
-        turn_id = supplied_turn_id or self._adapter._active_turn_id or str(self._adapter._turn_counter or "turn")
-        if supplied_turn_id and supplied_turn_id != self._adapter._active_turn_id:
-            self.reset_source_refs()
-            self._adapter._active_turn_id = supplied_turn_id
-        self._adapter._pre_llm_pending = bool(supplied_turn_id)
-        self._adapter._outcomes.open_turn(session_id, turn_id)
+        session_id = str(kwargs.get("session_id") or identity.session_id)
         current_message = kwargs.get("user_message")
-        if type(current_message) is str and current_message:
-            self._adapter._current_task_message = without_private(current_message)[0][:8192]
-        notice = self.note_opener(turn_id, kwargs.get("conversation_history"), current_message)
         context = identity.trusted_context(
             session_id=session_id, actor_origin="host_generated" if notice else None, mutation=True
         )
         if (
-            direct_owner_cli(identity)
+            current
+            and direct_owner_cli(identity)
             and context.actor_origin == "human_direct"
             and private.parse_recording_command(current_message)
             and kwargs.get("attachments") in (None, [])
@@ -212,7 +420,8 @@ class TurnCapture:
                 private.open_interval(core.storage, core.clock, context, target="session", session=context.session_id)
             else:
                 private.close_interval(core.storage, core.clock, context, target="session", session=context.session_id)
-            self._adapter._user_captured_turns[turn_id] = None
+            with self._adapter._said_lock:
+                self._adapter._user_captured_turns[turn_id] = None
             return
         event, gaps, ledger_identity = pre_llm_source_event(
             self._adapter._ledger,
@@ -231,14 +440,25 @@ class TurnCapture:
             identity=ledger_identity,
             gaps=gaps,
             scope_id=identity.local_scope_id,
+            bound=identity,
+            opener_turn_id=turn_id,
         )
-        if receipt is not None and any(gap.startswith("private_spans_removed:") for gap in receipt.gaps):
-            self._adapter._pending_private_receipt = (context.session_id, self._adapter._active_turn_id)
-        if receipt is not None and receipt.durability in ("persisted", "queued"):
-            self._adapter._user_captured_turns.pop(turn_id, None)
-            self._adapter._user_captured_turns[turn_id] = None
-            while len(self._adapter._user_captured_turns) > _USER_CAPTURED_TURNS:
-                self._adapter._user_captured_turns.pop(next(iter(self._adapter._user_captured_turns)))
+        with self._adapter._said_lock:
+            if (
+                current
+                and receipt is not None
+                and any(gap.startswith("private_spans_removed:") for gap in receipt.gaps)
+            ):
+                self._adapter._pending_private_receipt = (context.session_id, turn_id)
+            if receipt is not None and (
+                receipt.durability in ("persisted", "queued") or receipt.error_code == "PRIVATE_MODE"
+            ):
+                # An explicit privacy refusal settles this opener just as a durable capture does. Its original
+                # ledger witness remains, while temporary failures may be retried by the next request.
+                self._adapter._user_captured_turns.pop(turn_id, None)
+                self._adapter._user_captured_turns[turn_id] = None
+                while len(self._adapter._user_captured_turns) > _USER_CAPTURED_TURNS:
+                    self._adapter._user_captured_turns.pop(next(iter(self._adapter._user_captured_turns)))
 
     def tool_result(self, **kwargs) -> None:
         """Capture one tool result; the caller holds ``_lock`` exactly once, and the store I/O runs without it.
@@ -317,22 +537,26 @@ class TurnCapture:
         the adapter lock the reply would wait behind whatever held it, a capture on a busy store or a recall, and
         a callback Hermes gives up on is then skipped for a minute, for every session (Hermes 0.21.5).
         """
-        identity = self._adapter._require_identity()
-        if identity.read_only or not identity.runtime_audience.allowed_scope_ids:
-            return
         turn_id = str(kwargs.get("turn_id") or "").strip()
         if not turn_id:
+            return
+        with self._adapter._said_lock:
+            carried = self._sync_binding.get()
+            identity = carried.identity if carried else self._adapter._require_identity()
+            sequence = carried.sequence if carried else self._sequence
+        if identity.read_only or not identity.runtime_audience.allowed_scope_ids:
             return
         answer = kwargs.get("assistant_response")
         history = kwargs.get("conversation_history")
         observed_at = self._adapter._utc_now()
-        session = self._adapter._effective_session_id(str(kwargs.get("session_id") or ""))
+        session = str(kwargs.get("session_id") or identity.session_id)
         context = identity.trusted_context(session_id=session)
         # The ledger keeps only identity and first-observation times. Even a
         # refused reply needs that witness so delayed sync cannot date it anew.
         if isinstance(answer, str) and answer.strip():
             key = sync_assistant_key(context, session, turn_id)
             self._adapter._ledger.witness((key, 1), observed_at, observed_at)
+        self._request_binding(turn_id, kwargs.get("user_message"))
         # Conversation history is retrospective. Only a host timestamp or an
         # earlier witness establishes when its message occurred.
         said = tuple(
@@ -352,7 +576,7 @@ class TurnCapture:
                     (steer_source_key(context, steer), 1), observed_at, steer.occurred_at
                 )[1]
             )
-            for steer in _said_aside(identity, history)
+            for steer in _steers(identity, history)
         )
         try:
             check = self._adapter._require_core().private_check
@@ -373,6 +597,57 @@ class TurnCapture:
                 self._adapter._interim_said[turn_id] = said
             if steered:
                 self._adapter._steer_said[turn_id] = steered
+            if said or steered:
+                self._completed[turn_id] = _CompletedTurn(identity, session, turn_id, sequence)
+                while len(self._completed) > _CACHED_TURNS:
+                    oldest = min(self._completed, key=lambda key: self._completed[key].sequence)
+                    self._completed.pop(oldest)
+                    self._adapter._interim_said.pop(oldest, None)
+                    self._adapter._steer_said.pop(oldest, None)
+                    self._note_gap("capture_gap:completed_turn_cache_limit")
+
+    def _note_gap(self, gap: str) -> None:
+        """Keep a turn diagnostic across outcome updates; the caller holds the observation lock."""
+        self.capture_gaps = tuple(dict.fromkeys((*self.capture_gaps, gap)))
+        self._adapter._merge_gaps((gap,))
+
+    def clear_completed(self) -> None:
+        """Clear both message caches and their owners; the caller holds the small observation lock."""
+        self._completed.clear()
+        self._adapter._interim_said.clear()
+        self._adapter._steer_said.clear()
+
+    def flush_completed(self, *, through: int | None = None) -> None:
+        """Write completed snapshots in start order under their original identities.
+
+        A bound sync passes its start sequence so later turns remain untouched; an unbound sync drains all. The caller
+        holds the sync lock, without an outer adapter-lock hold, so per-message writes may release that lock.
+        """
+        adapter = self._adapter
+        with adapter._said_lock:
+            ready = sorted(
+                (item for item in self._completed.values() if through is None or item.sequence <= through),
+                key=lambda item: item.sequence,
+            )
+        for item in ready:
+            with adapter._said_lock:
+                if self._completed.get(item.turn_id) is not item:
+                    continue
+                self._completed.pop(item.turn_id)
+                said = adapter._interim_said.pop(item.turn_id, ())
+                steers = adapter._steer_said.pop(item.turn_id, ())
+            identity = item.identity
+            shown = identity.trusted_context(
+                session_id=item.session_id, actor_origin="assistant_visible", mutation=True
+            )
+            limited = self._write_messages(
+                interim_source_event, {item.turn_id: said}, identity, shown, item.session_id, limit=_INTERIM_PER_TURN
+            )
+            context = identity.trusted_context(session_id=item.session_id, mutation=True)
+            self._write_steers(steers, identity, context, "completed_turn")
+            if limited:
+                with adapter._lock, adapter._said_lock:
+                    self._note_gap("capture_gap:interim_limit")
 
     def sync(self, user_content: str, assistant_content: str, *, session_id: str, messages: object = None) -> None:
         """Write the finished turn one capture per hold of the lock, each one's store I/O without it.
@@ -386,16 +661,29 @@ class TurnCapture:
         """
         adapter = self._adapter
         with adapter._lock:
-            identity = adapter._require_identity()
+            with adapter._said_lock:
+                binding = self._sync_binding.get()
+                # This digest only detects reuse of a stale context object. It never becomes an event key or
+                # a time witness: missing starts retain the host adapter's baseline fallback semantics.
+                delivery = hashlib.sha256(
+                    json.dumps([session_id, user_content, assistant_content]).encode()
+                ).hexdigest()
+                if binding is not None and binding.delivery not in (None, delivery):
+                    binding = None
+                if binding is not None:
+                    binding.delivery = delivery
+                identity = binding.identity if binding else adapter._require_identity()
+                turn_id = (
+                    binding.turn_id if binding else adapter._active_turn_id or str(adapter._turn_counter or "turn")
+                )
+                through = binding.sequence if binding else None
+                user_captured = turn_id in adapter._user_captured_turns
             if identity.read_only:
                 return
             # The turn's message and reply are dated when its writing begins: dated as each is reached, the reply
             # could come after the next turn's message, written between this turn's captures.
             said_at = adapter._utc_now()
-            effective_session = adapter._effective_session_id(session_id)
-            active_turn = adapter._active_turn_id
-            turn_id = active_turn or str(adapter._turn_counter or "turn")
-            user_captured = turn_id in adapter._user_captured_turns
+            effective_session = session_id or identity.session_id
             if not identity.runtime_audience.allowed_scope_ids:
                 adapter._diagnostics.capability_gaps = identity.runtime_audience.capability_gaps
                 return
@@ -409,32 +697,16 @@ class TurnCapture:
             if notice
             else context
         )
-        with adapter._said_lock:
-            interim, adapter._interim_said = adapter._interim_said, {}
-            steers, adapter._steer_said = adapter._steer_said, {}
-        limited = self._write_messages(
-            interim_source_event,
-            interim,
-            identity,
-            shown,
-            effective_session,
-            limit=_INTERIM_PER_TURN,
-        )
-        # The conversation sync_turn is handed, and what post_llm_call kept when it was not.
-        steered = [steer for said in steers.values() for steer in said]
-        self._write_steers([*steered, *_said_aside(identity, messages)], identity, context, "sync_turn")
+        self.flush_completed(through=through)
+        self._write_steers(_said_aside(identity, messages), identity, context, "sync_turn")
         self._write_turn(identity, opened, shown, effective_session, turn_id, user_content, assistant_content, said_at)
         # Hermes runs this on its memory worker, after the reply: the place to write again what a busy store kept in
         # memory, once the turn's own sources are written.  Before them, a pass over a store that cannot take the
         # buffer would hold the turn's message and reply back by its whole time.
         adapter._retry.write_buffered(release=True)
-        with adapter._lock:
-            if adapter._active_turn_id == active_turn:
-                # The next turn may have begun between these writes; its pre_llm marker is its own.
-                adapter._pre_llm_pending = False
+        with adapter._lock, adapter._said_lock:
             adapter._diagnostics.pending_outcome_gaps = adapter._outcomes.pending_gaps()
-            if limited:
-                adapter._merge_gaps(("capture_gap:interim_limit",))
+            adapter._merge_gaps(self.capture_gaps)
 
     def _write_messages(self, make_event, messages: dict, identity, context, session_id: str, *, limit=None) -> bool:
         """Each message of each turn (what the model showed between tool calls, or what the person sent while the turn
@@ -475,18 +747,29 @@ class TurnCapture:
                         )
         return limited
 
-    def steers(self, messages: object, *, session_id: str = "", hook: str, deadline: float | None = None) -> None:
+    def steers(
+        self,
+        messages: object,
+        *,
+        session_id: str = "",
+        hook: str,
+        deadline: float | None = None,
+        bound=None,
+        typed_only: bool = False,
+    ) -> None:
         """Write now what the person sent while turns ran (``person_steers``) in ``messages``: a compression is
         about to take them out of the conversation, or the session ends, and no turn's end may come to read them.
         ``deadline`` is the hook's, when its other captures share the budget (``steer_deadline``).  The caller must
-        not hold the adapter's lock: the store I/O runs without it."""
+        not hold the adapter's lock: the store I/O runs without it. ``typed_only`` excludes untyped historical
+        recovery from request hooks. ``bound`` keeps the identity selected before releasing the admission lock.
+        """
         adapter = self._adapter
         with adapter._lock:
-            identity = adapter._identity
+            identity = bound or adapter._identity
             if identity is None or identity.read_only or not identity.runtime_audience.allowed_scope_ids:
                 return
-            effective_session = adapter._effective_session_id(session_id)
-        found = _said_aside(identity, messages)
+            effective_session = session_id or identity.session_id
+        found = _steers(identity, messages) if typed_only else _said_aside(identity, messages)
         if found:
             context = identity.trusted_context(session_id=effective_session, mutation=True)
             self._write_steers(found, identity, context, hook, deadline)
@@ -529,6 +812,10 @@ class TurnCapture:
         took = time.monotonic() - began
         with adapter._writer.using_capture_guard(guard):
             for (steer, key), held in zip(unread, self._held(unread, identity, context, deadline), strict=True):
+                if held is None:
+                    # Without a stable original key, an unreadable lookup cannot
+                    # distinguish new input from a source already held or deleted.
+                    continue
                 with adapter._lock, adapter._calls.holding(hook):
                     taken = held
                     # Kept to retry: the buffer writes it, or gives it up and the next hook reads it again.
@@ -571,10 +858,11 @@ class TurnCapture:
                         while len(adapter._steers_written) > _STEERS_WRITTEN:
                             adapter._steers_written.pop(next(iter(adapter._steers_written)))
 
-    def _held(self, unread, identity, context, deadline: float) -> tuple[bool, ...]:
+    def _held(self, unread, identity, context, deadline: float) -> tuple[bool | None, ...]:
         """Which steers the store holds already, in any session of the scope, or holds deleted: a compression
         carries a steer into the session it continues, and a process that starts again remembers none it wrote.
-        When the store cannot say, none is held: a steer stored twice is better than one lost.
+        When the store cannot say, typed steers may retry under their stable keys. Untyped historical input
+        returns None and waits for a later observation, since its original key and deletion state are unknown.
 
         A message no turn answered may still be a turn's own, stored by ``pre_llm_call`` under the turn's key when the
         gateway stopped before any reply: one of those is looked up by its words and moment in this session as well.
@@ -611,8 +899,12 @@ class TurnCapture:
                     if owner is not None:
                         held[owner] = said
         except (ContractError, OSError, RuntimeError, sqlite3.Error, ValueError):
-            return (False,) * len(unread)
-        return tuple(held) if len(held) == len(unread) else (False,) * len(unread)
+            return tuple(None if steer.kind == UNANSWERED_KIND else False for steer, _key in unread)
+        return (
+            tuple(held)
+            if len(held) == len(unread)
+            else tuple(None if steer.kind == UNANSWERED_KIND else False for steer, _key in unread)
+        )
 
     def _write_turn(
         self, identity, opened, shown, session_id: str, turn_id: str, user_content: str, assistant_content: str, said_at
@@ -620,7 +912,7 @@ class TurnCapture:
         """The turn's message (unless ``pre_llm`` stored it) and its reply, with the turn's outcome."""
         adapter = self._adapter
         outcome = "success"
-        with adapter._lock:
+        with adapter._lock, adapter._said_lock:
             if not assistant_content.strip():
                 outcome = "truncated"
                 adapter._outcomes.mark_truncated(session_id, turn_id)
@@ -648,12 +940,14 @@ class TurnCapture:
                     scope_id=identity.local_scope_id,
                     bound=identity,
                     release=True,
+                    opener_turn_id=turn_id if event["role"] == "user" else None,
                 )
 
     def reset_source_refs(self) -> None:
         """Open a new current-turn fence: no refs, no overflow, no overflow gap."""
-        self._adapter._current_source_refs.clear()
-        self._adapter._current_source_refs_overflow = False
-        self._adapter._diagnostics.capability_gaps = tuple(
-            gap for gap in self._adapter._diagnostics.capability_gaps if gap != GAP_CURRENT_SOURCE_REFS_LIMIT
-        )
+        with self._adapter._said_lock:
+            self._adapter._current_source_refs.clear()
+            self._adapter._current_source_refs_overflow = False
+            self._adapter._diagnostics.capability_gaps = tuple(
+                gap for gap in self._adapter._diagnostics.capability_gaps if gap != GAP_CURRENT_SOURCE_REFS_LIMIT
+            )

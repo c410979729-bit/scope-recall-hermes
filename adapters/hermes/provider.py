@@ -123,9 +123,9 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         self._brief_sequences: dict[str, int] = {}
         self._brief_epoch = uuid.uuid4().hex
         self._brief_compaction_times: dict[str, str] = {}
-        #: Guards only ``_interim_said``/``_steer_said`` and the turn they belong to, never across I/O:
+        #: Guards turn identities, opener records, current refs and completed-message caches, never across I/O:
         #: ``post_llm_call`` runs before Hermes sends the reply and must not wait behind a capture.
-        self._said_lock = threading.Lock()
+        self._said_lock = threading.RLock()
         self._identity: HermesIdentity | None = None
         self._host_runtime = host_runtime
         self._core = host_runtime.core if host_runtime is not None else core
@@ -137,7 +137,6 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         self._outcomes = TurnOutcomeTracker()
         self._turn_counter = 0
         self._active_turn_id = ""
-        self._pre_llm_pending = False
         #: What the assistant showed between tool calls, and when, by turn: read at ``post_llm_call`` on the
         #: host's thread and written by ``sync_turn`` on its memory worker, where a write may wait.
         self._interim_said: dict[str, tuple[tuple[str, str | None], ...]] = {}
@@ -145,13 +144,13 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         self._steer_said: dict[str, tuple[Any, ...]] = {}
         #: The names of the steers this process wrote (``TurnCapture._write_steers``), oldest first.
         self._steers_written: dict[str, None] = {}
-        #: Turns whose opening message ``pre_llm_call`` stored: after a compression switches the session id
+        #: Turns whose opener was durably captured, explicitly refused for privacy, or excluded as a control:
+        #: after a compression switches the session id
         #: mid-turn, ``sync_turn`` would store it again under the new session's key.
         self._user_captured_turns: dict[str, None] = {}
         #: Turns Hermes opened itself (``host_notice``), with the text of the message that opened each, kept like
         #: ``_user_captured_turns`` under ``_said_lock``: that message is stored as the host's wherever it is stored, by
-        #: ``pre_llm_call`` or by ``sync_turn``.  ``sync_turn`` names its turn by the one active when it runs, which can
-        #: be the next turn already, so the text decides, never the turn id alone.
+        #: ``pre_llm_call`` or by ``sync_turn``. The text must match as well as the turn identity.
         self._notice_turns: dict[str, str] = {}
         self._session_watermark = 0
         self._current_source_refs: list[str] = []
@@ -189,7 +188,6 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         self._captures_done = threading.Condition(self._lock)
         #: The turn id of a ``pre_llm_call`` this session was too busy to take, for the turn's start
         #: (``on_turn_start``); written without ``_lock`` by the skipped hook.
-        self._skipped_turn_id: str | None = None
 
     @property
     def name(self) -> str:
@@ -197,9 +195,11 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
 
     @property
     def diagnostics(self) -> AdapterDiagnostics:
+        with self._said_lock:
+            self._merge_gaps(self._turns.capture_gaps)
+            self._diagnostics.current_source_refs = tuple(self._current_source_refs)
         pending = self._retry.pending_identities()
         self._diagnostics.pending_capture_identities = tuple(f"{key}@{revision}" for key, revision in pending)
-        self._diagnostics.current_source_refs = tuple(self._current_source_refs)
         self._diagnostics.durable_pending_captures = self._retry.durable_pending_count()
         self._diagnostics.host_backpressure = self._calls.counts() or None
         return self._diagnostics
@@ -282,10 +282,47 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turns.start(turn_number, message, **kwargs)
 
-    @_serialized_host_event
+    @_participating_session()
     def observe_pre_llm(self, **kwargs) -> None:
-        """Capture raw current input only; never inject a second recall context."""
-        self._turns.pre_llm(**kwargs)
+        """Capture the host's opening message and typed steers through the shared input pipeline."""
+        self._observe_input("pre_llm_call", kwargs)
+
+    @_participating_session()
+    def observe_pre_api_request(self, **kwargs) -> None:
+        """Observe the request's UUID and typed user messages through the shared input pipeline."""
+        self._observe_input("pre_api_request", kwargs)
+
+    def _observe_input(self, event: str, kwargs: dict, *, wait=None, selected=None) -> None:
+        """Process current input under one lock hold, then write typed history without that hold.
+
+        Dispatcher admission has a timeout; direct callers block for the lock. The opener's store call has
+        its own capture budget and history writing gets a separate soft budget. Parsing and subsequent lock
+        acquisitions are outside admission's timeout, so the complete observation has no hard time bound.
+        """
+        if self._unbound_session:
+            return
+        acquired = self._lock.acquire() if wait is None else self._lock.acquire(timeout=wait)
+        if not acquired:
+            self._calls.busy(event, kwargs)
+            return
+        try:
+            if self._unbound_session or (selected is not None and not selected()):
+                return
+            holder = "observe_pre_llm" if event == "pre_llm_call" else "observe_pre_api_request"
+            with self._calls.holding(holder):
+                observer = self._turns.pre_llm if event == "pre_llm_call" else self._turns.pre_api
+                current = observer(**kwargs)
+                identity = self._require_identity()
+        finally:
+            self._lock.release()
+        if current:
+            self._turns.steers(
+                kwargs.get("conversation_history"),
+                session_id=str(kwargs.get("session_id") or ""),
+                hook=event,
+                bound=identity,
+                typed_only=True,
+            )
 
     @_serialized_host_event
     def observe_post_tool_call(self, **kwargs) -> None:
@@ -439,4 +476,5 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             if still_writing:
                 state["captures_still_writing"] = still_writing
             self._diagnostics.shutdown_state = state
+            self._turns.reset_binding()
             self._initialized = False

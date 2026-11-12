@@ -1,12 +1,14 @@
 # Profile / Entity 只读视图
 
-本文描述共享 Core 的读视图，以及 Hermes / Codex MCP 上的同名工具。协议版本为 **1.1**。
+本文描述共享 Core 的读视图，以及 Hermes 和本地客户端 MCP 上的同名工具。
 
 `profile` 与 `entity` 只读已承认的结构化 claim。空数据或尚未巩固的原始对话必须如实报告缺口，**不会**把原始聊天、USER.md、MEMORY.md 或共现文本自动写成档案。身份、路径与范围只来自已初始化的宿主上下文，工具参数不能传入。
 
 `budget_tokens` 按**最终**规范化 JSON 的 UTF-8 字节计费（含 honesty 标记、身份字符串、provenance），**不是**分词器 token 数。默认 `max_items=16`、`budget_tokens=4096`。请求下限是 64，不会为了塞进空信封而抬高下限。若连最小的诚实空结果 / `unavailable` 信封都放不下，调用以 `ContractError(INPUT_INVALID, budget_tokens)` 拒绝；宿主错误包装**不是**视图结果。扫描封顶（候选并集在发布前裁到 200 对象栅栏内）时，`coverage` **绝不会**是 `complete_for_query`。`no_match` 只表示在当前范围与预算内没有可发布的当前项，**不是**全局不存在的证明。别名枚举触顶时不能证明唯一，返回未解析 / `ambiguous` 的部分缺口，不会按不完整前缀解析。
 
 ## 巩固前提
+
+别名、目标事实和额外的别名证明对象共用发布上限。同一个对象只计一次；完整身份证明超过 200 个对象时，不截取部分证明来认定主体，而是返回扫描受限的空歧义响应。
 
 必须先有捕获 + 已接受的巩固（`accept_claim_proposals` / 已承认的 claim）。只有资格为当前有效、且证据仍存活的 claim 才能进入视图。
 
@@ -21,7 +23,19 @@
 
 ### 请求（`profile_request`）
 
-必填：`protocol_version`（`1.1`）、`request_id`、`subject`、`max_items`（1–30）、`budget_tokens`（64–8000）。宿主工具可省略后两项，由适配器填默认值。禁止额外字段（含 `scope_id`、`project_id`、`data_directory`、`session_id`）。整数必须是 JSON integer，不能用 `true`/`1.0`。
+必填：`protocol_version`、`request_id`、`subject`、`max_items`（1–30）、`budget_tokens`（64–8000）。宿主工具可省略后两项，由适配器填默认值。禁止额外字段（含 `scope_id`、`project_id`、`data_directory`、`session_id`）。整数必须是 JSON integer，不能用 `true`/`1.0`。
+
+### 当前这个人
+
+`user`、`current_user`、`用户`、`我`、`me`、`myself`、`i` 表示当前这个人，英文不区分大小写；其他词按名称读取。此规则同时适用于 `profile` 和 `entity`。`me`、`myself`、`i` 是保留人称；库中即使存在字面上叫这些名字的主体，也不能用这些词按字面查询，没有当前身份时返回 `IDENTITY_UNBOUND`。
+
+优先使用宿主已核实的人类发送者。本机共享入口的 Codex、Claude Code、WorkBuddy、dsh stdio MCP 在启动时显式启用主人回退：主体与该入口捕获用户输入时使用的主人身份相同，并重新核对清单是否批准这个身份。依据是安装时对这个入口本机主人的批准；程序不核对进程的系统账号是谁。谁能启动入口、读到配置和库，由操作系统的文件权限决定；共用账号或把入口目录开放给别的账号，等于把主人身份一起给了出去。这个回退不绑定对话，也不增加范围或写入权限。
+
+通用上下文默认只有主人身份等价解析，不提供当前人回退；钩子、交接、私密状态检查和远程 HTTP 沿用这个默认。Hermes 的 CLI、Desktop、TUI、网关和 A2A 仍使用现有宿主说话人规则，未新增回退。没有共享清单批准或身份仍不明确时，人称查询返回 `IDENTITY_UNBOUND`，不按字面名字查询。
+
+清单批准为同一主人的人类身份标记，在这两个视图中一起读取；已接受且证据有效的别名，其规范目标全部属于这组主人身份时，同样读取这些已批准的身份。多个规范目标在清单中属于同一主人时，`resolved_subject` 使用其中一个稳定的身份标记；每条事实仍保留自己的主体。存储主体和 slot key 保持原样，每条事实保留证据引用及可选的 `entries`（`{id, name}`，来自证据的入口）。清单未批准的身份不加入；没有已接受的身份链接时，主人的名字也只是一个名字。主体等价不授予读取权限，范围、项目、分支、发布检查、私密和暂停状态仍照常生效。
+
+已验证别名范围之外的可读范围里存在这些名称的同名字面事实时，会阻止主人扩展：仍返回歧义，只按原查询名列出候选。
 
 ```json
 {
@@ -35,7 +49,7 @@
 
 ### 响应要点
 
-每条含 claim `ref`/`revision`、`temporal_status`、`evidence_refs`，以及证据上已承认的 `source_contexts`（`{platform, chat_type}`）。平台只来自已存储证据，不来自本次查询文本。
+每条含 claim `ref`/`revision`、`temporal_status`、`evidence_refs`，以及证据上已承认的可选 `source_contexts`（`{platform, chat_type}`）和 `entries`。平台和入口只来自已存储证据，不来自本次查询文本。
 
 ```json
 {
@@ -97,7 +111,7 @@
 - **入边**：`value_text` **整段标量相等**于查询名（以及在别名已唯一解析时的规范主体）。不用共现、子串、逗号列表、自由文本枚举或改写来发明边
 - 返回的 `value_text` 就是当时写下的宾语文本，**不**假装它有规范实体 ID
 - `predicate` 若出现，必须完全相等
-- 不递归、不画图、不自动合并身份
+- 不递归、不画图；名称关系与主人等价只使用已接受的证据和清单批准
 
 ```json
 {
@@ -143,17 +157,39 @@
 | 情况 | 结果 |
 | --- | --- |
 | 唯一且证据有效的关系 | `alias_resolution=resolved`，读取规范主体及其已验证的等价名称 |
-| 同名对应不同主体或不同范围 | `alias_resolution=ambiguous`，不任选一个主体 |
+| 同名对应不同主体或不同范围 | `alias_resolution=ambiguous`，不任选一个主体；可发布的原名称事实按范围放在可选 `candidate_groups` |
 | 枚举触及候选上限 | 返回 `ambiguous` 和部分覆盖缺口 |
 | 关系未生效、已撤回或两端证据失效 | 按原名称查询 |
 
+### 同名候选分组
+
+歧义响应的旧顶层字段沿用原有语义：保留 `status=partial`、`answerability=ambiguous`、`resolved_subject=null` 和 `alias_ambiguous`，顶层 `sections` / `disputed` 或 `statements` 仍为空。`gaps` 可能增加预算、条数、密钥或争议缺口，发布检查失败仍可返回 `unavailable`。可选的 `candidate_groups` 提供候选内容，不表示不同组是同一个主体：
+
+```json
+{
+  "candidate_groups": [
+    {
+      "audience": {"scope_id": "示例项目范围", "project_id": null, "branch_id": null},
+      "sections": {"facts": [], "preferences": [], "constraints": [], "decisions": [], "pending_intentions": []},
+      "disputed": []
+    }
+  ]
+}
+```
+
+上面展示字段形状；实际响应只保留有可发布条目的组。`entity` 的每组使用同一个 `audience`，正文为 `statements` 数组。范围标识来自已发布事实的 `scope_id`、`project_id` 和 `branch_id`，调用方无权读取的范围不会出现在分组、计数或歧义判断中。名称碰撞检查保持保守；发布时仍执行证据的项目和分支精确匹配，不能因分组扩大读取。别名歧义时只列原查询名下的事实，不追随有争议的关系。
+
+所有组与顶层正文共用 `max_items` 和最终 JSON 字节预算，来源及范围标识也计入预算。预算裁剪后空组会被移除，候选扫描仍共用上限；别名枚举触顶时不输出基于不完整身份关系的候选。不同组不合并、不补全，也不推断身份。`memory_epoch` 保持全库变更计数的既有含义。
+
+候选扩展一条也放不下预算时，退回原来的空歧义响应，不带 `candidate_groups`，也不带因候选扩展新增的缺口或提示；原空响应放得下的预算仍可返回。能放下一部分时才保留分组及相应的截断标记。
 
 ## 部分结果与只读
 
 - `truncated` / `max_items_cap` / `budget_token_cap` / `scan_capped`：有界、如实的部分结果；没有续读游标
 - 选择与发布之间数据变化：失败关闭，返回 `unavailable`，不带过期档案 / 边 / 别名正文
+- 清单复核只保证到最后一次身份解析，不覆盖此后的清单变化，也不提供清单与数据库之间的原子快照
 - 视图查询不修改事实、不写审计、不入队、不碰向量；不需要 embedding / LLM 配置。访问旧结构前仍可能触发协调升级
-- Hermes 与 Codex 共用同一套 Core 方法；适配器只做身份绑定与参数边界
+- Hermes 与本地客户端共用同一套 Core 方法；适配器只做身份绑定与参数边界
 
 机器可读 schema：`contracts/profile_request.schema.json`、`contracts/entity_request.schema.json`、`contracts/profile_view.schema.json`、`contracts/entity_view.schema.json`。
 
@@ -171,7 +207,7 @@
 判断结果按范围内的名字保存，后续事实中的主语和原称均已判断时不再请求模型。
 端点改版或删除使对应名字重新进入有界回填；主人明确撤回的关系保持撤回。
 
-`entity` 同时读取已合并名称下的一跳记录；`trace` 沿这些实体的已记录关系行走，条件和跳数限制照常。
+`entity` 同时读取已合并名称下的一跳记录；`trace` 沿这些实体的已记录关系行走，条件和跳数限制照常。路径上的每条边保留可选的 `entries` 来源入口标签；没有入口标签时不增加这个字段。
 召回只把问题中的名称作为同一实体的等价称呼匹配，不额外沿实体关系扩展。
 同一位置出现多个已知名称时，优先匹配完整的较长名称，避免短别名改写另一个实体的名称。
 撤回别名记录后，查询按原名称工作；两端记录或证据失效时，该别名也停止生效。

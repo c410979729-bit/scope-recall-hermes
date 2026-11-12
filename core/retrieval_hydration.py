@@ -180,6 +180,11 @@ def evidence_source_contexts(tx, evidence: Iterable[str]) -> list[SourceContext]
     return _evidence_labels(tx, evidence)[0]
 
 
+def evidence_entries(tx, evidence: Iterable[str]) -> list[EntryLabel]:
+    """Distinct entry labels of the readable evidence, bounded by the existing provenance limit."""
+    return _evidence_labels(tx, evidence, include_entries=True)[1]
+
+
 def _source_contexts_metadata(contexts: list[SourceContext]) -> tuple[tuple[str, str], ...]:
     if not contexts:
         return ()

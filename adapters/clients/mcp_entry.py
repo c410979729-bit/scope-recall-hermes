@@ -15,10 +15,14 @@ if __name__ == "__main__":
 import argparse
 import os
 import sys
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 from ...runtime.worker_entry import host_process_credential_environment
+from ..host_identity import owner_subjects
 from .config import CodexConfigError, CodexInstallationConfig, SharedClientConfig, load_codex_config, load_shared_client
+from .identity import capture_owner_principal
 from .mcp_server import build_server
 from .stdio_lifetime import run_stdio
 
@@ -62,6 +66,7 @@ def apply_credential_environment(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Serve a local stdio entry, enabling its approved capture owner only for this process's read views."""
     parser = argparse.ArgumentParser(description="Scope Recall Codex MCP server")
     where = parser.add_mutually_exclusive_group(required=True)
     where.add_argument("--config", help="absolute trusted installation config")
@@ -98,10 +103,22 @@ def main(argv: list[str] | None = None) -> int:
             workspace=workspace,
             trusted_runtime_config_path=str(runtime_config) if runtime_config is not None else None,
         )
-        if isinstance(config, SharedClientConfig) and runtime_config is None:
-            from .local_endpoint import request_recall
+        if isinstance(config, SharedClientConfig):
+            # Stdio uses the same installed-owner approval as captured user input.
+            # Access to the entry is enforced by OS file permissions, not an account comparison here.
+            server.context = replace(
+                server.context,
+                subject_resolver=partial(
+                    owner_subjects,
+                    config.to_binding(),
+                    config.entry_id,
+                    current=capture_owner_principal(config).to_payload(),
+                ),
+            )
+            if runtime_config is None:
+                from .local_endpoint import request_recall
 
-            request_recall(config.home, config.host)
+                request_recall(config.home, config.host)
         run_stdio(server.server)
     except (CodexConfigError, ValueError) as exc:
         raise SystemExit(str(exc)) from None

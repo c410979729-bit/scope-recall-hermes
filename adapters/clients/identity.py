@@ -15,7 +15,12 @@ from pathlib import Path
 
 from scope_recall.adapters.audiences import LOCAL_USER_ID
 from scope_recall.adapters.host_identity import context_ref as _opaque_context
-from scope_recall.adapters.host_identity import entry_owner, host_scope_payload, principal_ref
+from scope_recall.adapters.host_identity import (
+    entry_owner,
+    host_scope_payload,
+    owner_subjects,
+    principal_ref,
+)
 from scope_recall.contracts import ContractError, Origin, TrustedContext, TrustedSourcePrincipal
 from scope_recall.core.private import normalize_project_path
 from scope_recall.runtime.remote_clock import stored_session_id as session_identity
@@ -63,6 +68,10 @@ def _shared_principal(config: SharedClientConfig, origin: Origin) -> TrustedSour
 
 
 def _source_principal(config: CodexInstallationConfig | SharedClientConfig, origin: Origin) -> TrustedSourcePrincipal:
+    """Use the entry's capture identity.
+
+    Shared local owners are approved at attachment, without an OS-account comparison.
+    """
     if isinstance(config, SharedClientConfig):
         shared = _shared_principal(config, origin)
         if shared is not None:
@@ -82,6 +91,11 @@ def _source_principal(config: CodexInstallationConfig | SharedClientConfig, orig
         "external_document": "document",
     }.get(origin, "unknown")
     return TrustedSourcePrincipal(kind, "unresolved")
+
+
+def capture_owner_principal(config: SharedClientConfig) -> TrustedSourcePrincipal:
+    """Return the identity this entry uses to capture user input, without comparing OS accounts."""
+    return _source_principal(config, "human_direct")
 
 
 def resolve_runtime_audience(config: CodexInstallationConfig | SharedClientConfig, cwd: object) -> CodexRuntimeAudience:
@@ -151,6 +165,7 @@ def trusted_context(
     mutation: bool = False,
     project_root: str | None = None,
 ) -> TrustedContext:
+    """Bind a host request with owner equivalences, without a current-person fallback or additional scope grants."""
     if not session_id.strip():
         raise ValueError("session_id is required")
     shared = isinstance(config, SharedClientConfig)
@@ -174,6 +189,7 @@ def trusted_context(
         source_principal=_source_principal(config, actor_origin),
         entry_id=config.entry_id if shared else None,
         owner_resolver=partial(entry_owner, config.to_binding()) if shared else None,
+        subject_resolver=partial(owner_subjects, config.to_binding(), config.entry_id) if shared else None,
         project_root=project_root_of(project_root, resolve_links=False)
         or project_root_of(audience.matched_project_root),
     )
