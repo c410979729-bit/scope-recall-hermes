@@ -80,17 +80,26 @@ def endpoints(home: Path | str) -> Path:
     """Return the current user's endpoint directory for the attached library.
 
     The library path, rather than an entry or host name, makes every local client discover the same process.
-    Unattached homes retain an isolated directory for compatibility with local callers.
+    Unattached homes retain an isolated directory for compatibility with local callers. On Windows the directory
+    is under the user's home and outside AppData: the processes of a packaged application get a private copy of the
+    AppData folders they create, which no other process of the same user sees.
     """
     home = Path(home).expanduser().resolve()
     attachment = read_attachment(home)
     library = Path(attachment.root).resolve() if attachment is not None else home
     digest = hashlib.sha256(os.path.normcase(str(library)).encode("utf-8")).hexdigest()[:16]
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    else:
-        base = Path.home() / ".cache"
-    return base / "scope-recall" / "hook-endpoints" / digest
+    return Path.home() / ".cache" / "scope-recall" / "hook-endpoints" / digest
+
+
+def _legacy_endpoints(home: Path | str) -> Path:
+    """Return the Windows endpoint directory used before it moved under the user home."""
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    return base / "scope-recall" / "hook-endpoints" / endpoints(home).name
+
+
+def _other_resident(folder: Path, paths: list[Path], info: dict[str, Any]) -> bool:
+    """Old-location-only residents cannot answer current hooks, even when their version matches."""
+    return info.get("version") != __version__ or all(path.parent != folder for path in paths)
 
 
 def _proof(token: str, *parts: str) -> str:
@@ -298,7 +307,11 @@ class Recaller:
         }
         tried = 0
         named = []
-        for path in _named(endpoints(self.home)):
+        try:
+            folder = endpoints(self.home)
+        except RuntimeError:
+            return None  # no home directory to look in: the hook recalls by itself
+        for path in _named(folder):
             try:
                 info = json.loads(path.read_text(encoding="utf-8"))
                 port, token, pid = int(info["port"]), str(info["token"]), int(info["pid"])
@@ -921,12 +934,15 @@ def resident_alive(home: Path | str, host: str) -> Path:
 
 
 def request_recall(home: Path | str, host: str) -> None:
-    """Publish client activity for the worker without launching or extending a process from a worker pass."""
-    path = resident_alive(home, host)
+    """Publish client activity for the worker without launching or extending a process from a worker pass.
+
+    A hook that has nowhere to publish (no home directory, a directory it cannot write) still answers.
+    """
     try:
+        path = resident_alive(home, host)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
-    except OSError:
+    except (OSError, RuntimeError):
         pass
 
 
@@ -942,19 +958,27 @@ def live_residents(
     after a crash its id may belong to any of the user's processes, which a stop must not end."""
     from ...runtime.process_probe import probe_process
 
-    said: dict[int, tuple[list[Path], dict[str, Any]]] = {}
-    record = resident_record(home, host)
-    for path in (record, *_named(endpoints(home))):
+    said: dict[tuple[int, str | None], tuple[list[Path], dict[str, Any]]] = {}
+    proven_pids: set[int] = set()
+    folder = endpoints(home)
+    folders = [folder]
+    if any_version and os.name == "nt":
+        folders.append(_legacy_endpoints(home))
+    records = {location / "resident.pid" for location in folders}
+    pending: dict[int | Path, tuple[list[Path], dict[str, Any]]] = {}
+    for path in [path for location in folders for path in (location / "resident.pid", *_named(location))]:
         try:
             info = json.loads(path.read_text(encoding="utf-8"))
             pid = int(info["pid"])
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if info.get("host") not in (host, "*") or (path != record and info.get("resident") is not True):
+        if info.get("host") not in (host, "*") or (path not in records and info.get("resident") is not True):
             continue
-        said.setdefault(pid, ([], info))[0].append(path)
-    found = []
-    for pid, (paths, info) in said.items():
+        # Cross-location control must validate each file before grouping by process identity.
+        key = path if any_version and os.name == "nt" else pid
+        pending.setdefault(key, ([], info))[0].append(path)
+    for paths, info in pending.values():
+        pid = int(info["pid"])
         try:
             state = probe_process(pid)
         except (OSError, ValueError):
@@ -964,6 +988,15 @@ def live_residents(
             for path in paths:
                 remove_quietly(path)
             continue
+        # An unproven path cannot establish where a proven process advertises itself.
+        if started is None and pid in proven_pids:
+            continue
+        if started is not None:
+            proven_pids.add(pid)
+            said.pop((pid, None), None)
+        said.setdefault((pid, started), ([], info))[0].extend(paths)
+    found = []
+    for (_pid, started), (paths, info) in said.items():
         if any_version or info.get("version") == __version__:
             found.append((paths, info, started is not None))
     return found
@@ -1006,8 +1039,8 @@ def ensure_resident(
     if resident_running(home, host):
         others = [
             (info, proven)
-            for _paths, info, proven in live_residents(home, host, any_version=True)
-            if info.get("version") != __version__
+            for paths, info, proven in live_residents(home, host, any_version=True)
+            if _other_resident(folder, paths, info)
         ]
         if not others:
             return "running"
@@ -1133,7 +1166,7 @@ def stop_residents(home: Path | str, host: str, *, other_versions: bool = False)
 
     stopped = []
     for paths, info, proven in live_residents(home, host, any_version=True):
-        if not proven or (other_versions and info.get("version") == __version__):
+        if not proven or (other_versions and not _other_resident(endpoints(home), paths, info)):
             continue
         pid = int(info["pid"])
         try:

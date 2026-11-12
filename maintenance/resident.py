@@ -22,11 +22,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--home", required=True, help="absolute home of a client attached to a shared store")
     parser.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh"))
     args = parser.parse_args(argv)
-    home = Path(args.home).expanduser()
+    try:
+        home = Path(args.home).expanduser()
+        from ..adapters.clients.local_endpoint import endpoints
+
+        endpoints(home)
+    except RuntimeError:
+        print(json.dumps({"status": "error", "code": "home_directory_unavailable"}))
+        return 2
     if not home.is_absolute():
         print(json.dumps({"status": "error", "code": "home_not_absolute"}))
         return 2
+    from ..adapters.clients.config import CodexConfigError, load_shared_client
     from ..adapters.clients.local_endpoint import live_residents, resident_minutes, resident_running, stop_residents
+    from ..runtime.worker_entry import read_worker_metadata, resident_recall_result
 
     stopped = stop_residents(home, args.host) if args.action == "stop" else []
     # A stopped process lets go of the entry's lock as it ends: what is said after, and an upgrade after that, waits
@@ -39,12 +48,28 @@ def main(argv: list[str] | None = None) -> int:
         for _paths, info, proven in live_residents(home, args.host, any_version=True)
     ]
     running = resident_running(home, args.host)
+    worker_recall = None
+    try:
+        config = load_shared_client(home, args.host)
+        worker = read_worker_metadata(config.data_directory / "runtime-worker-status.json")
+        if (
+            worker.get("installation_id") == config.installation_id
+            and "resident_recall" in worker
+            and isinstance(worker.get("finished_at"), str)
+        ):
+            worker_recall = {
+                "result": resident_recall_result(worker["resident_recall"]),
+                "finished_at": worker["finished_at"],
+            }
+    except (CodexConfigError, OSError, RecursionError, ValueError):
+        pass
     said = {
         "status": "ok",
         "action": args.action,
         "resident_recall_minutes": resident_minutes(home, args.host),
         "running": running,
         "servers": servers,
+        "worker_resident_recall": worker_recall,
     }
     if args.action == "stop":
         said["stopped"] = stopped

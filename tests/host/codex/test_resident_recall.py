@@ -732,6 +732,7 @@ def test_the_resident_command_says_and_stops(entry, capsys):
     assert resident.main(["status", "--home", str(entry), "--host", "workbuddy"]) == 0
     said = json.loads(capsys.readouterr().out)
     assert (said["resident_recall_minutes"], said["running"], said["servers"]) == (45, False, [])
+    assert said["worker_resident_recall"] is None
     holder = _Holder(entry)
     try:
         assert resident.main(["status", "--home", str(entry), "--host", "workbuddy"]) == 0
@@ -740,6 +741,254 @@ def test_the_resident_command_says_and_stops(entry, capsys):
         holder.release()
     assert resident.main(["stop", "--home", str(entry), "--host", "workbuddy"]) == 0
     assert json.loads(capsys.readouterr().out)["stopped"] == []
+
+
+def test_resident_status_reports_last_worker_result(entry, tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from scope_recall.adapters.clients import config
+    from scope_recall.maintenance import resident
+
+    monkeypatch.setattr(
+        config,
+        "load_shared_client",
+        lambda *_: SimpleNamespace(data_directory=tmp_path, installation_id="TEST-installation"),
+    )
+    path = tmp_path / "runtime-worker-status.json"
+    path.write_text(
+        json.dumps(
+            {
+                "installation_id": "TEST-installation",
+                "resident_recall": "running:4.0.0",
+                "finished_at": "2026-01-01T00:00:00Z",
+            }
+        )
+    )
+    assert resident.main(["status", "--home", str(entry), "--host", "workbuddy"]) == 0
+    assert json.loads(capsys.readouterr().out)["worker_resident_recall"] == {
+        "result": "running:4.0.0",
+        "finished_at": "2026-01-01T00:00:00Z",
+    }
+    path.write_text("{broken", encoding="utf-8")
+    assert resident.main(["status", "--home", str(entry), "--host", "workbuddy"]) == 0
+    assert json.loads(capsys.readouterr().out)["worker_resident_recall"] is None
+
+    for installation in ({}, {"installation_id": "TEST-other"}):
+        path.write_text(
+            json.dumps({**installation, "resident_recall": "started", "finished_at": "2026-01-01T00:00:00Z"})
+        )
+        assert resident.main(["status", "--home", str(entry), "--host", "workbuddy"]) == 0
+        assert json.loads(capsys.readouterr().out)["worker_resident_recall"] is None
+    path.write_text(json.dumps({"x": 0}).replace("0", "[" * 5000 + "0" + "]" * 5000))
+    assert resident.main(["status", "--home", str(entry), "--host", "workbuddy"]) == 0
+    assert json.loads(capsys.readouterr().out)["worker_resident_recall"] is None
+
+
+def test_resident_command_handles_missing_user_home(entry, monkeypatch, capsys):
+    from scope_recall.maintenance import resident
+
+    def no_home(cls):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", classmethod(no_home))
+    for action in ("status", "stop"):
+        assert resident.main([action, "--home", str(entry), "--host", "workbuddy"]) == 2
+        assert json.loads(capsys.readouterr().out) == {"status": "error", "code": "home_directory_unavailable"}
+
+
+def _old_resident(entry, pid, *, start, version):
+    """Write synthetic legacy records for a process owned by this test."""
+    folder = local_endpoint._legacy_endpoints(entry)
+    folder.mkdir(parents=True, exist_ok=True)
+    info = {
+        "host": "workbuddy",
+        "pid": pid,
+        "start": start,
+        "version": version,
+        "resident": True,
+        "port": 4111,
+        "token": "TEST-token",
+    }
+    for path in (folder / "resident.pid", folder / f"{pid}.json"):
+        path.write_text(json.dumps(info), encoding="utf-8")
+    return folder
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Only Windows had an AppData endpoint directory")
+@pytest.mark.parametrize("action", ["replace", "stop"])
+def test_stale_new_record_does_not_hide_valid_legacy_resident(entry, tmp_path, monkeypatch, capsys, action):
+    from scope_recall._version import __version__
+    from scope_recall.maintenance import resident
+
+    holder, pid = _lock_holder(entry, tmp_path / "old.pid")
+    started = []
+    try:
+        old = _old_resident(entry, pid, start=probe_process(pid).start_token, version=__version__)
+        (old / "resident.pid").unlink()
+        current = local_endpoint.resident_record(entry, "workbuddy")
+        stale = json.dumps({"pid": pid, "host": "workbuddy", "version": __version__, "start": "TEST-dead"})
+        current.write_text(stale)
+        assert local_endpoint.live_residents(entry, "workbuddy") == []
+        assert not current.exists() and (old / f"{pid}.json").exists()
+        current.write_text(stale)
+        found = local_endpoint.live_residents(entry, "workbuddy", any_version=True)
+        assert len(found) == 1 and found[0][0] == [old / f"{pid}.json"] and found[0][2] is True
+        assert not current.exists() and (old / f"{pid}.json").exists()
+        if action == "replace":
+
+            def start(command, *, cwd):
+                assert _wait(lambda: not local_endpoint.resident_running(entry, "workbuddy"), 10)
+                started.append(_lock_holder(entry, tmp_path / "new.pid")[0])
+                return True
+
+            monkeypatch.setattr(local_endpoint, "start_detached", start)
+            assert (
+                local_endpoint.ensure_resident(entry, "workbuddy", minutes=45, replace=True)
+                == f"replaced:{__version__}"
+            )
+            assert started[0].poll() is None
+        else:
+            assert resident.main(["stop", "--home", str(entry), "--host", "workbuddy"]) == 0
+            assert json.loads(capsys.readouterr().out)["stopped"] == [pid]
+        assert holder.wait(10) is not None
+    finally:
+        for process in [holder, *started]:
+            if process.poll() is None:
+                process.kill()
+            process.wait(10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Only Windows had an AppData endpoint directory")
+def test_unproven_new_record_does_not_hide_proven_legacy_resident(entry, tmp_path, monkeypatch):
+    from scope_recall._version import __version__
+
+    holder, pid = _lock_holder(entry, tmp_path / "old.pid")
+    started = []
+    try:
+        old = _old_resident(entry, pid, start=probe_process(pid).start_token, version=__version__)
+        current = local_endpoint.resident_record(entry, "workbuddy")
+        current.write_text(json.dumps({"pid": pid, "host": "workbuddy", "version": __version__, "start": None}))
+        found = local_endpoint.live_residents(entry, "workbuddy", any_version=True)
+        assert len(found) == 1 and found[0][2] is True
+        assert current not in found[0][0] and (old / f"{pid}.json") in found[0][0]
+        assert current.exists()
+
+        def start(command, *, cwd):
+            assert _wait(lambda: not local_endpoint.resident_running(entry, "workbuddy"), 10)
+            started.append(_lock_holder(entry, tmp_path / "new.pid")[0])
+            return True
+
+        monkeypatch.setattr(local_endpoint, "start_detached", start)
+        assert local_endpoint.ensure_resident(entry, "workbuddy", minutes=45, replace=True) == f"replaced:{__version__}"
+        assert holder.wait(10) is not None and started[0].poll() is None
+    finally:
+        for process in [holder, *started]:
+            if process.poll() is None:
+                process.kill()
+            process.wait(10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Only Windows had an AppData endpoint directory")
+def test_matching_records_in_both_locations_remain_one_current_resident(entry, tmp_path):
+    from scope_recall._version import __version__
+
+    holder, pid = _lock_holder(entry, tmp_path / "holder.pid")
+    try:
+        start = probe_process(pid).start_token
+        old = _old_resident(entry, pid, start=start, version=__version__)
+        current = local_endpoint.resident_record(entry, "workbuddy")
+        current.write_text(json.dumps({"pid": pid, "host": "workbuddy", "version": __version__, "start": start}))
+        found = local_endpoint.live_residents(entry, "workbuddy", any_version=True)
+        assert len(found) == 1 and found[0][2] is True
+        assert set(found[0][0]) == {current, old / "resident.pid", old / f"{pid}.json"}
+        assert local_endpoint.ensure_resident(entry, "workbuddy", minutes=45, replace=True) == "running"
+        assert local_endpoint.stop_residents(entry, "workbuddy", other_versions=True) == []
+        assert holder.poll() is None
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait(10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Only Windows had an AppData endpoint directory")
+@pytest.mark.parametrize("same_version", [False, True])
+def test_legacy_resident_status_stop_and_replacement(entry, tmp_path, monkeypatch, capsys, same_version):
+    from scope_recall._version import __version__
+    from scope_recall.maintenance import resident
+
+    version = __version__ if same_version else "3.6.0"
+    _runtime_config(entry, resident_recall_minutes=45)
+    holder, pid = _lock_holder(entry, tmp_path / "old-status.pid")
+    try:
+        folder = _old_resident(entry, pid, start=probe_process(pid).start_token, version=version)
+        assert resident.main(["status", "--home", str(entry), "--host", "workbuddy"]) == 0
+        assert json.loads(capsys.readouterr().out)["servers"] == [{"pid": pid, "version": version, "verified": True}]
+        assert local_endpoint.Recaller(entry, "workbuddy")({}, (), (), 0.5) is None
+        assert resident.main(["stop", "--home", str(entry), "--host", "workbuddy"]) == 0
+        assert json.loads(capsys.readouterr().out)["stopped"] == [pid]
+        assert holder.wait(10) is not None
+        assert not (folder / "resident.pid").exists() and not (folder / f"{pid}.json").exists()
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait(10)
+
+    holder, pid = _lock_holder(entry, tmp_path / "old-replace.pid")
+    started = []
+    try:
+        _old_resident(entry, pid, start=probe_process(pid).start_token, version=version)
+
+        def start(command, *, cwd):
+            assert _wait(lambda: not local_endpoint.resident_running(entry, "workbuddy"), 10)
+            started.append(_lock_holder(entry, tmp_path / "new-holder.pid")[0])
+            return True
+
+        monkeypatch.setattr(local_endpoint, "start_detached", start)
+        assert local_endpoint.ensure_resident(entry, "workbuddy", minutes=45, replace=True) == f"replaced:{version}"
+        assert holder.wait(10) is not None
+        assert len(started) == 1 and started[0].poll() is None
+        assert local_endpoint.resident_running(entry, "workbuddy")
+    finally:
+        for process in [holder, *started]:
+            if process.poll() is None:
+                process.kill()
+            process.wait(10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Only Windows had an AppData endpoint directory")
+def test_legacy_unproven_and_stale_records(entry, tmp_path, monkeypatch, capsys):
+    from scope_recall._version import __version__
+    from scope_recall.maintenance import resident
+
+    holder, pid = _lock_holder(entry, tmp_path / "old-unproven.pid")
+    try:
+        folder = _old_resident(entry, pid, start=None, version=__version__)
+        signals = []
+        monkeypatch.setattr(local_endpoint.os, "kill", lambda *args: signals.append(args))
+        assert (
+            local_endpoint.ensure_resident(entry, "workbuddy", minutes=45, replace=True) == f"unstoppable:{__version__}"
+        )
+        assert resident.main(["stop", "--home", str(entry), "--host", "workbuddy"]) == 1
+        assert json.loads(capsys.readouterr().out)["status"] == "still_running"
+        assert signals == [] and holder.poll() is None
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait(10)
+    assert local_endpoint.live_residents(entry, "workbuddy", any_version=True) == []
+    assert not (folder / "resident.pid").exists() and not (folder / f"{pid}.json").exists()
+
+
+def test_non_windows_control_does_not_read_legacy(entry, monkeypatch):
+    class OtherOS:
+        name = "posix"
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+    monkeypatch.setattr(local_endpoint, "os", OtherOS())
+    monkeypatch.setattr(local_endpoint, "_legacy_endpoints", lambda *_: pytest.fail("legacy path was read"))
+    assert local_endpoint.live_residents(entry, "workbuddy", any_version=True) == []
 
 
 def _hook(monkeypatch, payload):
@@ -1320,11 +1569,175 @@ def test_worker_manages_one_process_for_two_hosts_with_separate_grants(entry, mo
 
 
 def test_library_lock_is_shared_across_os_profile_directories(entry, tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "TEST-profile-a"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "TEST-profile-a"))
     first = local_endpoint.resident_lock(entry, "workbuddy")
     private_first = local_endpoint.endpoints(entry)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "TEST-profile-b"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "TEST-profile-b"))
     second = local_endpoint.resident_lock(entry, "workbuddy")
     assert first == second
-    if os.name == "nt":
-        assert private_first != local_endpoint.endpoints(entry)
+    assert private_first != local_endpoint.endpoints(entry)
+    expected = tmp_path / "TEST-profile-b" / ".cache" / "scope-recall"
+    assert local_endpoint.endpoints(entry).parent.parent == expected
+
+
+def test_a_hook_without_a_home_directory_publishes_nothing_and_asks_no_server(entry, monkeypatch):
+    def no_home(cls):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", classmethod(no_home))
+    with pytest.raises(RuntimeError):
+        local_endpoint.endpoints(entry)
+    local_endpoint.request_recall(entry, "workbuddy")
+    recaller = local_endpoint.Recaller(entry, "workbuddy")
+    assert recaller({}, (), (), 1.0) is None
+    assert recaller.outcome == "none"
+
+
+def _appdata_findings(relative, source):
+    """Find AppData literals outside the exact read-only and environment-forwarding cases."""
+    import ast
+
+    tree = ast.parse(source)
+    parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    permitted = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant):
+                permitted.add(id(node.body[0].value))
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = {target.id for target in targets if isinstance(target, ast.Name)}
+        parent = parents.get(id(node))
+        while parent is not None and not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            parent = parents.get(id(parent))
+        scope = parent.name if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+        value = node.value
+        env_set = (relative, scope, names) in (
+            ("runtime/worker_launch.py", None, {"_WORKER_ENV_NAMES"}),
+            ("runtime/codex_cli.py", "_child_env", {"allowed"}),
+        )
+        if (
+            env_set
+            and isinstance(value, (ast.Set, ast.Tuple, ast.List))
+            and all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in value.elts)
+        ):
+            permitted.update(id(item) for item in value.elts)
+        # These read existing locations; the exact expression cannot be repurposed to create another path.
+        expressions = {
+            ("maintenance/install_hermes.py", "profile_identity", "native"): (
+                '(Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / '
+                '("hermes" + suffix) if sys.platform == "win32" else Path.home() / (".hermes" + suffix)).resolve()'
+            ),
+            ("adapters/clients/local_endpoint.py", "_legacy_endpoints", "base"): (
+                'Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")'
+            ),
+        }
+        for (file, function, name), expression in expressions.items():
+            if (relative, scope, names) == (file, function, {name}) and ast.dump(value) == ast.dump(
+                ast.parse(expression, mode="eval").body
+            ):
+                permitted.update(id(item) for item in ast.walk(value))
+        if (relative, scope, names) == ("core/capture_filters.py", None, {"PRIVATE_PATH_PATTERNS"}):
+            pattern = r"(?<![A-Za-z0-9])%(?:TEMP|TMP|LOCALAPPDATA|APPDATA|USERPROFILE)%[\\/][^\s\]})>'\"]+"
+            for item in ast.walk(value):
+                if isinstance(item, ast.Constant) and item.value == pattern:
+                    permitted.add(id(item))
+    return [
+        f"{relative}:{node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "appdata" in node.value.lower()
+        and id(node) not in permitted
+    ]
+
+
+def test_application_paths_do_not_use_redirected_appdata():
+    """AppData literals belong only to environment forwarding, discovery or path redaction."""
+    root = Path(__file__).resolve().parents[3]
+    findings = []
+    for folder in ("adapters", "runtime", "maintenance", "core"):
+        for path in (root / folder).rglob("*"):
+            if path.suffix.lower() in {".js", ".ts", ".sh", ".ps1", ".cmd", ".bat"}:
+                if "appdata" in path.read_text(encoding="utf-8").lower():
+                    findings.append(path.relative_to(root).as_posix())
+                continue
+            if path.suffix != ".py":
+                continue
+            relative = path.relative_to(root).as_posix()
+            findings.extend(_appdata_findings(relative, path.read_text(encoding="utf-8")))
+    assert findings == []
+
+
+def test_appdata_guard_rejects_path_in_environment_allowlist():
+    source = 'def _child_env():\n    allowed = Path(os.environ["LOCALAPPDATA"]) / "scope-recall"\n    allowed.mkdir()\n'
+    assert _appdata_findings("runtime/codex_cli.py", source) == ["runtime/codex_cli.py:2"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("running:4.0.0rc1+test", "running:4.0.0rc1+test"),
+        ("replaced:" + "x" * 65, "replaced:invalid"),
+        ("unstoppable:private/path", "unstoppable:invalid"),
+        ("running:secret\ntext", "running:invalid"),
+        ("not-a-status", "unavailable"),
+        (None, "unavailable"),
+    ],
+)
+def test_worker_resident_result_is_bounded(value, expected):
+    from scope_recall.runtime.worker_entry import resident_recall_result
+
+    assert resident_recall_result(value) == expected
+
+
+def test_worker_receipt_and_status_store_sanitized_resident_result(tmp_path, monkeypatch):
+    from io import StringIO
+
+    from scope_recall.adapters.clients import store_service
+    from scope_recall.contracts import InstanceBinding
+    from scope_recall.core import CoreConfig, MemoryCore
+    from scope_recall.runtime.worker_entry import run_worker
+
+    binding = InstanceBinding("TEST-agent", "TEST-installation", tmp_path / "data", frozenset({"TEST-scope"}), True)
+    MemoryCore(CoreConfig(binding)).initialize()
+    config = {
+        "binding": {
+            "agent_id": binding.agent_id,
+            "installation_id": binding.installation_id,
+            "data_directory": str(binding.data_directory),
+            "scope_ids": list(binding.scope_ids),
+            "test_mode": True,
+        },
+        "session_id": "TEST-session",
+        "allowed_scope_ids": list(binding.scope_ids),
+        "actor_origin": "human_direct",
+        "owner_id": "TEST-owner",
+        "request_seconds": 45.0,
+        "drain_seconds": 120.0,
+        "max_items": 32,
+        "lease_seconds": 60.0,
+        "auxiliary": {"external_embedding": False, "external_consolidation": False},
+    }
+    path = tmp_path / "worker.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setattr(store_service, "manage", lambda *args, **kwargs: "running:private/path")
+    output = StringIO()
+    assert run_worker(path, output=output) == 0
+    assert json.loads(output.getvalue())["resident_recall"] == "running:invalid"
+    saved = json.loads((binding.data_directory / "runtime-worker-status.json").read_text(encoding="utf-8"))
+    assert saved["resident_recall"] == "running:invalid"
+    assert "private/path" not in json.dumps(saved)
+
+    from scope_recall.adapters.clients import ledger
+
+    def fail_replay(*args, **kwargs):
+        raise RuntimeError("TEST-replay-failure")
+
+    monkeypatch.setattr(ledger, "reconcile_store", fail_replay)
+    output = StringIO()
+    assert run_worker(path, output=output) == 1
+    assert json.loads(output.getvalue())["resident_recall"] == "running:invalid"
+    saved = json.loads((binding.data_directory / "runtime-worker-status.json").read_text(encoding="utf-8"))
+    assert saved["resident_recall"] == "running:invalid"

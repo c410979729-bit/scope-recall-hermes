@@ -97,7 +97,8 @@ class _OwnedWindowsJob:
         if not handle:
             raise ctypes.WinError(ctypes.get_last_error())
         info = Extended()
-        info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+        # Explicitly detached services outlive a pass; ordinary descendants remain owned by this job.
+        info.BasicLimitInformation.LimitFlags = 0x2000 | 0x0800  # KILL_ON_JOB_CLOSE | BREAKAWAY_OK
         ok = kernel.SetInformationJobObject(
             handle,
             9,  # JobObjectExtendedLimitInformation
