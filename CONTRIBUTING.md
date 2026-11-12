@@ -98,6 +98,59 @@ committed allowlist and that computation disagree. A new `.py` file is either
 listed in `packaging/v11-module-allowlist.json` or a test under `tests/` that a
 tier in `scripts/check.py` selects.
 
+## Checking Hermes source changes
+
+After a Hermes release, compare its source checkout with the reviewed inventory:
+
+```sh
+python scripts/hermes_surface.py diff fixtures/hermes/surface-0.23.0.json /path/to/hermes-agent
+python scripts/hermes_surface.py diff fixtures/hermes/surface-0.23.0.json /path/to/hermes-agent --strict
+python scripts/hermes_surface.py refresh fixtures/hermes/surface-0.23.0.json /path/to/hermes-agent --output /path/to/new-inventory.json
+```
+
+The checker parses Python syntax without importing Hermes. Its output separates
+action required from reference changes. The default check exits 1 only when:
+
+- A boundary marker has no remaining match in Hermes source.
+- The inventory's boundary constants or registered hooks differ from this tree.
+  Refresh the inventory first, using the command printed by the check.
+- A registered hook with recorded dispatch calls has none remaining.
+- A hook or memory-provider method loses a keyword across all its call sites.
+
+Keywords include statically visible keys of dictionary spreads. A keyword still
+present at another call site is retained. Dynamic spreads can hide keys and need
+source review. User rows, marker movements, added keywords and direct message
+events are reference changes and exit 0. Use `--strict` to exit 1 for any change
+when reviewing a new baseline. Input errors exit 2 in either mode.
+
+Provider calls are included only when the receiver expression or source-relative path
+contains `memory`, ignoring case. Aliases such as `p.sync_turn` outside a
+memory-named file are missed; unrelated memory-named objects can still match.
+Hook loss is checked against observed baseline calls. A dispatch wrapper unseen
+in both scans cannot establish a new loss and does not trigger that check.
+Dynamic roles, other call aliases and runtime dictionary updates need source
+review. Test, evaluation and environment directories are excluded. Line numbers
+only locate code and do not cause drift.
+
+For each user row without `display_kind`, add one `disposition` object with a
+`status` (`recognized`, `outside_history`, `unknown` or `unverified`) and a `reason`.
+Name the boundary rule, explain why it cannot reach captured history, or record
+that provenance is unknown. Use `unverified` when the route has not been checked.
+Keep these explanations in the inventory alone. `refresh` preserves a disposition
+only when the row's ID, content and display kind match. If an identical-row group
+changes size, its occurrence numbers are ambiguous and none are carried. The
+command lists rows without dispositions and discarded dispositions. Fill the
+listed untyped rows, review any listed typed rows, and inspect the discarded
+records. Source metadata comes from the new scan. Review the JSON, then replace
+the recorded fixture and update its filename references when recording another
+release. Run `tests/unit/test_hermes_surface.py`. `scan` creates an inventory
+without transferring dispositions.
+
+The catalog-install workflow includes both sections in the job summary. Weekly
+and manual runs fail only for action-required changes or input errors. Pull
+requests report both levels without failing for differences; input errors still
+fail.
+
 ## The recall benchmark
 
 `tests/recall_bench/` measures recall on a synthetic shared store: three owners,
