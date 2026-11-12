@@ -93,7 +93,7 @@ def test_unanswered_lookup_failure_waits_for_another_observation(telegram, monke
     assert not telegram._retry.captures
     monkeypatch.setattr(telegram._core, "said_in_session", lookup)
     telegram.on_session_end(history)
-    assert _human_words(telegram) == ["TEST restored input"]
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [("TEST restored input", "origin_unknown")]
 
 
 def test_untimed_unanswered_history_stays_blocked_after_private_off(adapter):
