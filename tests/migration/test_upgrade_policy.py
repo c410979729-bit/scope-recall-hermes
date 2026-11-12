@@ -330,6 +330,15 @@ def long_reader(tmp_path, monkeypatch):
     reader = sqlite3.connect(core.storage.path, isolation_level=None)
     reader.execute("BEGIN")
     reader.execute("SELECT count(*) FROM source_events").fetchone()
+    began = time.monotonic()
+    store_upgrade.backup_sqlite(
+        core.storage.path,
+        tmp_path / "TEST-calibration.sqlite3",
+        manifest=tmp_path / "TEST-calibration.json",
+        automatic_upgrade=True,
+    )
+    snapshot_seconds = time.monotonic() - began
+    budget = max(1.0, snapshot_seconds * 4)
     original = storage.SQLiteStorage._migrate_store
 
     def spill(self, conn):
@@ -340,19 +349,18 @@ def long_reader(tmp_path, monkeypatch):
 
     monkeypatch.setattr(storage.SQLiteStorage, "_migrate_store", spill)
     try:
-        yield core, reader, original
+        yield core, reader, original, budget, snapshot_seconds
     finally:
         reader.close()
 
 
 def test_delete_reader_blocks_spilled_pages_with_bounded_rollback(long_reader):
-    core, reader, _ = long_reader
+    core, reader, _, budget, snapshot_seconds = long_reader
     began = time.monotonic()
-    # A second leaves a slow runner time for the automatic snapshot that precedes the migration; the reader then
-    # holds the migration to the deadline, and the rollback stays bounded by it.
+    # Allow the verified snapshot time to scale with this store and disk while bounding the reader's lock wait.
     with pytest.raises(sqlite3.OperationalError):
-        core.storage.initialize(remaining_seconds=1)
-    assert time.monotonic() - began < 2
+        core.storage.initialize(remaining_seconds=budget)
+    assert time.monotonic() - began < budget + max(2.0, snapshot_seconds * 2)
     assert reader.execute("PRAGMA user_version").fetchone()[0] == 1111
     assert not reader.execute("SELECT 1 FROM sqlite_master WHERE name='test_spill'").fetchall()
     report = DoctorReport(host="codex", status="degraded")
@@ -361,9 +369,14 @@ def test_delete_reader_blocks_spilled_pages_with_bounded_rollback(long_reader):
 
 
 def test_released_delete_reader_allows_retry(long_reader, monkeypatch):
-    core, reader, original = long_reader
+    core, reader, original, budget, snapshot_seconds = long_reader
+    began = time.monotonic()
     with pytest.raises(sqlite3.OperationalError):
-        core.storage.initialize(remaining_seconds=1)
+        core.storage.initialize(remaining_seconds=budget)
+    assert time.monotonic() - began < budget + max(2.0, snapshot_seconds * 2)
+    assert store_upgrade.read_upgrade_state(core.storage.path.parent)["reason"] == "upgrade_blocked_by_reader"
+    assert reader.execute("PRAGMA user_version").fetchone()[0] == 1111
+    assert not reader.execute("SELECT 1 FROM sqlite_master WHERE name='test_spill'").fetchall()
     reader.rollback()
     monkeypatch.setattr(storage.SQLiteStorage, "_migrate_store", original)
-    assert core.storage.initialize(remaining_seconds=2).schema_version == storage.SCHEMA_VERSION
+    assert core.storage.initialize(remaining_seconds=max(2.0, budget)).schema_version == storage.SCHEMA_VERSION
