@@ -40,6 +40,127 @@ def _alive(pid: int) -> bool:
     return False
 
 
+def _exercise_detached_worker(tmp_path: Path):
+    """Exercise a worker tree inside the enclosing kill-on-close job."""
+    root = Path(__file__).resolve().parents[2]
+    detached_pid = tmp_path / "detached.pid"
+    ordinary_pid = tmp_path / "ordinary.pid"
+    sleeper = "import os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(300)"
+    script = """import pathlib, subprocess, sys, time, types
+root, detached, ordinary, sleeper = sys.argv[1:]
+package = types.ModuleType('scope_recall')
+package.__path__ = [root]
+sys.modules['scope_recall'] = package
+from scope_recall.adapters.clients.local_endpoint import start_detached
+assert sys.stdin.buffer.read(1) == b'\\x01'
+assert start_detached([sys.executable, '-c', sleeper, detached], cwd=pathlib.Path(root))
+subprocess.Popen([sys.executable, '-c', sleeper, ordinary])
+time.sleep(300)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(root), str(detached_pid), str(ordinary_pid), sleeper],
+        stdin=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    job = _OwnedWindowsJob()
+    pids = []
+    try:
+        job.assign(child)
+        child.stdin.write(b"\x01")
+        child.stdin.close()
+
+        def written(path: Path) -> int | None:
+            # A sleeper's file exists, empty, for a moment before its process id is in it.
+            try:
+                return int(path.read_text())
+            except (OSError, ValueError):
+                return None
+
+        deadline = time.monotonic() + 60
+        while (written(detached_pid) is None or written(ordinary_pid) is None) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        pids = [pid for pid in (written(detached_pid), written(ordinary_pid)) if pid is not None]
+        assert len(pids) == 2
+        _kill_tree(child, job)
+        deadline = time.monotonic() + 30
+        while _alive(pids[1]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(pids[1])
+        assert _alive(pids[0]), "detached process died when the worker job closed"
+        (tmp_path / "inner-closed").write_text("ready", encoding="ascii")
+        sys.stdin.buffer.read(1)
+    finally:
+        _kill_tree(child, job)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Objects are not available on other systems")
+def test_detached_worker_remains_in_outer_job(tmp_path: Path):
+    """A non-breakaway outer job continues to own a descendant detached from the inner job."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class Io(ctypes.Structure):
+        _fields_ = [("values", ctypes.c_ulonglong * 6)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", Basic),
+            ("IoInfo", Io),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    outer = _OwnedWindowsJob()
+    info = Extended()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE without BREAKAWAY_OK
+    if not outer._kernel.SetInformationJobObject(outer.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        outer.close()
+        raise ctypes.WinError(ctypes.get_last_error())
+    script = (
+        "import runpy,sys; from pathlib import Path; "
+        "assert sys.stdin.buffer.read(1)==b'\\x01'; "
+        "runpy.run_path(sys.argv[1])['_exercise_detached_worker'](Path(sys.argv[2]))"
+    )
+    watchdog = subprocess.Popen(
+        [sys.executable, "-c", script, __file__, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        outer.assign(watchdog)
+        watchdog.stdin.write(b"\x01")
+        watchdog.stdin.flush()
+        marker = tmp_path / "inner-closed"
+        deadline = time.monotonic() + 120
+        while not marker.exists() and watchdog.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.exists(), f"inner watchdog did not finish: {watchdog.poll()}"
+        pid = int((tmp_path / "detached.pid").read_text())
+        assert _alive(pid)
+        _kill_tree(watchdog, outer)
+        deadline = time.monotonic() + 30
+        while _alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(pid)
+    finally:
+        _kill_tree(watchdog, outer)
+
+
 def test_owned_watchdog_kills_real_child_tree_after_abrupt_parent_exit(tmp_path: Path):
     pid_file = tmp_path / "child.pid"
     script = (

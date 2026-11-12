@@ -271,6 +271,30 @@ def persist_worker_status(
         )
 
 
+def resident_recall_result(value: object) -> str:
+    """Keep the resident result bounded, including versions read from endpoint records."""
+    if not isinstance(value, str):
+        return "unavailable"
+    if value in {
+        "not_shared",
+        "no_clients",
+        "disabled",
+        "idle",
+        "off",
+        "upgrading",
+        "running",
+        "recent",
+        "failed",
+        "started",
+        "unavailable",
+    }:
+        return value
+    status, separator, version = value.partition(":")
+    if separator and status in {"running", "unstoppable", "replaced"}:
+        return f"{status}:{version if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}', version) else 'invalid'}"
+    return "unavailable"
+
+
 def _persist_worker_status_unlocked(
     config: RuntimeInstanceConfig,
     payload: dict[str, Any],
@@ -309,6 +333,8 @@ def _persist_worker_status_unlocked(
         )
         if key in payload
     }
+    if "resident_recall" in payload:
+        safe["resident_recall"] = resident_recall_result(payload["resident_recall"])
     safe["capability_gaps"] = [str(value)[:120] for value in payload.get("capability_gaps", ())][:16]
     # One bounded line naming why a child died, chosen by the watchdog from the
     # tail of a traceback; never the stream itself.
@@ -523,11 +549,15 @@ def _pass_deadline(config: RuntimeInstanceConfig, deadline_epoch: float | None) 
     return deadline
 
 
-def _owner_timeout(sink: TextIO, config: RuntimeInstanceConfig | None, *, started_at: str) -> int:
+def _owner_timeout(
+    sink: TextIO, config: RuntimeInstanceConfig | None, *, started_at: str, resident_result: str | None = None
+) -> int:
     """The receipt a watchdog writes when it kills a pass that overran its
     window, written instead by a pass that ran out of the window it was handed:
     the same exit code and gap, which a supervisor survives, with nothing killed."""
     payload = _minimal_payload(config, "degraded", "worker_watchdog_timeout")
+    if resident_result is not None:
+        payload["resident_recall"] = resident_result
     return _report(sink, config, payload, started_at=started_at, exit_code=124, best_effort=True)
 
 
@@ -642,6 +672,7 @@ def run_worker(
     sink: TextIO = sys.stdout if output is None else output
     config: RuntimeInstanceConfig | None = None
     instance = None
+    resident_result = None
     started_at = utc_now()
     try:
         config = load_config(config_path)
@@ -659,9 +690,10 @@ def run_worker(
                 from ..adapters.clients.ledger import reconcile_store
                 from ..adapters.clients.store_service import manage
 
-                manage(config.binding, minutes=config.resident_recall_minutes)
+                resident_result = resident_recall_result(manage(config.binding, minutes=config.resident_recall_minutes))
                 ledger = reconcile_store(config.binding, seconds=min(2.0, max(0.001, deadline - time.monotonic())))
                 payload = _drain_once(config, instance, deadline)
+                payload["resident_recall"] = resident_result
                 payload["transcript_replay"] = ledger
                 checkpoint = worker_metadata_path(config, "transcript-replay.json")
                 pending_replay = bool(ledger.get("ready") or ledger.get("deferred") or ledger.get("pending_scan"))
@@ -673,21 +705,27 @@ def run_worker(
                 return _report(sink, config, payload, started_at=started_at, exit_code=0)
         except TimeoutError:
             payload = _minimal_payload(config, "busy", "worker_wait_timeout")
+            if resident_result is not None:
+                payload["resident_recall"] = resident_result
             return _report(sink, config, payload, started_at=started_at, exit_code=75)
     except Exception as exc:
         if deadline_epoch is not None and isinstance(exc, ContractError) and exc.code == "DEADLINE_EXCEEDED":
             # The window ran out inside the drain, as it does for a pass that
             # starts with milliseconds left.  Like a kill, it keeps its page.
-            return _owner_timeout(sink, config, started_at=started_at)
+            return _owner_timeout(sink, config, started_at=started_at, resident_result=resident_result)
         if _writer_busy(exc):
             # Nothing failed: another writer held the truth database.  Busy,
             # like a held worker lock, so the supervisor tries again after a
             # pause instead of stopping until the next autostart wake.
             payload = _minimal_payload(config, "busy", "worker_writer_busy")
+            if resident_result is not None:
+                payload["resident_recall"] = resident_result
             return _report(sink, config, payload, started_at=started_at, exit_code=75)
         # Error classes/codes are useful to a supervisor while details may
         # contain paths or model data.  Keep the protocol bounded and safe.
         payload = _minimal_payload(config, "degraded", _exception_gap(exc))
+        if resident_result is not None:
+            payload["resident_recall"] = resident_result
         return _report(sink, config, payload, started_at=started_at, exit_code=1, best_effort=True)
     finally:
         if instance is not None:

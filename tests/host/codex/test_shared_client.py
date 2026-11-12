@@ -2294,7 +2294,7 @@ def test_a_server_names_itself_in_the_user_s_own_profile(resident):
     from pathlib import Path
 
     _root, client, endpoint = resident
-    profile = Path(os.environ["LOCALAPPDATA"]) if os.name == "nt" else Path.home() / ".cache"
+    profile = Path.home() / ".cache"
     assert profile in endpoint.path.parents and client not in endpoint.path.parents
     if os.name != "nt":
         assert stat.S_IMODE(endpoint.path.stat().st_mode) == 0o600
