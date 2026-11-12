@@ -240,6 +240,16 @@ class HermesIdentity:
             return None
         return self.hermes_home / "scope-recall" / RUNTIME_CONFIG_FILENAME
 
+    @property
+    def person_origin(self) -> str:
+        """The origin of what the session's person says themselves on this platform.
+
+        A platform identity does not prove every word was authored by the person. A2A is unknown when the resolved
+        platform is ``a2a``; an A2A message routed through a local platform is outside this check. A capture naming no
+        origin uses this value.
+        """
+        return "origin_unknown" if self.scope.platform in _UNATTESTED_HUMAN_PLATFORMS else "human_direct"
+
     def stored_session_id(self, session_id: str | None = None) -> str:
         """The session id a context carries into storage.
 
@@ -270,16 +280,9 @@ class HermesIdentity:
         scopes = self.writable_scope_ids if mutation else self.runtime_audience.allowed_scope_ids
         if not scopes:
             raise ContractError("ACCESS_DENIED")
-        # A platform identity is trusted metadata, but an authenticated remote
-        # peer is not an operator confirmation.  Keep the existing human
-        # default for platforms whose host contract explicitly represents the
-        # operator; A2A has no such attestation at this boundary.  Callers
-        # still pass tool_observation/assistant_visible explicitly below.
-        resolved_origin = (
-            "origin_unknown"
-            if actor_origin is None and self.scope.platform in _UNATTESTED_HUMAN_PLATFORMS
-            else (actor_origin or "human_direct")
-        )
+        # A context that names no origin speaks for the session's person (``person_origin``).  Callers pass
+        # tool_observation, assistant_visible and the other origins explicitly.
+        resolved_origin = actor_origin or self.person_origin
         resolved_task = task_anchor or _context_ref(
             "hermes-task",
             self.binding.installation_id,
