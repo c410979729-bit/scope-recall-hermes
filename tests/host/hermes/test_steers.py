@@ -874,7 +874,7 @@ def test_only_an_attested_private_chat_recovers_unanswered_rows(chat_type, origi
 
     identity = SimpleNamespace(
         scope=SimpleNamespace(chat_type=chat_type, platform="telegram", user_id="TEST-user"),
-        trusted_context=lambda: SimpleNamespace(actor_origin=origin),
+        person_origin=origin,
     )
     words = [steer.words for steer in turn_capture._said_aside(identity, _put_back(1790000200.0))]
     assert words == (["TEST 游戏里能正确显示中文吗", "TEST 还没做好吗"] if taken else [])

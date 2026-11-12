@@ -12,13 +12,17 @@ from threading import Lock
 from types import SimpleNamespace
 
 from scope_recall.adapters.hermes.backpressure import HostBackpressure
-from scope_recall.adapters.hermes.boundary import host_notice
+from scope_recall.adapters.hermes.boundary import opener_origin
 from scope_recall.adapters.hermes.turn_capture import TurnCapture
 
-NOTICE = "[ASYNC DELEGATION BATCH COMPLETE] TEST background result"
+NOTICE = "TEST background result"
 STAMP = "[Mon 2026-11-02 08:00:00 CST] "
 # Corresponds to the rendered wall time above in Asia/Shanghai.
 EPOCH = 1793577600.0
+
+
+def host_notice(history, message):
+    return opener_origin(history, message, local_surface=True) == "host_generated"
 
 
 def notice_row(**changes):
@@ -59,13 +63,16 @@ class NoticeTimestampTests(unittest.TestCase):
         self.assertFalse(host_notice([notice_row(timestamp=None)], NOTICE))
 
     def test_same_classifier_is_cached_for_pre_llm_and_busy_sync_fallback(self):
-        adapter = SimpleNamespace(_said_lock=Lock(), _notice_turns={}, _holder=None, _backpressure={})
+        identity = SimpleNamespace(scope=SimpleNamespace(platform="cli"), person_origin="human_direct")
+        adapter = SimpleNamespace(
+            _said_lock=Lock(), _opener_origins={}, _holder=None, _backpressure={}, _require_identity=lambda: identity
+        )
         capture = TurnCapture(adapter)
         adapter._turns = capture
-        self.assertTrue(capture.note_opener("TEST-turn", [notice_row()], NOTICE))
-        self.assertTrue(capture.opened_by_host("TEST-turn", NOTICE))
-        self.assertFalse(capture.opened_by_host("TEST-turn", "TEST human request"))
-        self.assertFalse(capture.opened_by_host("TEST-other-turn", NOTICE))
+        self.assertTrue(capture.note_opener("TEST-turn", [notice_row()], NOTICE, identity) == "host_generated")
+        self.assertTrue(capture.remembered_origin("TEST-turn", NOTICE))
+        self.assertFalse(capture.remembered_origin("TEST-turn", "TEST human request"))
+        self.assertFalse(capture.remembered_origin("TEST-other-turn", NOTICE))
         with self.assertLogs("scope_recall.adapters.hermes.provider", level="WARNING"):
             HostBackpressure(adapter).busy(
                 "pre_llm_call",
@@ -76,7 +83,7 @@ class NoticeTimestampTests(unittest.TestCase):
                 },
             )
         self.assertEqual(adapter._turns._opening.turn_id, "TEST-busy")
-        self.assertTrue(capture.opened_by_host("TEST-busy", NOTICE))
+        self.assertTrue(capture.remembered_origin("TEST-busy", NOTICE))
 
 
 if __name__ == "__main__":

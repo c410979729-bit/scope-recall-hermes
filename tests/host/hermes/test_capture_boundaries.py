@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import sqlite3
 import time
 from contextvars import copy_context
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from scope_recall.adapters.hermes import HermesIdentityError, ScopeRecallHermesAdapter, kept_captures
 from scope_recall.adapters.hermes.boundary import (
+    _HERMES_ROW_HEADS,
+    _SUMMARY_END,
+    _TODO_HEADER,
     carries_gateway_origin,
-    host_notice,
+    opener_origin,
     person_steers,
-    sync_host_notice,
+    sync_opener_origin,
     unanswered_messages,
 )
 from scope_recall.adapters.hermes.capture import RETRY_EVENT_BYTES
@@ -48,6 +53,512 @@ def _human_words(provider):
 
 def _pre(provider, text, turn="TEST-turn", **kwargs):
     _hook(provider, "pre_llm_call", turn_id=turn, user_message=text, **kwargs)
+
+
+def test_evidence_old_answered_row_cannot_attest_request():
+    history = [dict(role="user", content="TEST go", message_id="old"), dict(role="assistant", content="TEST answer")]
+    assert opener_origin(history, "TEST go", local_surface=False) == "origin_unknown"
+    assert sync_opener_origin(history, "TEST go", local_surface=False) == "human_direct"
+
+
+@pytest.mark.parametrize("classify", [opener_origin, sync_opener_origin])
+def test_evidence_merged_row_id_attests_only_first_message(classify):
+    history = [dict(role="user", content="TEST old human\n\nTEST synthetic", message_id="old")]
+    assert classify(history, "TEST synthetic", local_surface=False) == "origin_unknown"
+    assert classify(history, "TEST old human", local_surface=False) == "human_direct"
+
+
+@pytest.mark.parametrize("classify", [opener_origin, sync_opener_origin])
+def test_evidence_substring_is_not_a_platform_message(classify):
+    history = [dict(role="user", content="TEST prefix TEST words", message_id="old")]
+    assert classify(history, "TEST words", local_surface=False) == "origin_unknown"
+
+
+def test_evidence_sync_looks_past_redirect():
+    history = [
+        dict(role="user", content="TEST ask", platform_message_id="new"),
+        dict(role="assistant", content="TEST partial"),
+        dict(
+            role="user",
+            content="TEST correct",
+            api_content="[Context from the interrupted assistant response]\nTEST context\n\nTEST correct",
+        ),
+        dict(role="assistant", content="TEST answer"),
+    ]
+    assert sync_opener_origin(history, "TEST ask", local_surface=False) == "human_direct"
+
+
+def test_evidence_sync_looks_past_synthetic_todo():
+    history = [
+        dict(role="user", content="TEST ask", platform_message_id="new"),
+        dict(role="user", content=_TODO_HEADER + " TEST tasks", _todo_snapshot_synthetic=True),
+        dict(role="assistant", content="TEST answer"),
+    ]
+    assert sync_opener_origin(history, "TEST ask", local_surface=False) == "human_direct"
+    merged = [
+        dict(
+            role="user",
+            content="TEST ask\n\n" + _TODO_HEADER + " TEST tasks",
+            platform_message_id="new",
+            _todo_snapshot_synthetic=True,
+        )
+    ]
+    assert sync_opener_origin(merged, "TEST ask", local_surface=False) == "human_direct"
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_evidence_request_looks_past_steer(merged):
+    text = "TEST ask"
+    steer = _steer("TEST correction")
+    history = (
+        [dict(role="user", content=text + "\n\n" + steer, platform_message_id="new")]
+        if merged
+        else [dict(role="user", content=text, platform_message_id="new"), _row(steer)]
+    )
+    assert opener_origin(history, text, local_surface=False) == "human_direct"
+
+
+def test_evidence_busy_human_origin_survives_lost_id(telegram, monkeypatch):
+    from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+    text = "TEST new human"
+    history = [dict(role="user", content=text, platform_message_id="new")]
+    _busy_hook(telegram, monkeypatch, turn_id="TEST-turn", user_message=text, conversation_history=history)
+    telegram.on_turn_start(11, text)
+    assert _rows(telegram) == []
+    merged = [
+        dict(role="user", content="TEST earlier", message_id="old"),
+        dict(role="assistant", content="TEST answer"),
+        dict(role="user", content="TEST old\n\n" + text),
+    ]
+    telegram.sync_turn(text, "TEST reply", messages=merged)
+    assert [(row["content"], row["origin"]) for row in _rows(telegram) if row["role"] == "user"] == [
+        (text, "human_direct")
+    ]
+
+
+def test_evidence_busy_redacted_and_raw_text_share_origin(telegram, monkeypatch):
+    from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+    raw, redacted = "TEST original text", "TEST redacted text"
+    history = [
+        dict(role="user", content="TEST earlier", message_id="old"),
+        dict(role="assistant", content="TEST answer"),
+        dict(role="user", content=raw),
+    ]
+    _busy_hook(telegram, monkeypatch, turn_id="TEST-turn", user_message=raw, conversation_history=history)
+    telegram.on_turn_start(1, redacted)
+    _hook(telegram, "pre_api_request", turn_id="TEST-turn", user_message=raw, conversation_history=None)
+    assert telegram._turns.remembered_origin("TEST-turn", raw) == "origin_unknown"
+    assert telegram._turns.remembered_origin("TEST-turn", redacted) == "origin_unknown"
+    telegram.sync_turn(redacted, "TEST reply", messages=None)
+    assert [(row["content"], row["origin"]) for row in _rows(telegram) if row["role"] == "user"] == [
+        (redacted, "origin_unknown")
+    ]
+
+
+def test_evidence_goal_prefix_is_allowed_in_redirect():
+    words = "[Continuing toward your standing goal]\nTEST explain this notice"
+    row = _redirect(words)
+    selected = person_steers([row], platform="telegram", user_id="TEST-user", local_surface=False)
+    assert [(item.kind, item.words) for item in selected] == [("redirect", words)]
+    assert opener_origin([dict(role="user", content=words)], words, local_surface=False) == "host_generated"
+
+
+def test_evidence_unattested_remembered_origin_is_unknown(telegram):
+    identity = telegram._identity
+    telegram._identity = replace(identity, scope=replace(identity.scope, platform="a2a"))
+    text = "TEST unattested"
+    _pre(telegram, text, conversation_history=[dict(role="user", content=text, platform_message_id="new")])
+    assert telegram._turns.remembered_origin("TEST-turn", text) == "origin_unknown"
+
+
+#: The note a Discord gateway puts before the message Hermes shows the model, not before the one it hands the hook
+#: (``gateway.run_inbound``).
+_ROUTING_NOTE = "[Triggering message id: `TEST-new` — use as `message_id` for reply/react/pin via the discord tools.]"
+
+
+def test_evidence_staged_row_needs_no_matching_words(telegram):
+    text = "TEST ask"
+    staged = [
+        dict(role="user", content="TEST earlier", message_id="old"),
+        dict(role="assistant", content="TEST answer"),
+        dict(role="user", content=_ROUTING_NOTE + "\n\n" + text, platform_message_id="TEST-new"),
+    ]
+    assert opener_origin(staged, text, local_surface=False, staged=True) == "human_direct"
+    # A later hook cannot tell this row from one holding other text, so its words must match there.
+    assert opener_origin(staged, text, local_surface=False) == "origin_unknown"
+    _pre(telegram, text, conversation_history=staged)
+    assert [(row["content"], row["origin"]) for row in _rows(telegram) if row["role"] == "user"] == [
+        (text, "human_direct")
+    ]
+
+
+def test_evidence_staged_row_after_a_turn_start_compaction():
+    text = "TEST ask"
+    folded = dict(
+        role="user",
+        content=f"TEST summary\n{_SUMMARY_END}\n{text}",
+        platform_message_id="TEST-new",
+        _compressed_summary=True,
+    )
+    compacted = [
+        folded,
+        dict(role="assistant", content="TEST reply the compaction moved"),
+        dict(role="user", content=_TODO_HEADER + "\n- TEST task", _todo_snapshot_synthetic=True),
+    ]
+    assert opener_origin(compacted, text, local_surface=False, staged=True) == "human_direct"
+    # Only a compaction puts a reply after the staged row, and it marks the row it folded into.
+    answered = [dict(role="user", content=text, message_id="old"), dict(role="assistant", content="TEST answer")]
+    assert opener_origin(answered, text, local_surface=False, staged=True) == "origin_unknown"
+
+
+def test_evidence_request_looks_past_the_turns_own_tool_batch(telegram):
+    text = "TEST ask"
+    staged = [dict(role="user", content=text, platform_message_id="TEST-new")]
+    later = [
+        *staged,
+        dict(
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "TEST-tool", "type": "function", "function": {"name": "TEST", "arguments": "{}"}}],
+        ),
+        dict(role="tool", tool_call_id="TEST-tool", content="TEST result"),
+        _row(_steer("TEST correction")),
+    ]
+    assert opener_origin(later, text, local_surface=False) == "human_direct"
+    # A reply that called no tool ends a turn: the same words said in that turn lend no id across it.
+    answered = [*later, dict(role="assistant", content="TEST answer")]
+    assert opener_origin(answered, text, local_surface=False) == "origin_unknown"
+    turns = telegram._turns
+    assert turns.note_opener("TEST-turn", staged, text, telegram._identity, staged=True) == "human_direct"
+    assert turns.remembered_origin("TEST-turn", text) == "human_direct"
+
+
+def test_evidence_start_does_not_lend_a_person_origin_to_other_text(telegram, monkeypatch):
+    from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+    old, synthetic = "TEST old human", "TEST synthetic"
+    _busy_hook(
+        telegram,
+        monkeypatch,
+        turn_id="TEST-old",
+        user_message=old,
+        conversation_history=[dict(role="user", content=old, message_id="old")],
+    )
+    telegram.on_turn_start(11, synthetic)
+    assert telegram._turns.remembered_origin("TEST-old", synthetic) is None
+    history = [
+        dict(role="user", content=old, message_id="old"),
+        dict(role="assistant", content="TEST answer"),
+        dict(role="user", content=synthetic),
+        dict(role="assistant", content="TEST reply"),
+    ]
+    telegram.sync_turn(synthetic, "TEST reply", messages=history)
+    assert [(row["content"], row["origin"]) for row in _rows(telegram) if row["role"] == "user"] == [
+        (synthetic, "origin_unknown")
+    ]
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_evidence_joined_row_vouches_only_for_its_first_words(staged):
+    # Hermes joins an empty row with the next one into the empty row's dictionary and records the absorbed row.
+    empty_first = [dict(role="user", content="TEST synthetic", message_id="old", _absorbed_message_uids=["TEST-u"])]
+    assert opener_origin(empty_first, "TEST synthetic", local_surface=False, staged=staged) == "origin_unknown"
+    joined = [
+        dict(
+            role="user",
+            content="TEST old human\n\nTEST synthetic",
+            message_id="old",
+            _merged_turn_prefix="TEST old human",
+            _absorbed_message_uids=["TEST-u"],
+        )
+    ]
+    assert opener_origin(joined, "TEST synthetic", local_surface=False, staged=staged) == "origin_unknown"
+    assert opener_origin(joined, "TEST old human", local_surface=False, staged=staged) == "human_direct"
+    assert sync_opener_origin(empty_first, "TEST synthetic", local_surface=False) == "origin_unknown"
+    assert sync_opener_origin(joined, "TEST old human", local_surface=False) == "human_direct"
+
+
+@pytest.mark.parametrize("classify", [opener_origin, sync_opener_origin])
+def test_evidence_spaces_before_a_replay_time_still_match(classify):
+    text = "  [Sun 2026-09-06 12:00:00 UTC] TEST ask"
+    assert classify([dict(role="user", content=text, platform_message_id="new")], text, local_surface=False) == (
+        "human_direct"
+    )
+
+
+def test_evidence_sync_passes_a_todo_list_quoting_the_opener():
+    quoting = [
+        dict(role="user", content="TEST ask", platform_message_id="new"),
+        dict(role="user", content=_TODO_HEADER + "\n- TEST ask", _todo_snapshot_synthetic=True),
+        dict(role="assistant", content="TEST answer"),
+    ]
+    assert sync_opener_origin(quoting, "TEST ask", local_surface=False) == "human_direct"
+    # A to-do row that absorbed the opener holds it, so the search stops there instead of reaching an older row.
+    absorbed = [
+        dict(role="user", content="TEST ask", message_id="older"),
+        dict(role="assistant", content="TEST earlier answer"),
+        dict(role="user", content=_TODO_HEADER + "\n- TEST task\n\nTEST ask", _todo_snapshot_synthetic=True),
+        dict(role="assistant", content="TEST answer"),
+    ]
+    assert sync_opener_origin(absorbed, "TEST ask", local_surface=False) == "origin_unknown"
+
+
+@pytest.mark.parametrize("hook", ["pre", "busy_pre", "pre_api", "sync"])
+@pytest.mark.parametrize(
+    "text,origin",
+    [
+        (
+            "[Continuing toward your standing goal]\nGoal: TEST goal\n\nContinue working toward this goal.",
+            "host_generated",
+        ),
+        ("TEST synthesized prompt", "origin_unknown"),
+        ("TEST previous human words", "origin_unknown"),
+    ],
+)
+def test_unmarked_synthetic_openers_are_not_human(telegram, monkeypatch, hook, text, origin):
+    history = [
+        dict(role="user", content="TEST previous human words", message_id="TEST-old"),
+        dict(role="assistant", content="TEST previous reply"),
+        dict(role="user", content=text),
+    ]
+    if hook == "pre":
+        _pre(telegram, text, conversation_history=history)
+    if hook == "busy_pre":
+        from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+        _busy_hook(telegram, monkeypatch, turn_id="TEST-turn", user_message=text, conversation_history=history)
+    telegram.on_turn_start(1, text)
+    if hook == "pre_api":
+        _hook(telegram, "pre_api_request", turn_id="TEST-turn", user_message=text, conversation_history=history)
+    if hook == "sync":
+        telegram.sync_turn(text, "TEST reply", messages=history)
+    assert [(row["origin"], row["content"]) for row in _rows(telegram) if row["content"] == text] == [(origin, text)]
+    assert text not in _human_words(telegram)
+
+
+@pytest.mark.parametrize("hook", ["pre", "busy_pre", "pre_api", "sync"])
+@pytest.mark.parametrize("key", ["platform_message_id", "message_id"])
+def test_platform_message_id_proves_each_opener_path(telegram, monkeypatch, hook, key):
+    text = "TEST platform message"
+    history = [
+        dict(role="user", content="TEST previous", message_id="TEST-old"),
+        dict(role="assistant", content="TEST reply"),
+        dict(role="user", content=text, **{key: "TEST-current"}),
+    ]
+    if hook == "pre":
+        _pre(telegram, text, conversation_history=history)
+    if hook == "busy_pre":
+        from tests.host.hermes.test_turn_binding_recovery import _busy_hook
+
+        _busy_hook(telegram, monkeypatch, turn_id="TEST-turn", user_message=text, conversation_history=history)
+    telegram.on_turn_start(1, text)
+    if hook == "pre_api":
+        _hook(telegram, "pre_api_request", turn_id="TEST-turn", user_message=text, conversation_history=history)
+    if hook == "sync":
+        telegram.sync_turn(text, "TEST answer", messages=history)
+    assert _human_words(telegram) == [text]
+
+
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize(
+    "text,expected",
+    [("TEST ordinary", "human_direct"), ("[Continuing toward your standing goal]\nGoal: TEST", "host_generated")],
+)
+def test_openers_without_platform_ids_keep_compatibility(local, text, expected):
+    history = [dict(role="user", content=text)]
+    assert opener_origin(history, text, local_surface=local) == expected
+    assert sync_opener_origin(history, text, local_surface=local) == expected
+
+
+@pytest.mark.parametrize(
+    "text,origin",
+    [
+        ("TEST ordinary", "human_direct"),
+        ("[Continuing toward your standing goal]\nGoal: TEST", "host_generated"),
+    ],
+)
+def test_legacy_platform_opener_is_recorded(telegram, text, origin):
+    _pre(telegram, text, conversation_history=[dict(role="user", content=text)])
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [(text, origin)]
+
+
+@pytest.mark.parametrize(
+    "text,origin",
+    [
+        ("TEST local input", "human_direct"),
+        ("[Continuing toward your standing goal]\nGoal: TEST", "host_generated"),
+    ],
+)
+def test_local_opener_is_recorded(adapter, text, origin):
+    provider, _clock = adapter
+    _pre(provider, text, conversation_history=[dict(role="user", content=text)])
+    assert [(row["content"], row["origin"]) for row in _rows(provider)] == [(text, origin)]
+
+
+@pytest.mark.parametrize("text", ["[TODO] TEST task", "[BUG] TEST issue"])
+def test_capital_bracketed_human_text_with_id_is_human(text):
+    assert (
+        opener_origin([dict(role="user", content=text, platform_message_id="TEST-id")], text, local_surface=False)
+        == "human_direct"
+    )
+
+
+@pytest.mark.parametrize(
+    "head", [head for head in _HERMES_ROW_HEADS if head != _TODO_HEADER] + ["[Continuing toward your standing goal"]
+)
+def test_a_hermes_opening_pasted_into_a_delivered_message_stays_the_persons(head):
+    """The platform's message id says the person sent it; how the text begins does not outweigh that."""
+    text = head + " TEST"
+    row = dict(role="user", content=text, platform_message_id="TEST-id")
+    assert opener_origin([row], text, local_surface=False) == "human_direct"
+    assert sync_opener_origin([row], text, local_surface=False) == "human_direct"
+
+
+def test_a_row_that_is_only_a_to_do_list_proves_no_person():
+    """Hermes strips a stale to-do snapshot when reading a row, leaving no own words even if it has an ID."""
+    text = _TODO_HEADER + " TEST"
+    row = dict(role="user", content=text, platform_message_id="TEST-id")
+    assert opener_origin([row], text, local_surface=False) == "host_generated"
+
+
+@pytest.mark.parametrize("head", (*_HERMES_ROW_HEADS, "[Continuing toward your standing goal"))
+@pytest.mark.parametrize("shape", ["other-rows-numbered", "no-row-numbered", "local"])
+def test_a_hermes_opening_without_a_platform_id_is_hermess(head, shape):
+    """With nothing proving the person, text that begins as Hermes's own rows begin is Hermes's on every surface."""
+    text = head + " TEST"
+    earlier = dict(
+        role="user", content="TEST previous", **({"message_id": "1"} if shape == "other-rows-numbered" else {})
+    )
+    history = [earlier, dict(role="assistant", content="TEST reply"), dict(role="user", content=text)]
+    assert opener_origin(history, text, local_surface=shape == "local") == "host_generated"
+    assert sync_opener_origin(history, text, local_surface=shape == "local") == "host_generated"
+
+
+@pytest.mark.parametrize("platform,origin", [("telegram", "human_direct"), ("a2a", "origin_unknown")])
+def test_the_persons_own_words_have_one_origin_per_platform(telegram, platform, origin):
+    """What the person says themselves is first-hand where the platform attests them and unknown where it does not;
+    a context that names no origin gets the same."""
+    identity = replace(telegram._identity, scope=replace(telegram._identity.scope, platform=platform))
+    assert identity.person_origin == origin
+    assert identity.trusted_context().actor_origin == origin
+
+
+def test_previous_platform_id_cannot_attest_a_different_opener():
+    history = [
+        dict(role="user", content="TEST previous", message_id="TEST-old"),
+        dict(role="assistant", content="TEST reply"),
+        dict(role="user", content=""),
+    ]
+    assert opener_origin(history, "TEST synthesized prompt", local_surface=False) == "origin_unknown"
+    assert sync_opener_origin(history, "TEST synthesized prompt", local_surface=False) == "origin_unknown"
+
+
+def test_timestamped_platform_row_attests_clean_input():
+    text = "TEST typed words"
+    history = [dict(role="user", content="[Sun 2026-09-06 12:00:00 UTC] " + text, platform_message_id="TEST-id")]
+    assert opener_origin(history, text, local_surface=False) == "human_direct"
+    assert sync_opener_origin(history, text, local_surface=False) == "human_direct"
+
+
+def test_unattested_platform_does_not_promote_a_numbered_opener(telegram):
+    identity = telegram._identity
+    telegram._identity = replace(identity, scope=replace(identity.scope, platform="a2a"))
+    text = "TEST unattested opener"
+    _pre(telegram, text, conversation_history=[dict(role="user", content=text, platform_message_id="TEST-id")])
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [(text, "origin_unknown")]
+
+
+def test_unattested_platform_steer_keeps_unknown_origin(telegram):
+    identity = telegram._identity
+    telegram._identity = replace(identity, scope=replace(identity.scope, platform="a2a"))
+    text = "TEST unattested steer"
+    steer = _steer(text).replace('"platform": "telegram"', '"platform": "a2a"')
+    telegram.on_pre_compress([_row(steer)])
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [(text, "origin_unknown")]
+
+
+def test_unknown_opener_keeps_answer_and_cannot_pause_recording(telegram, monkeypatch):
+    text = "scope-recall pause"
+    history = [
+        dict(role="user", content="TEST earlier", message_id="TEST-old"),
+        dict(role="assistant", content="TEST earlier answer"),
+        dict(role="user", content=text),
+    ]
+    opened = []
+    monkeypatch.setattr("scope_recall.adapters.hermes.turn_capture.direct_owner_cli", lambda identity: True)
+    monkeypatch.setattr(
+        "scope_recall.adapters.hermes.turn_capture.private.open_interval", lambda *a, **k: opened.append(1)
+    )
+    _pre(telegram, text, conversation_history=history)
+    telegram.on_turn_start(1, text)
+    telegram.sync_turn(text, "TEST answer", messages=history)
+    assert not opened
+    assert {(row["role"], row["origin"], row["content"]) for row in _rows(telegram)} == {
+        ("user", "origin_unknown", text),
+        ("assistant", "assistant_visible", "TEST answer"),
+    }
+
+
+def test_unknown_opener_cannot_authorize_forgetting(telegram):
+    original = "TEST original message"
+    _pre(
+        telegram, original, "TEST-original", conversation_history=[dict(role="user", content=original, message_id="1")]
+    )
+    row = _rows(telegram)[0]
+    ref, revision = row["event_id"], row["source_revision"]
+    text = f"delete {ref}"
+    history = [
+        dict(role="user", content=original, message_id="1"),
+        dict(role="assistant", content="TEST answer"),
+        dict(role="user", content=text),
+    ]
+    _pre(telegram, text, "TEST-delete", conversation_history=history)
+    context = telegram._identity.trusted_context()
+    with pytest.raises(ContractError, match="ACCESS_DENIED"):
+        telegram._core.forget(
+            context,
+            {"protocol_version": "1.1", "target_refs": [ref], "mode": "delete", "expected_revisions": {ref: revision}},
+            remaining_seconds=10,
+        )
+    assert telegram._core.source(context, ref, revision) is not None
+
+
+def test_pre_api_remembers_unknown_origin(telegram):
+    text = "TEST synthesized opener"
+    history = [
+        dict(role="user", content="TEST previous", message_id="1"),
+        dict(role="assistant", content="TEST answer"),
+        dict(role="user", content=text),
+    ]
+    telegram.on_turn_start(1, text)
+    _hook(telegram, "pre_api_request", turn_id="TEST-turn", user_message=text, conversation_history=history)
+    assert telegram._turns.remembered_origin("TEST-turn", text) == "origin_unknown"
+
+
+def test_capture_mutations_require_explicit_actor_origin():
+    """Every write must name its provenance instead of relying on the identity default."""
+    source = Path(__file__).resolve().parents[3] / "adapters" / "hermes" / "turn_capture.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    violations = []
+    for node in ast.walk(tree):
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr != "trusted_context"
+        ):
+            continue
+        keywords = {item.arg: item.value for item in node.keywords}
+        mutation = keywords.get("mutation")
+        origin = keywords.get("actor_origin")
+        if (
+            isinstance(mutation, ast.Constant)
+            and mutation.value is True
+            and (origin is None or isinstance(origin, ast.Constant) and origin.value is None)
+        ):
+            violations.append(node.lineno)
+    assert not violations, f"Capture mutations must explicitly name actor_origin; lines: {violations}"
 
 
 def test_recording_controls_release_observation_slots(telegram):
@@ -570,8 +1081,8 @@ def test_a_handed_over_opener_with_an_attachment_stays_hermess_at_the_turns_end(
 def test_origin_opener_classification_is_exact(prefix, expected):
     text = prefix + _redirect("TEST words")["content"]
     row = dict(role="user", content=text)
-    assert host_notice([row], text) is expected
-    assert sync_host_notice([row], text) is expected
+    assert (opener_origin([row], text, local_surface=False) == "host_generated") is expected
+    assert (sync_opener_origin([row], text, local_surface=False) == "host_generated") is expected
 
 
 def test_origin_check_reads_a_run_of_tags_once():
