@@ -1,4 +1,4 @@
-"""Synthetic host deliveries distinguish omitted, delayed and retained human sources."""
+"""Synthetic host deliveries distinguish omitted, delayed and retained human sources, and sources of unknown origin."""
 
 from __future__ import annotations
 
@@ -372,6 +372,15 @@ def test_paused_entry_has_no_capture(adapter):
     owner.set_entry_state("local", "paused", actor="TEST-owner")
     _pre(provider, "TEST paused entry input")
     assert _rows(provider) == _rows(provider, "capture_inbox") == []
+
+
+def test_paused_entry_drops_unanswered_history(adapter):
+    provider, _clock = adapter
+    owner, _ctx = _owner(provider)
+    owner.set_entry_state("local", "paused", actor="TEST-owner")
+    provider.on_session_end([dict(role="user", content="TEST paused history"), dict(role="user", content="TEST next")])
+    assert _rows(provider) == _rows(provider, "capture_inbox") == []
+    assert not provider._retry.captures
 
 
 @pytest.mark.parametrize("state", ["pending_review", "quarantined"])
@@ -835,6 +844,21 @@ def test_redirect_during_private_interval_is_not_recovered(adapter):
     assert "TEST private redirect" not in _human_words(provider)
 
 
+def test_unanswered_during_private_interval_is_not_recovered(adapter):
+    provider, clock = adapter
+    _owner_api, ctx = _owner(provider)
+    provider.observe_pre_llm(session_id=ctx.session_id, turn_id="TEST-pause", user_message="scope-recall pause")
+    history = [
+        dict(role="user", content="TEST private history", timestamp=1788696000),
+        dict(role="user", content="TEST next"),
+    ]
+    provider.on_pre_compress(history)
+    clock.now = "2026-09-06T13:00:00Z"
+    provider.observe_pre_llm(session_id=ctx.session_id, turn_id="TEST-resume", user_message="scope-recall resume")
+    provider.on_session_end(history)
+    assert _rows(provider) == _rows(provider, "capture_inbox") == []
+
+
 def test_deleted_redirect_is_not_recaptured(telegram):
     row = _redirect("TEST correction to delete")
     telegram.on_pre_compress([row])
@@ -852,6 +876,29 @@ def test_deleted_redirect_is_not_recaptured(telegram):
     telegram.on_session_end([row])
     assert telegram._core.source(context, ref, revision) is None
     assert sum(item["content"] == "TEST correction to delete" for item in _rows(telegram)) <= 1
+
+
+def test_deleted_unanswered_row_is_not_recaptured(telegram):
+    history = [
+        dict(role="user", content="TEST history to delete", timestamp=1788696000),
+        dict(role="user", content="TEST next"),
+    ]
+    telegram.on_pre_compress(history)
+    source = next(item for item in _rows(telegram) if item["content"] == "TEST history to delete")
+    assert source["origin"] == "origin_unknown"
+    ref, revision = source["event_id"], source["source_revision"]
+    _pre(telegram, f"删除 {ref}", "TEST-delete")
+    context = telegram._identity.trusted_context()
+    telegram._core.forget(
+        context,
+        {"protocol_version": "1.1", "target_refs": [ref], "mode": "delete", "expected_revisions": {ref: revision}},
+        remaining_seconds=10,
+    )
+    telegram._steers_written.clear()
+    telegram._ledger.reset()
+    telegram.on_session_end(history)
+    assert telegram._core.source(context, ref, revision) is None
+    assert sum(item["content"] == "TEST history to delete" for item in _rows(telegram)) <= 1
 
 
 @pytest.mark.parametrize("identified", [False, True])
@@ -873,7 +920,97 @@ def test_recovered_unanswered_message_needs_a_private_chat(telegram, group):
         dict(role="user", content="TEST current input", timestamp=1788696060),
     ]
     telegram.on_session_end(rows)
-    assert _human_words(telegram) == ([] if group else ["TEST recovered input"])
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == (
+        [] if group else [("TEST recovered input", "origin_unknown")]
+    )
+
+
+@pytest.mark.parametrize("first", ["session_end", "pre_compress", "sync_turn"])
+def test_unanswered_row_has_unknown_origin_whichever_hook_reads_it_first(telegram, first):
+    """Each hook that reads the conversation stores an unanswered row with an unknown origin on its own; read again by
+    the others, it stays that one source."""
+    history = [
+        dict(role="user", content="TEST unanswered input", timestamp=1788696000),
+        dict(role="user", content="TEST next input", timestamp=1788696060),
+    ]
+    readers = {
+        "session_end": lambda: telegram.on_session_end(history),
+        "pre_compress": lambda: telegram.on_pre_compress(history),
+        "sync_turn": lambda: telegram.sync_turn(
+            "TEST next input", "TEST reply", session_id="TEST-session-tg", messages=history
+        ),
+    }
+
+    def stored():
+        return [(row["role"], row["origin"]) for row in _rows(telegram) if row["content"] == "TEST unanswered input"]
+
+    readers[first]()
+    assert stored() == [("user", "origin_unknown")]
+    for read in readers.values():
+        read()
+    assert stored() == [("user", "origin_unknown")]
+
+
+def test_an_unanswered_row_kept_to_retry_keeps_its_unknown_origin(telegram, monkeypatch):
+    """A busy store leaves the capture in the retry buffer with the context it was built under: written later, the row
+    is still of unknown origin."""
+    real = telegram._core.record_host_event
+
+    def busy(context, event, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(telegram._core, "record_host_event", busy)
+    monkeypatch.setattr(telegram._retry, "start", lambda: None)
+    telegram.on_pre_compress(
+        [
+            dict(role="user", content="TEST unanswered input", timestamp=1788696000),
+            dict(role="user", content="TEST next input", timestamp=1788696060),
+        ]
+    )
+    assert telegram._retry.captures and _rows(telegram) == []
+    monkeypatch.setattr(telegram._core, "record_host_event", real)
+    telegram._retry.write_buffered()
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [("TEST unanswered input", "origin_unknown")]
+
+
+def test_unanswered_row_and_delivered_corrections_keep_distinct_origins(telegram):
+    history = [
+        _row(_steer("TEST steer", message_id="TEST-steer"), timestamp=1788695990),
+        _redirect("TEST redirect", timestamp=1788695991),
+        dict(role="user", content="TEST unanswered", timestamp=1788696000),
+        dict(role="user", content="TEST next", timestamp=1788696060),
+    ]
+    telegram.on_session_end(history)
+    assert {(row["content"], row["origin"]) for row in _rows(telegram)} == {
+        ("TEST steer", "human_direct"),
+        ("TEST redirect", "human_direct"),
+        ("TEST unanswered", "origin_unknown"),
+    }
+
+
+def test_stored_opener_is_not_duplicated_as_unanswered(telegram):
+    telegram.on_turn_start(1, "TEST opener", turn_id="TEST-opener")
+    telegram.observe_pre_llm(session_id="TEST-session-tg", turn_id="TEST-opener", user_message="TEST opener")
+    # The store takes a row for a copy it holds when both were said within two minutes; this fixture runs on the
+    # real clock, so the row is dated now, as the opener just stored was.
+    telegram.on_session_end(
+        [dict(role="user", content="TEST opener", timestamp=time.time()), dict(role="user", content="TEST next")]
+    )
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [("TEST opener", "human_direct")]
+
+
+def test_previously_stored_unanswered_key_keeps_its_origin(telegram):
+    history = [
+        dict(role="user", content="TEST older recovery", timestamp=1788696000),
+        dict(role="user", content="TEST next"),
+    ]
+    identity = telegram._require_identity()
+    context = identity.trusted_context(session_id=identity.session_id, mutation=True)
+    telegram._turns._write_steers(unanswered_messages(history), identity, context, "TEST-old-recovery")
+    telegram._steers_written.clear()
+    telegram._ledger.reset()
+    telegram.on_session_end(history)
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [("TEST older recovery", "human_direct")]
 
 
 def test_untimed_recovered_equal_messages_share_a_fallback_identity(telegram):
@@ -883,7 +1020,9 @@ def test_untimed_recovered_equal_messages_share_a_fallback_identity(telegram):
         dict(role="user", content="TEST current input"),
     ]
     telegram.on_session_end(rows)
-    assert _human_words(telegram) == ["TEST repeated recovered input"]
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == [
+        ("TEST repeated recovered input", "origin_unknown")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -932,12 +1071,12 @@ def test_recovered_notice_shaped_text_is_not_promoted(telegram, text):
 def test_recovered_rows_hermes_wrote_are_not_promoted(telegram, text, kept):
     """A restarted gateway replays the rows Hermes wrote into a private chat with nothing marking them: steers it
     handed over and notices, behind the time a replay may put before them, what a cron job or a webhook delivered
-    into the chat, and any of these joined to the person's words a blank line apart.  None is taken for something the
-    person said; their own words still are, joined or not."""
+    into the chat, and any of these joined to other words a blank line apart. Recognized rows are omitted; the
+    remaining rows have unknown authors."""
     telegram.on_session_end(
         [
             dict(role="user", content=text, timestamp=1788696000),
             dict(role="user", content="TEST current input", timestamp=1788696060),
         ]
     )
-    assert bool(_human_words(telegram)) is kept
+    assert [(row["content"], row["origin"]) for row in _rows(telegram)] == ([(text, "origin_unknown")] if kept else [])
