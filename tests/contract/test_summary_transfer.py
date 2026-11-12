@@ -23,7 +23,7 @@ from tests.contract.test_importance_summaries import app, build
 from tests.host.codex.test_merged_host_boundaries import client
 from tests.host.codex.test_shared_client import _hermes, store
 from tests.host.hermes.test_two_entries_one_store import _old_store, _scope, entries, root
-from tests.v11_support import source_event
+from tests.v11_support import replay_capture_inbox, source_event
 
 
 def _idle_jobs(core, context):
@@ -84,6 +84,10 @@ def test_four_client_hosts_reach_the_same_thirty_minute_summary_boundary(client,
             )
         )
         ctx = trusted_context(hook.config, resolve_runtime_audience(hook.config, None), session_id="TEST-idle-session")
+        writer = trusted_context(
+            hook.config, resolve_runtime_audience(hook.config, None), session_id="TEST-idle-session", mutation=True
+        )
+        replay_capture_inbox(hook.core, writer, host="client")
         _idle_jobs(hook.core, ctx)
         assert calls
     finally:
@@ -101,6 +105,7 @@ def test_hermes_reaches_the_same_thirty_minute_summary_boundary(store, monkeypat
             turn_id="TEST-summary-idle",
             user_message="TEST-summary Hermes captured a safe result.",
         )
+        replay_capture_inbox(provider._core, provider._require_identity().trusted_context(mutation=True), host="hermes")
         _idle_jobs(provider._core, provider._require_identity().trusted_context())
         assert calls
     finally:
