@@ -221,6 +221,8 @@ def fence_epoch(
     if retracted is not None and type(view["memory_epoch"]) is int and not retracted(view["memory_epoch"]):
         return view
     fenced = cast(dict[str, Any], scrub_no_content(view))
+    if "candidate_groups" in fenced:
+        fenced["candidate_groups"] = []
     fenced.update(
         status="unavailable",
         memory_epoch=current_epoch,

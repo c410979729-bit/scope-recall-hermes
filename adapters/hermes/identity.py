@@ -24,7 +24,14 @@ from scope_recall.contracts import (
 from ...core.private import normalize_project_path
 from ...runtime.remote_clock import stored_session_id as session_identity
 from ...runtime.worker_launch import RUNTIME_CONFIG_FILENAME
-from ..host_identity import HermesRuntimeScope, RuntimeAudience, entry_owner, principal_ref, resolve_runtime_audience
+from ..host_identity import (
+    HermesRuntimeScope,
+    RuntimeAudience,
+    entry_owner,
+    owner_subjects,
+    principal_ref,
+    resolve_runtime_audience,
+)
 from ..host_identity import context_ref as _context_ref
 from ..host_identity import host_scope_payload as host_scope_payload
 from .audiences import LOCAL_PLATFORMS, LOCAL_USER_ID, approved_local_platforms
@@ -178,6 +185,8 @@ def _normalize_chat_type(value: object) -> str:
 
 @dataclass(frozen=True)
 class HermesIdentity:
+    """An immutable manifest-approved message route, separate from the process's local owner."""
+
     hermes_home: Path
     session_id: str
     parent_session_id: str
@@ -296,6 +305,7 @@ class HermesIdentity:
             entry_id=self.entry_id,
             project_root=root,
             owner_resolver=partial(entry_owner, self.binding),
+            subject_resolver=partial(owner_subjects, self.binding, self.entry_id or ""),
         )
 
     def _agent_workspace_path(self) -> str | None:

@@ -1247,12 +1247,20 @@ def test_a_server_stopped_once_does_not_wait_for_a_stuck_recall_again_at_exit(en
 
 def test_prompt_and_mcp_publish_activity_without_starting_a_process(entry, monkeypatch, capsys):
     from scope_recall.adapters.clients import hook_entry, mcp_entry
+    from scope_recall.adapters.clients.config import load_shared_client
+    from scope_recall.adapters.clients.identity import resolve_runtime_audience, trusted_context
 
     _runtime_config(entry)
     started = []
     monkeypatch.setattr(local_endpoint, "ensure_resident", lambda *a, **k: started.append(True))
     monkeypatch.setattr(local_endpoint, "serve", lambda *a, **k: started.append(True))
-    monkeypatch.setattr(mcp_entry, "build_server", lambda *a, **k: type("Server", (), {"server": object()})())
+    config = load_shared_client(entry, "workbuddy")
+    context = trusted_context(
+        config, resolve_runtime_audience(config, None), session_id="TEST-mcp", actor_origin="memory_reinjection"
+    )
+    monkeypatch.setattr(
+        mcp_entry, "build_server", lambda *a, **k: type("Server", (), {"server": object(), "context": context})()
+    )
     monkeypatch.setattr(mcp_entry, "run_stdio", lambda server: None)
     assert mcp_entry.main(["--home", str(entry), "--host", "workbuddy"]) == 0
     _hook(monkeypatch, {"hook_event_name": "UserPromptSubmit", "session_id": "TEST-service", "prompt": "TEST color"})
