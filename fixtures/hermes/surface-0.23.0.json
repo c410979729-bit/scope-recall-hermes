@@ -1328,6 +1328,37 @@
     {
       "locations": [
         {
+          "file": "gateway/run_busy.py",
+          "function": "GatewayBusySessionMixin._is_goal_continuation_event",
+          "line": 308
+        },
+        {
+          "file": "hermes_cli/goals.py",
+          "function": "<module>",
+          "line": 61
+        },
+        {
+          "file": "hermes_cli/goals.py",
+          "function": "<module>",
+          "line": 71
+        },
+        {
+          "file": "hermes_cli/goals.py",
+          "function": "<module>",
+          "line": 85
+        },
+        {
+          "file": "hermes_cli/goals.py",
+          "function": "<module>",
+          "line": 98
+        }
+      ],
+      "name": "_GOAL_CONTINUATION_HEAD",
+      "text": "[Continuing toward your standing goal"
+    },
+    {
+      "locations": [
+        {
           "file": "gateway/run_notifications.py",
           "function": "GatewayNotificationsMixin._format_process_final_message",
           "line": 1807
@@ -1737,6 +1768,85 @@
     {
       "locations": [
         {
+          "file": "agent/message_metadata.py",
+          "function": "<module>",
+          "line": 30
+        }
+      ],
+      "name": "_MERGED_PREFIX",
+      "text": "_merged_turn_prefix"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/message_metadata.py",
+          "function": "<module>",
+          "line": 30
+        }
+      ],
+      "name": "_MERGE_WITNESSES[0]",
+      "text": "_merged_turn_prefix"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/message_metadata.py",
+          "function": "<module>",
+          "line": 39
+        }
+      ],
+      "name": "_MERGE_WITNESSES[1]",
+      "text": "_absorbed_message_uids"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/agent_runtime_helpers.py",
+          "function": "_merge_consecutive_users",
+          "line": 724
+        },
+        {
+          "file": "agent/agent_runtime_helpers.py",
+          "function": "_remember_absorbed_row",
+          "line": 478
+        },
+        {
+          "file": "agent/agent_runtime_helpers.py",
+          "function": "_remember_absorbed_row",
+          "line": 482
+        },
+        {
+          "file": "agent/conversation_compression_archive.py",
+          "function": "<module>",
+          "line": 13
+        },
+        {
+          "file": "agent/conversation_compression_manual.py",
+          "function": "compress_now",
+          "line": 123
+        },
+        {
+          "file": "agent/conversation_compression_manual.py",
+          "function": "compress_now",
+          "line": 126
+        },
+        {
+          "file": "tui_gateway/methods_prompt.py",
+          "function": "_archived_user_turns",
+          "line": 472
+        },
+        {
+          "file": "tui_gateway/methods_prompt.py",
+          "function": "_resolve_truncate_row_id",
+          "line": 160
+        }
+      ],
+      "name": "_MERGE_WITNESSES[2]",
+      "text": "_absorbed_row_ids"
+    },
+    {
+      "locations": [
+        {
           "file": "agent/context_compressor.py",
           "function": "<module>",
           "line": 514
@@ -1888,6 +1998,182 @@
       ],
       "name": "_SUMMARY_END",
       "text": "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/context_compressor.py",
+          "function": "_salvage_reduce_todo_snapshot",
+          "line": 556
+        },
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "<module>",
+          "line": 2167
+        },
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "_fold_todo_snapshot",
+          "line": 3024
+        },
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "_fold_todo_snapshot",
+          "line": 3036
+        },
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "_fold_todo_snapshot",
+          "line": 3072
+        },
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "_fold_todo_snapshot",
+          "line": 3075
+        }
+      ],
+      "name": "_SYNTHETIC_USER_FLAGS[0]",
+      "text": "_todo_snapshot_synthetic"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "<module>",
+          "line": 2167
+        },
+        {
+          "file": "agent/session_persistence.py",
+          "function": "<module>",
+          "line": 37
+        },
+        {
+          "file": "agent/session_persistence.py",
+          "function": "SessionPersistenceMixin._drop_trailing_empty_response_scaffolding",
+          "line": 538
+        },
+        {
+          "file": "agent/turn_empty_response.py",
+          "function": "recover_empty_response",
+          "line": 237
+        },
+        {
+          "file": "agent/turn_empty_response.py",
+          "function": "recover_empty_response",
+          "line": 240
+        },
+        {
+          "file": "agent/turn_final_response.py",
+          "function": "<module>",
+          "line": 34
+        }
+      ],
+      "name": "_SYNTHETIC_USER_FLAGS[1]",
+      "text": "_empty_recovery_synthetic"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "<module>",
+          "line": 2167
+        },
+        {
+          "file": "agent/session_persistence.py",
+          "function": "<module>",
+          "line": 40
+        },
+        {
+          "file": "agent/turn_finalizer.py",
+          "function": "<module>",
+          "line": 28
+        },
+        {
+          "file": "agent/turn_stop_gates.py",
+          "function": "apply_stop_gates",
+          "line": 185
+        }
+      ],
+      "name": "_SYNTHETIC_USER_FLAGS[2]",
+      "text": "_verification_stop_synthetic"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "<module>",
+          "line": 2167
+        },
+        {
+          "file": "agent/session_persistence.py",
+          "function": "<module>",
+          "line": 41
+        },
+        {
+          "file": "agent/turn_finalizer.py",
+          "function": "<module>",
+          "line": 28
+        },
+        {
+          "file": "agent/turn_stop_gates.py",
+          "function": "apply_stop_gates",
+          "line": 198
+        }
+      ],
+      "name": "_SYNTHETIC_USER_FLAGS[3]",
+      "text": "_pre_verify_synthetic"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/conversation_compression.py",
+          "function": "<module>",
+          "line": 2168
+        },
+        {
+          "file": "agent/session_persistence.py",
+          "function": "<module>",
+          "line": 43
+        },
+        {
+          "file": "agent/turn_final_response.py",
+          "function": "<module>",
+          "line": 35
+        },
+        {
+          "file": "agent/turn_final_response.py",
+          "function": "finish_text_response",
+          "line": 352
+        },
+        {
+          "file": "agent/turn_final_response.py",
+          "function": "finish_text_response",
+          "line": 357
+        }
+      ],
+      "name": "_SYNTHETIC_USER_FLAGS[4]",
+      "text": "_dropped_toolcall_nudge"
+    },
+    {
+      "locations": [
+        {
+          "file": "agent/session_persistence.py",
+          "function": "<module>",
+          "line": 42
+        },
+        {
+          "file": "agent/turn_stop_gates.py",
+          "function": "apply_stop_gates",
+          "line": 206
+        },
+        {
+          "file": "agent/turn_stop_gates.py",
+          "function": "apply_stop_gates",
+          "line": 208
+        }
+      ],
+      "name": "_SYNTHETIC_USER_FLAGS[5]",
+      "text": "_kanban_stop_synthetic"
     },
     {
       "locations": [
