@@ -108,6 +108,14 @@ def pytest_runtest_makereport(item, call):
 
 
 @pytest.fixture(autouse=True)
+def _wait_for_recall_log_writes(monkeypatch):
+    """Wait for writes, with a hang limit; completed writes return immediately."""
+    from scope_recall.core import recall_log_writer
+
+    monkeypatch.setattr(recall_log_writer, "VIEW_WAIT_SECONDS", 60.0)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_posix_truth_hardening_cache():
     """Reset process-local POSIX hardening records around every test."""
 
