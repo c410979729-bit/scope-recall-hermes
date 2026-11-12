@@ -21,6 +21,8 @@ include docs/core-storage-mapping.md
 include docs/codex-cli-consolidation.md
 include docs/autonomous-memory.md
 prune tests
+exclude scripts/hermes_surface.py
+prune fixtures/hermes
 recursive-include packaging_hooks *.py
 include packaging/v11-module-allowlist.json
 # The checker ships with the modules it imports.
