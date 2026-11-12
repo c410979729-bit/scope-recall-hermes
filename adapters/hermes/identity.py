@@ -43,7 +43,10 @@ from .installation import (
 from .shared_entries import load_binding_for_home
 
 _NON_PRIMARY_CONTEXTS = frozenset({"subagent", "cron", "flush"})
-_UNATTESTED_HUMAN_PLATFORMS = frozenset({"a2a"})
+#: Platforms whose sender is not a person typing to the agent: another agent (A2A), and an external service's event
+#: rendered into a prompt (``gateway.platforms.webhook`` and ``gateway.platforms.msgraph_webhook`` name the sender
+#: ``webhook:<route>`` or ``msgraph``), which can carry other people's text.
+_UNATTESTED_HUMAN_PLATFORMS = frozenset({"a2a", "webhook", "msgraph_webhook"})
 #: The session key Hermes's gateway gives a conversation its local session transport runs:
 #: ``agent:<profile>:local:dm:<chat id>``.  A profile id holds no colon (``main`` is the default profile's namespace,
 #: ``main~`` the one of a profile named ``main``).
@@ -244,9 +247,9 @@ class HermesIdentity:
     def person_origin(self) -> str:
         """The origin of what the session's person says themselves on this platform.
 
-        A platform identity does not prove every word was authored by the person. A2A is unknown when the resolved
-        platform is ``a2a``; an A2A message routed through a local platform is outside this check. A capture naming no
-        origin uses this value.
+        A platform identity does not prove every word was authored by the person. It is unknown on the platforms in
+        ``_UNATTESTED_HUMAN_PLATFORMS`` (A2A and webhook deliveries), judged by the resolved platform: an A2A message
+        routed through a local platform is outside this check. A capture naming no origin uses this value.
         """
         return "origin_unknown" if self.scope.platform in _UNATTESTED_HUMAN_PLATFORMS else "human_direct"
 
