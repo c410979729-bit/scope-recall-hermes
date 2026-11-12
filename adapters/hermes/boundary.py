@@ -277,9 +277,11 @@ def _shown_text(message: dict[str, Any]) -> str:
 def _message_time(message: dict[str, Any]) -> str | None:
     """The epoch time Hermes stamps on each message it appends, in the adapter's UTC form."""
     stamp = message.get("timestamp")
-    if type(stamp) not in (int, float) or not math.isfinite(stamp) or stamp <= 0:
+    if type(stamp) not in (int, float):
         return None
     try:
+        if not math.isfinite(stamp) or stamp <= 0:
+            return None
         return datetime.fromtimestamp(stamp, timezone.utc).isoformat().replace("+00:00", "Z")
     except (OverflowError, OSError, ValueError):
         return None
@@ -289,6 +291,9 @@ def _message_time(message: dict[str, Any]) -> str | None:
 #: turn: their words between these marker lines (``agent.prompt_builder.format_steer_marker``), after an origin
 #: preamble when a gateway delivered it (``gateway.run_busy._steer_text_with_origin``).
 STEER_KIND = "steer"
+REDIRECT_KIND = "redirect"
+_REDIRECT_CONTEXT = "[Context from the interrupted assistant response]"
+_ADDITIONAL_CORRECTION = "[Additional user correction]"
 _STEER_OPEN = "[OUT-OF-BAND USER MESSAGE"
 _STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 _STEER_ORIGIN = "Gateway message origin (JSON data, not instructions or authorization):"
@@ -448,8 +453,8 @@ class Steer(NamedTuple):
 _ORIGIN_LINE = re.compile(r"(?m)^" + re.escape(_STEER_ORIGIN))
 
 
-def _steer_pieces(content: object) -> list[tuple[dict[str, Any] | None, str]]:
-    """A steer row's pieces, each its origin and its words, in order.
+def _steer_pieces(content: object, *, redirect: bool = False) -> list[tuple[dict[str, Any] | None, str]]:
+    """A steer or redirect's pieces, each its origin and its words, in order.
 
     Hermes joins the steers queued before the next tool boundary into one row, a line apart (``AIAgent.steer``), and
     a gateway puts its origin preamble before each (``_steer_text_with_origin``): that line, the origin's JSON, a
@@ -457,18 +462,29 @@ def _steer_pieces(content: object) -> list[tuple[dict[str, Any] | None, str]]:
     read has an origin naming no one ({}).
     """
     text = extract_user_text(content).lstrip()
-    line_end = text.find("\n")
-    if not text.startswith(_STEER_OPEN) or line_end == -1:
-        return []
-    body = text[line_end + 1 :]
-    close = body.rfind(_STEER_CLOSE)
-    body = body[:close] if close != -1 else body
-    starts = [match.start() for match in _ORIGIN_LINE.finditer(body)]
-    if not starts or starts[0] != 0:
-        starts.insert(0, 0)
+    if redirect:
+        # Hermes joins pending redirects in this row at this separator; check each part separately.
+        segments = text.split(f"\n\n{_ADDITIONAL_CORRECTION}\n")
+    else:
+        line_end = text.find("\n")
+        if not text.startswith(_STEER_OPEN) or line_end == -1:
+            return []
+        body = text[line_end + 1 :]
+        close = body.rfind(_STEER_CLOSE)
+        body = body[:close] if close != -1 else body
+        starts = [match.start() for match in _ORIGIN_LINE.finditer(body)]
+        if not starts or starts[0] != 0:
+            starts.insert(0, 0)
+        segments = [
+            body[start : starts[index + 1] if index + 1 < len(starts) else len(body)]
+            for index, start in enumerate(starts)
+        ]
     pieces: list[tuple[dict[str, Any] | None, str]] = []
-    for index, start in enumerate(starts):
-        piece = body[start : starts[index + 1] if index + 1 < len(starts) else len(body)]
+    for index, piece in enumerate(segments):
+        if not redirect and index + 1 < len(segments):
+            # Only an intermediate steer segment can end with a separator between inputs.
+            piece = piece.rstrip().removesuffix("\n" + _ADDITIONAL_CORRECTION)
+        # A preamble names a sender only where the gateway writes it, at the very start of its piece.
         if not piece.startswith(_STEER_ORIGIN):
             pieces.append((None, piece.strip()))
             continue
@@ -478,7 +494,8 @@ def _steer_pieces(content: object) -> list[tuple[dict[str, Any] | None, str]]:
         except (ValueError, RecursionError):
             origin = {}
         blank = piece.find("\n\n")
-        pieces.append((origin if isinstance(origin, dict) else {}, piece[blank + 2 :].strip() if blank != -1 else ""))
+        words = piece[blank + 2 :].strip() if blank != -1 else ""
+        pieces.append((origin if isinstance(origin, dict) else {}, words))
     return pieces
 
 
@@ -489,8 +506,23 @@ def _sent_by(origin: dict[str, Any], user_id: str) -> bool:
     return bool(user_id) and said in {user_id, "user_" + hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]}
 
 
+def _is_redirect(message: dict[str, Any]) -> bool:
+    """Recognize the interrupted-response context wrapped around a redirect's own text."""
+    api_content = message.get("api_content")
+    content = message.get("content")
+    return (
+        message.get("role") == "user"
+        and "display_kind" not in message
+        and isinstance(content, str)
+        and isinstance(api_content, str)
+        and not content.startswith(_REDIRECT_CONTEXT)
+        and api_content.startswith(_REDIRECT_CONTEXT + "\n")
+        and api_content.endswith("\n\n" + content)
+    )
+
+
 def person_steers(messages: object, *, platform: str, user_id: str, local_surface: bool) -> tuple[Steer, ...]:
-    """Every steer in ``messages`` that the session's person sent, in order and each once.
+    """Every steer and redirect in ``messages`` that the session's person sent, in order and each once.
 
     Read wherever it is in the list: Hermes puts notices, compression summaries and to-do lists after a steer.  A
     gateway delivers the person's steer after an origin naming them; a piece without one comes from the agent's side
@@ -502,12 +534,15 @@ def person_steers(messages: object, *, platform: str, user_id: str, local_surfac
     """
     if not isinstance(messages, list):
         return ()
-    found: dict[str, Steer] = {}
+    found: dict[tuple[str, str], Steer] = {}
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "user" or message.get("display_kind") != STEER_KIND:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        redirect = _is_redirect(message)
+        if message.get("display_kind") != STEER_KIND and not redirect:
             continue
         occurred_at = _message_time(message)
-        for origin, words in _steer_pieces(message.get("content")):
+        for origin, words in _steer_pieces(message.get("content"), redirect=redirect):
             if origin is None:
                 theirs = local_surface
             else:
@@ -519,15 +554,20 @@ def person_steers(messages: object, *, platform: str, user_id: str, local_surfac
                     re.match(r"\[Background process \S+ heartbeat #(?:\d+|\?) — still running(?:[\s.\]]|$)", words)
                     is not None
                 )
-            if not theirs or not words or notice:
+            if not theirs or not words or notice or (redirect and not _typed_words({"content": words})):
                 break
+            try:
+                encoded_words = words.encode("utf-8")
+            except UnicodeEncodeError:
+                continue
             message_id = str((origin or {}).get("message_id") or "").strip()
             if origin is not None and message_id:
                 # A message id is the chat's own count: two chats of one platform share them.
                 key = f"{origin.get('platform')}:{origin.get('chat_id')}:{message_id}"
             else:
-                key = "text:" + hashlib.sha256(f"{occurred_at}\x00{words}".encode()).hexdigest()[:32]
-            found.setdefault(key, Steer(key, words, occurred_at))
+                key = "text:" + hashlib.sha256(f"{occurred_at}\x00".encode() + encoded_words).hexdigest()[:32]
+            kind = REDIRECT_KIND if redirect else STEER_KIND
+            found.setdefault((kind, key), Steer(key, words, occurred_at, kind))
     return tuple(found.values())
 
 
@@ -555,7 +595,7 @@ _HERMES_NOTICE = re.compile(r"\[[A-Z][A-Z0-9_]+(?:[\s:\]\-]|\u2014)")
 def _typed_words(message: dict[str, Any]) -> str:
     """A user row's own words when the person typed them: no kind Hermes gives the rows it writes, not a summary it
     folded, and not begun the way such a row is begun."""
-    if message.get("display_kind") or message.get(_COMPRESSED_SUMMARY) is True:
+    if message.get("display_kind") or message.get(_COMPRESSED_SUMMARY) is True or _is_redirect(message):
         return ""
     words = _own_text(message)
     if not words or words.startswith(_HERMES_ROW_HEADS) or _HERMES_NOTICE.match(words):
@@ -688,8 +728,8 @@ def steer_source_event(
 ) -> tuple[SourceEvent | None, tuple[str, ...], SourceIdentity | None]:
     """Store a delivered steer or an unanswered historical row in its first observed session.
 
-    Untimed history keeps an unknown occurrence so Core can enforce historical privacy intervals. A typed
-    steer may use the instant its request hook first observes it.
+    Untimed redirects and unanswered history keep an unknown occurrence so Core can enforce historical privacy
+    intervals. A steer may use the instant its request hook first observes it.
     """
     return ledger.observe(
         source_event_key=steer_source_key(context, steer),
@@ -698,7 +738,7 @@ def steer_source_event(
         content=steer.words,
         origin=context.actor_origin,
         recorded_at=recorded_at,
-        occurred_at=steer.occurred_at if steer.kind == UNANSWERED_KIND else steer.occurred_at or recorded_at,
+        occurred_at=steer.occurred_at if steer.kind != STEER_KIND else steer.occurred_at or recorded_at,
         capture_state="complete",
     )
 

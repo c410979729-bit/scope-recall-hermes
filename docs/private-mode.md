@@ -240,17 +240,24 @@ a client that is offline.
   positions advance, and eligible later lines are delivered.
   An old question that could belong to a full interval is refused as well; turning
   on read-only mode later does not release it as a recall question.
-- Hermes writes turns, compressed context, steers, tool results, retries and
+- Hermes writes turns, compressed context, steers, redirects, tool results, retries and
   kept captures through the capture writer, which checks before writing its retry
   buffer or `kept-captures/` file. A `full` or `read-only` interval therefore
   refuses the event before those local copies exist. Deferred assistant replies
-  and user steers keep no private body in memory; only identity and observation
+  and user steers and redirects keep no private body in memory; only identity and observation
   times are retained for delayed callbacks. A discarded retry is removed once
   and is not counted as persisted at shutdown or expiry, including a write that
   finishes after shutdown. Historical messages without an established time are
   checked before their bodies enter those caches. A Hermes project rule uses
   the gateway's `agent_workspace` only when it is an absolute path; a workspace
   label is not treated as a filesystem path.
+- Hermes records a person's mid-turn steer or redirect as a separate source. Joined
+  redirect rows in Hermes' native format are checked one message at a time and stop
+  at the first untrusted sender.
+  Gateway messages must identify the session's sender and, outside local surfaces,
+  match its platform; local input needs no gateway origin. Host notifications are
+  excluded. A redirect without a timestamp
+  keeps an unknown occurrence time for privacy checks.
 - A shared-store client's local MCP server uses that MCP server process's
   working directory as its project directory when the host gives no workspace,
   so a project `full` interval also gates its `recall`, `profile`, `entity` and
