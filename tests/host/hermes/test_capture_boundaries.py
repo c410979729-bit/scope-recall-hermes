@@ -436,13 +436,32 @@ def test_a_hermes_opening_without_a_platform_id_is_hermess(head, shape):
     assert sync_opener_origin(history, text, local_surface=shape == "local") == "host_generated"
 
 
-@pytest.mark.parametrize("platform,origin", [("telegram", "human_direct"), ("a2a", "origin_unknown")])
+@pytest.mark.parametrize(
+    "platform,origin",
+    [
+        ("telegram", "human_direct"),
+        ("a2a", "origin_unknown"),
+        ("webhook", "origin_unknown"),
+        ("msgraph_webhook", "origin_unknown"),
+    ],
+)
 def test_the_persons_own_words_have_one_origin_per_platform(telegram, platform, origin):
     """What the person says themselves is first-hand where the platform attests them and unknown where it does not;
     a context that names no origin gets the same."""
     identity = replace(telegram._identity, scope=replace(telegram._identity.scope, platform=platform))
     assert identity.person_origin == origin
     assert identity.trusted_context().actor_origin == origin
+
+
+def test_a_webhook_delivery_is_not_the_persons_words(telegram):
+    # A webhook route renders an external service's event, which can quote someone else, and carries a delivery id.
+    identity = telegram._identity
+    telegram._identity = replace(identity, scope=replace(identity.scope, platform="webhook"))
+    text = "TEST a comment someone else wrote on a pull request"
+    _pre(telegram, text, conversation_history=[dict(role="user", content=text, platform_message_id="TEST-delivery")])
+    assert [(row["content"], row["origin"]) for row in _rows(telegram) if row["role"] == "user"] == [
+        (text, "origin_unknown")
+    ]
 
 
 def test_previous_platform_id_cannot_attest_a_different_opener():

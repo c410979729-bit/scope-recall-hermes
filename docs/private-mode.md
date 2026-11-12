@@ -286,8 +286,10 @@ a client that is offline.
   `/retry` and Discord voice-channel transcripts. When no user row has an ID, the
   earlier human fallback applies: this includes older hosts, platforms such as
   SimpleX, and first turns of host-created sessions such as scheduled jobs or `/bg`.
-  If the resolved platform is A2A, human input is capped at unknown origin; A2A
-  input routed through a local platform is outside that check.
+  If the resolved platform is A2A, or a webhook route (`webhook`,
+  `msgraph_webhook`) that renders an external service's event into a prompt,
+  human input is capped at unknown origin; A2A input routed through a local
+  platform is outside that check.
 - In a private chat on a platform that identifies the person, the messages no
   turn answered that a restarted gateway replays are stored with an unknown
   origin, not as the person's own words:
