@@ -36,5 +36,5 @@ Defect reports and reproductions:
 | [849506054](https://github.com/849506054) | Capture delivery at the end of a session. |
 | [momolee-deep](https://github.com/momolee-deep) | Memory tool calls from Hermes agents using Gemini. |
 
-See the [commit history](https://github.com/410979729/scope-recall-hermes/commits/main/)
+See the [commit history](https://github.com/c410979729-bit/scope-recall-hermes/commits/main/)
 for implementation authors and additional contributions.
