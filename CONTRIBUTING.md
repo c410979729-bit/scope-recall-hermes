@@ -72,6 +72,8 @@ hand says how, in the pull request and in `CHANGELOG.md`.
 
 1. Run the tiers that own the files you changed, then `unit` + `contract` + `packaging`:
    `python -X utf8 scripts/check.py --tier contract`
+   A change to code, not only to documentation, also runs `integration` before
+   the pull request opens: pull-request CI does not run that tier.
 2. Run the quality check, which CI's `lint` job runs: `ruff format` leaves every
    file as it is, no file has more ruff or pyright findings of a rule than
    `scripts/quality.baseline.json` records, and no function is bigger than

@@ -1,17 +1,16 @@
 name: CI
 
+# A change set runs this workflow once, on its pull request.  Main is
+# fast-forwarded to the tested head, so the release gate finds ci-required on
+# the commit it tags and a push to main does not repeat the suite.  A newer
+# push to the same pull request cancels the run it supersedes.
 on:
-  push:
-    # Branches must be explicit alongside the tag filter so main pushes
-    # receive checks. Feature branches are covered by pull_request below.
-    branches: [main]
-    # Release tags refer to commits already checked on main; the release
-    # gate consumes ci-required without repeating this workflow for tags.
-    tags-ignore: ['**']
   pull_request:
-  schedule:
-    - cron: "23 3 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -23,7 +22,6 @@ env:
 jobs:
   test:
     name: ${{ matrix.os }}-${{ matrix.tier }}
-    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -64,7 +62,6 @@ jobs:
   # process tiers use the shared interpreter configured above.
   test-python-range:
     name: ${{ matrix.os }}-py${{ matrix.python }}
-    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -100,7 +97,6 @@ jobs:
   # contributor's `uv run python scripts/quality.py` sees what this sees.
   lint:
     name: lint
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -115,14 +111,14 @@ jobs:
       - name: Check formatting, lint and types against the baseline
         run: uv run --no-sync python scripts/quality.py
 
-  windows-daily:
-    name: windows-${{ matrix.tier }}
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+  # The integration baseline takes 35 to 45 minutes on a Windows runner, so it
+  # runs where the change is made, before the pull request opens
+  # (CONTRIBUTING.md), and here only when the workflow is dispatched by hand.
+  # Host and native run on every pull request in the matrix above.
+  windows-integration:
+    name: windows-integration
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        tier: [integration, native]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -137,23 +133,24 @@ jobs:
         run: python -m pip install ".[lancedb,codex,dev]" uv
       - name: Record SQLite capabilities
         run: python tests/public_bench/probe_sqlite.py
-      - name: Run Windows tier (no implicit retries)
-        run: python scripts/check.py --tier ${{ matrix.tier }} --task P17
+      - name: Run the integration tier (no implicit retries)
+        run: python scripts/check.py --tier integration --task P17
 
   ci-required:
     name: ci-required
-    if: ${{ always() }}
+    # A run cancelled by a newer push reports nothing for the head it superseded.
+    if: ${{ !cancelled() }}
     permissions: {}
     needs:
       - test
       - test-python-range
       - lint
-      - windows-daily
+      - windows-integration
     runs-on: ubuntu-latest
     steps:
       - name: Require every CI dependency to succeed
         run: |
-          test "${{ needs.test.result }}" = "${{ github.event_name == 'schedule' && 'skipped' || 'success' }}"
-          test "${{ needs.test-python-range.result }}" = "${{ github.event_name == 'schedule' && 'skipped' || 'success' }}"
-          test "${{ needs.lint.result }}" = "${{ github.event_name == 'schedule' && 'skipped' || 'success' }}"
-          test "${{ needs.windows-daily.result }}" = "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'success' || 'skipped' }}"
+          test "${{ needs.test.result }}" = "success"
+          test "${{ needs.test-python-range.result }}" = "success"
+          test "${{ needs.lint.result }}" = "success"
+          test "${{ needs.windows-integration.result }}" = "${{ github.event_name == 'workflow_dispatch' && 'success' || 'skipped' }}"

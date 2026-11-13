@@ -282,8 +282,9 @@ The test command is `python -X utf8 scripts/check.py --tier <name>`:
 `release` selects unit, contract, native, host, migration and packaging.
 A complete T0–T3 run also executes storage, capture, claims, deletion, episodes,
 retrieval and integration; `release` alone does not replace those selections.
-Ubuntu and Windows CI run the main tiers; macOS CI runs the native import probe, not the main suite. The CI
-jobs record their actual Python SQLite version and extension-loading capability.
+Pull-request CI runs the main tiers on Ubuntu, Windows and macOS, and host and native on Windows. The
+integration tier runs locally before a pull request opens, and in CI only when the workflow is dispatched by
+hand. The CI jobs record their actual Python SQLite version and extension-loading capability.
 Windows measurements do not establish Linux or macOS behavior; run the same
 commands and frozen workload on those machines separately.
 
