@@ -8,12 +8,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from scope_recall._version import stamp_manifest_version
 
 from ..adapters.clients.remote_client import HOOK_TIMEOUTS, RemoteClientError, absolute_path, load_client_config
 from . import install_dsh as dsh
@@ -23,6 +26,7 @@ from .install_common import (
     CLAUDE_CODE_DESCRIPTION,
     CODEX_LONG_DESCRIPTION,
     CODEX_SHORT_DESCRIPTION,
+    PACKAGE_VERSION,
     REMOTE_STORE_NOTE,
     SKILLS,
     InstallError,
@@ -43,9 +47,60 @@ def _hook_argv(config: dict[str, Any]) -> list[str]:
     ]
 
 
+def hermes_files(config: dict[str, Any], home: Path) -> dict[Path, str]:
+    """Install the catalog's wrapper beside a transport binding, refusing to replace a local store binding.
+
+    The wrapper is the catalog's own entry module: its ``register`` selects the remote provider when the profile
+    holds a transport binding, so no second registration module exists to diverge (a ``register`` submodule beside
+    it would also replace the package's ``register`` function once imported). The core declaration keeps the form
+    the plugin directory already has: Hermes' package manager does not rebuild a plugin whose declaration moves
+    between ``plugin.yaml``'s ``pip_dependencies`` and an authored ``pyproject.toml``, and disables it instead. A
+    directory the catalog installed keeps its pin in ``plugin.yaml``; a home plugin the local installer wrote keeps
+    its ``pyproject.toml``.
+    """
+    from ..adapters.hermes.remote import config_path
+    from .hermes_config import provider_configuration
+    from .install_hermes import DIST_HERMES, home_plugin_dir, wrapper_manifest, wrapper_pyproject
+
+    if any((home / "scope-recall" / name).exists() for name in ("attachment.json", "installation.json")):
+        raise RemoteClientError("Hermes profile already has a local store binding; use a separate profile")
+    wrapper = home_plugin_dir(home)
+    remote = {key: str(config[key]) for key in ("url", "host", "token_file", "state_dir")}
+    try:
+        configuration = provider_configuration(home / "config.yaml").decode("utf-8")
+    except InstallError as exc:
+        raise RemoteClientError(str(exc)) from exc
+    template = (DIST_HERMES / "plugin.yaml").read_text(encoding="utf-8")
+    files = {
+        home / "config.yaml": configuration,
+        config_path(home): json.dumps(remote, indent=2) + "\n",
+        wrapper / "__init__.py": (DIST_HERMES / "__init__.py").read_text(encoding="utf-8"),
+    }
+    if (wrapper / "pyproject.toml").is_file():
+        files[wrapper / "plugin.yaml"] = wrapper_manifest(template)
+        files[wrapper / "pyproject.toml"] = wrapper_pyproject()
+    else:
+        files[wrapper / "plugin.yaml"] = _pinned_manifest(template)
+    return files
+
+
+_CORE_PIN = re.compile(r'"hermes-scope-recall\[vectors\]==[^"]*"')
+
+
+def _pinned_manifest(template: str) -> str:
+    """The catalog manifest stamped with this package and pinning it exactly, development builds included."""
+    stamped = stamp_manifest_version(template, PACKAGE_VERSION)
+    pinned, count = _CORE_PIN.subn(f'"hermes-scope-recall[vectors]=={PACKAGE_VERSION}"', stamped)
+    if count != 1:
+        raise RemoteClientError("the catalog manifest does not pin exactly one core package")
+    return pinned
+
+
 def plugin_files(config: dict[str, Any], plugin_dir: Path) -> dict[Path, str]:
     """The plugin that sends this client's hooks and MCP calls to its entry's server."""
     host = config["host"]
+    if host == "hermes":
+        return hermes_files(config, plugin_dir)
     if host == "dsh":
         raise RemoteClientError("a dsh client has no plugin directory: install merges its native rows into dsh's home")
     if host == "workbuddy":
@@ -212,6 +267,19 @@ def _keep_private(config: dict[str, Any], home: Path) -> None:
             path.chmod(0o700 if path.is_dir() else 0o600)
 
 
+def _hermes_backups(config: dict, home: Path, files: dict[Path, str] | dict[Path, bytes]) -> list[str]:
+    """Keep changed profile files in their relative locations so the wrapper and binding can be restored together."""
+    kept = config["state_dir"] / "backups" / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backups = []
+    for path, content in files.items():
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        if path.is_file() and path.read_bytes() != data:
+            target = kept / path.relative_to(home)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            backups.append(shutil.copy2(path, target))
+    return backups
+
+
 def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
     """Write the plugin, or merge WorkBuddy/dsh's native files after copying changed files to ``backups``."""
     if not config["token_file"].exists():
@@ -240,6 +308,8 @@ def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
                 Path(backups[-1]).chmod(0o600)
     else:
         files = plugin_files(config, plugin_dir)
+    if config["host"] == "hermes":
+        backups = _hermes_backups(config, plugin_dir, files)
     written = []
     for path, content in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)

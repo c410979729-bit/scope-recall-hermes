@@ -257,6 +257,16 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
 
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+    def _recording_command(self, context, command: str, turn_id: str) -> None:
+        """Apply an attested CLI recording command; remote replay supplies a durable command fence."""
+        from scope_recall.core import private
+
+        core = self._require_core()
+        if command == "pause":
+            private.open_interval(core.storage, core.clock, context, target="session", session=context.session_id)
+        else:
+            private.close_interval(core.storage, core.clock, context, target="session", session=context.session_id)
+
     def _effective_session_id(self, session_id: str) -> str:
         identity = self._require_identity()
         return session_id or identity.session_id

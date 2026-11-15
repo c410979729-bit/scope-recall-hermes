@@ -492,4 +492,9 @@ class HermesToolSurface:
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         # Hermes retains the returned schema objects; return fresh objects so
         # host-side mutation cannot alter the adapter's contract for later runs.
-        return [*json.loads(json.dumps(_TOOL_SCHEMAS, ensure_ascii=False)), trace_tool_schema(), *handoff_schemas()]
+        return tool_schemas()
+
+
+def tool_schemas() -> list[dict[str, Any]]:
+    """Return fresh public Hermes schemas for local and remote provider registration."""
+    return [*json.loads(json.dumps(_TOOL_SCHEMAS, ensure_ascii=False)), trace_tool_schema(), *handoff_schemas()]

@@ -38,6 +38,7 @@ The token never leaves this machine except in the requests' ``Authorization`` he
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import http.client
 import itertools
@@ -60,8 +61,8 @@ from scope_recall.core.private import normalize_project_path, notice_for_mode, p
 from ...contracts import ContractError
 from ...runtime.remote_clock import event_times as _private_times
 from ...runtime.remote_clock import private_metadata
-from ..host_profiles import agent_run
-from . import transcript
+from ..host_profiles import HERMES_MAX_FACT_BYTES, HERMES_MAX_WIRE_BYTES, agent_run
+from . import hermes_privacy, hermes_queue, transcript
 from .boundary import (
     EMPTY_ANSWER,
     IN_CONTEXT_FIELD,
@@ -72,7 +73,7 @@ from .boundary import (
 from .hook_answer import command_block
 from .session_marks import clear_compaction, compaction_marker, mark_compaction, rebase_compaction
 
-HOSTS = ("claude-code", "codex", "workbuddy", "dsh")
+HOSTS = ("claude-code", "codex", "workbuddy", "dsh", "hermes")
 #: Hosts whose Stop and SessionEnd send the lines of their own session record (``transcript``).
 _RECORD_HOSTS = frozenset({"claude-code", "workbuddy", "codex"})
 #: How long the client's host waits for each hook (the plugin's hooks.json): the local installers' ceilings
@@ -183,7 +184,36 @@ def _connection_failed(config: dict[str, Any], event: object, exc: OSError) -> N
         pass
 
 
-def _post(config: dict[str, Any], body: dict[str, Any], timeout: float) -> dict[str, Any] | None:
+class HermesSizeError(ValueError):
+    """A snapshot exceeds an encoded or decoded limit and cannot be retried unchanged."""
+
+
+def _encoded_request(config: dict, body: dict, endpoint: str) -> tuple[bytes, dict]:
+    raw = (
+        hermes_queue.encode(body)
+        if config["host"] == "hermes"
+        else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    )
+    headers = {}
+    if config["host"] == "hermes" and endpoint == "/hook":
+        if len(raw) > HERMES_MAX_FACT_BYTES:
+            raise HermesSizeError("Hermes decoded envelope exceeds HTTP bound")
+        if len(raw) > 512 * 1024:
+            raw = gzip.compress(raw, mtime=0)
+            headers["Content-Encoding"] = "gzip"
+        if len(raw) > HERMES_MAX_WIRE_BYTES:
+            raise HermesSizeError("Hermes encoded envelope exceeds HTTP bound")
+    return raw, headers
+
+
+def _refused_response(config: dict, event, status: int):
+    _log(config, f"{event}: HTTP {status}, refused for good: not kept")
+    return {"refused": status}
+
+
+def _post(
+    config: dict[str, Any], body: dict[str, Any], timeout: float, *, endpoint: str = "/hook"
+) -> dict[str, Any] | None:
     """The server's answer, or None when it could not be reached in time or refused.
 
     The connection is opened to the server itself, never through a proxy: HTTP_PROXY and the system proxy
@@ -207,7 +237,7 @@ def _post(config: dict[str, Any], body: dict[str, Any], timeout: float) -> dict[
             _connection_failed(config, event, exc)
             return None
         connection.sock.settimeout(max(0.2, until - time.monotonic()))
-        if _private_rules(config) and not direct_owner_command(body, config["host"]):
+        if config["host"] != "hermes" and _private_rules(config) and not direct_owner_command(body, config["host"]):
             state = _private_check(config, body, until - time.monotonic())
             if state is None:
                 return None
@@ -216,21 +246,31 @@ def _post(config: dict[str, Any], body: dict[str, Any], timeout: float) -> dict[
                 return None
             if state["capture_blocked"]:
                 body = _recall_only(body)
+        encoded, encoding_headers = _encoded_request(config, body, endpoint)
         connection.request(
             "POST",
-            f"{url.path}/hook",
-            body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            f"{url.path}{endpoint}",
+            body=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json, text/event-stream",
+                **encoding_headers,
+            },
         )
         response = connection.getresponse()
         raw = response.read()
         if response.status in _REFUSED_FOR_GOOD:
-            _log(config, f"{event}: HTTP {response.status}, refused for good: not kept")
-            return {"refused": response.status}
+            return _refused_response(config, event, response.status)
         if response.status != 200:
             _log(config, f"{event}: HTTP {response.status}")
             return None
-        answer = json.loads(raw.decode("utf-8"))
+        decoded = raw.decode("utf-8")
+        data = [line[5:].strip() for line in decoded.splitlines() if line.startswith("data:")]
+        answer = json.loads(data[-1] if data else decoded)
+    except HermesSizeError:
+        _log(config, f"{event}: Hermes envelope cannot fit HTTP bounds")
+        answer = {"refused": 413}
     except (OSError, http.client.HTTPException, ValueError) as exc:
         _log(config, f"{event}: no answer in {timeout:.1f} s ({type(exc).__name__})")
         return None
@@ -243,6 +283,150 @@ def _post(config: dict[str, Any], body: dict[str, Any], timeout: float) -> dict[
     if isinstance(answer, dict):
         _remember_private_rules(config, answer)
     return answer if isinstance(answer, dict) else None
+
+
+def _hermes_checked(config: dict, payload: dict, seconds: float) -> dict | None:
+    """Verify original event and row times before any content request, including reads and MCP."""
+    until = time.monotonic() + seconds
+    combined: dict[str, Any] = {"decisions": [False] * len(payload.get("events", [])), "history_decisions": {}}
+    try:
+        for body in hermes_privacy.batches(payload, 65536):
+            if time.monotonic() >= until:
+                return None
+            answer = _post(config, body, until - time.monotonic(), endpoint="/private/check")
+            if answer is None:
+                return None
+            if answer.get("refused") == 413:
+                return {**payload, "_oversized": True}
+            if answer.get("terminal"):
+                return hermes_privacy.eligible(payload, answer)
+            if not isinstance(answer.get("decisions"), list) or not isinstance(answer.get("history_decisions"), dict):
+                return None
+            combined["decisions"] = [a or b for a, b in zip(combined["decisions"], answer["decisions"], strict=True)]
+            for key, decisions in answer["history_decisions"].items():
+                combined["history_decisions"].setdefault(key, []).extend(decisions)
+            combined["recall_blocked"] = combined.get("recall_blocked", False) or answer.get("recall_blocked", False)
+        return hermes_privacy.eligible(payload, combined)
+    except hermes_privacy.MetadataTooLarge:
+        return {**payload, "_oversized": True}
+
+
+def _send_hermes_item(config: dict, item: Path, until: float) -> tuple[int | None, dict]:
+    """Settle one head snapshot; never transmit content after an unsuccessful metadata check."""
+    kept = json.loads(item.read_text(encoding="utf-8"))
+    payload = kept["payload"]
+    checked = _hermes_checked(config, payload, min(5.0, max(0.2, until - time.monotonic())))
+    if checked is None:
+        return None, {}
+    if checked.get("_oversized"):
+        hermes_queue.discard(config, item, payload, _now())
+        return 0, {"terminal": True, "retry": False}
+    if checked.get("_refused"):
+        hermes_queue.acknowledge(config, item, payload)
+        return 0, {"terminal": True, "retry": False}
+    if time.monotonic() >= until:
+        return None, {}
+    answer = _post(config, {**kept, "payload": checked}, min(30.0, until - time.monotonic()))
+    if answer is None or answer.get("retry"):
+        return None, answer or {}
+    if answer.get("refused") == 413:
+        hermes_queue.discard(config, item, payload, _now())
+        return 0, {"terminal": True, "retry": False}
+    hermes_queue.acknowledge(config, item, payload)
+    return 1, {**answer, "delivered_revision": payload.get("revision")}
+
+
+def _drain_hermes(config: dict, until: float, target: str | None = None) -> tuple[int, dict]:
+    """Drain under the common send mutex; a claimed head stops this sender rather than being overtaken."""
+    sent, result = 0, {}
+    while time.monotonic() < until - 0.2:
+        items = sorted(_spool_dir(config).glob("*.json"))
+        if not items:
+            break
+        item = items[0]
+        try:
+            with advisory_file_lock(item.with_suffix(".claim"), timeout_seconds=0):
+                outcome, answer = _send_hermes_item(config, item, until)
+        except TimeoutError:
+            break
+        except (OSError, ValueError) as exc:
+            _log(config, f"Hermes queue: {type(exc).__name__}; head retained")
+            break
+        _remove_settled_claim(item)
+        if outcome is None:
+            break
+        sent += outcome
+        if target is not None and item.name.endswith(f"-{target}.json"):
+            result = answer
+            break
+    return sent, result
+
+
+def _flush_hermes(config: dict, seconds: float) -> int:
+    try:
+        with hermes_queue.sending(config):
+            return _drain_hermes(config, time.monotonic() + seconds)[0]
+    except TimeoutError:
+        return 0
+
+
+def hermes_hook(config: dict[str, Any], payload: dict, *, keep: bool = True) -> dict:
+    """Coalesce one turn, then serialize transmissions from the shared Hermes queue."""
+    until = time.monotonic() + 7.0
+    checked = None if _server_away(config) else _hermes_checked(config, payload, min(5.0, until - time.monotonic()))
+    if checked is not None and (checked.get("_oversized") or checked.get("_refused")):
+        if keep and checked.get("_oversized"):
+            hermes_queue.discard(config, None, payload, _now())
+        return {"terminal": True, "retry": False}
+    if checked is None and _private_rules(config):
+        return {}
+    if keep:
+        try:
+            hermes_queue.put(config, checked or payload, _now())
+        except (OSError, TimeoutError, ValueError) as exc:
+            _log(config, f"Hermes queue: could not retain ({type(exc).__name__})")
+            return {}
+    if checked is None:
+        return {}
+    try:
+        with hermes_queue.sending(config):
+            _sent, answer = _drain_hermes(config, until, payload.get("queue_key") if keep else None)
+            if keep:
+                return answer
+            if any(_spool_dir(config).glob("*.json")) or time.monotonic() >= until:
+                return {}
+            return _post(config, {"payload": checked}, until - time.monotonic()) or {}
+    except TimeoutError:
+        return {}
+
+
+def hermes_tool(config: dict[str, Any], name: str, arguments: dict, meta: dict) -> str | None:
+    """Preflight read privacy with content-free metadata before sending a tool's filtered arguments."""
+    if _server_away(config):
+        return None
+    payload = meta.get("scope-recall/hermes")
+    if not isinstance(payload, dict):
+        return '{"error":"ACCESS_DENIED"}'
+    checked = _hermes_checked(config, {**payload, "tool_read": True}, 1.0) if isinstance(payload, dict) else None
+    if checked is None or checked.get("_refused") or checked.get("_oversized"):
+        return None
+    try:
+        with hermes_queue.sending(config):
+            answer = _post(
+                config,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments, "_meta": meta},
+                },
+                6.0,
+                endpoint="/mcp",
+            )
+    except TimeoutError:
+        return None
+    result = (answer or {}).get("result", {})
+    return next((row["text"] for row in result.get("content", []) if row.get("type") == "text"), None)
 
 
 def owner_prompt(host: str, payload: dict[str, Any]) -> bool:
@@ -515,6 +699,8 @@ def flush_spool(config: dict[str, Any], seconds: float = FLUSH_SECONDS) -> int:
 
     One flusher at a time (a lock file beside the spool).  Returns how many were sent.
     """
+    if config["host"] == "hermes":
+        return _flush_hermes(config, seconds)
     folder = _spool_dir(config)
     if not folder.is_dir():
         return 0
@@ -575,7 +761,7 @@ def _flush_item(config, item: Path, left: float) -> int | None:
     compact = compaction_marker(config, session) if session is not None else None
     if compact is not None:
         kept.update(compacted_at=compact["at"], compaction_seq=compact["ordinal"], compaction_epoch=compact["epoch"])
-    if _private_rules(config):
+    if config["host"] != "hermes" and _private_rules(config):
         state = _private_check(config, kept, min(left, 1.0))
         if state is None:
             return None
@@ -988,10 +1174,17 @@ def _empty_answer(path: object) -> str:
     return answer + "\n" if answer else ""
 
 
+def _queue_report(config: dict, command: str) -> dict:
+    result = {"sent": flush_spool(config)} if command == "flush" else {}
+    if config["host"] == "hermes":
+        result.update(hermes_queue.status(config))
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     args = list(sys.argv[1:] if argv is None else argv)
-    command = args.pop(0) if args and args[0] in ("token", "flush") else "hook"
+    command = args.pop(0) if args and args[0] in ("token", "flush", "status") else "hook"
     parser = argparse.ArgumentParser(prog="scope-recall-remote-client")
     parser.add_argument("--config", required=True)
     parsed = parser.parse_args(args)
@@ -1000,8 +1193,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "token":
             print(json.dumps({"token_sha256": make_token(config)}))
             return 0
-        if command == "flush":
-            print(json.dumps({"sent": flush_spool(config)}))
+        if command in {"flush", "status"}:
+            print(json.dumps(_queue_report(config, command)))
             return 0
     except RemoteClientError as exc:
         if command == "hook":

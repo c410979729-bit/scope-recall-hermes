@@ -245,6 +245,22 @@ def load_shared_client(home: Path | str, host: str) -> SharedClientConfig:
     return SharedClientConfig(host, path, manifest, audience, scope)
 
 
+def load_server_entry(home: Path | str, host: str) -> SharedClientConfig | InstallationManifest:
+    """Verify the server-local entry without treating a Hermes gateway as a fixed local-owner client."""
+    if host != "hermes":
+        return load_shared_client(home, host)
+    path = Path(home).expanduser()
+    if not path.is_absolute():
+        raise CodexConfigError("home must be absolute")
+    attachment = read_attachment(path)
+    if attachment is None or attachment.host != "hermes":
+        raise CodexConfigError("home is not attached as a Hermes entry")
+    manifest = shared_entry_manifest(attachment.root, attachment.entry_id, hermes_home=path)
+    if not (manifest.data_directory / "memory.sqlite3").is_file():
+        raise CodexConfigError("verified core database is required")
+    return manifest
+
+
 def write_codex_config(config: CodexInstallationConfig) -> None:
     config.data_directory.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {

@@ -36,8 +36,9 @@ def principal_ref(kind: str, installation_id: str, *parts: str) -> str:
     return _opaque_ref(f"hermes-{kind}", installation_id, *parts)
 
 
-def _matches_owner_principal(manifest: InstallationManifest, *, platform: str, user_id: str) -> bool:
-    return any(item["platform"] == platform and item["user_id"] == user_id for item in manifest.owner_principals)
+def matches_owner_principal(principals, *, platform: str, user_id: str) -> bool:
+    """Check the explicit owner approvals shared by runtime routes and grant copying."""
+    return any(item["platform"] == platform and item["user_id"] == user_id for item in principals)
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,7 @@ def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntim
     owner_private_scope = manifest.audience_scopes.get("owner_private")
     if not owner_private_scope:
         return RuntimeAudience(frozenset(), None, ("capability_gap:owner_private_unconfigured",), False)
-    owner_verified = _matches_owner_principal(manifest, platform=scope.platform, user_id=scope.user_id)
+    owner_verified = matches_owner_principal(manifest.owner_principals, platform=scope.platform, user_id=scope.user_id)
 
     exact_fields = {
         "platform": scope.platform,
@@ -259,3 +260,31 @@ def owner_subjects(
     if type(subject) is not str or subject not in humans:
         return ()
     return (subject, *sorted(humans - {subject}))
+
+
+def normalize_platform(value: object) -> str:
+    """Normalize a host platform with the existing CLI fallback."""
+    return str(value or "cli").strip().lower() or "cli"
+
+
+def switched_scope(values: dict, changes: dict) -> dict:
+    """Apply host route changes; a platform change without a principal cannot inherit the old sender."""
+    previous_platform = normalize_platform(values.get("platform"))
+    updated = {
+        **values,
+        **{
+            key: value
+            for key, value in changes.items()
+            if key in values or key in HermesRuntimeScope.__dataclass_fields__
+        },
+    }
+    if "user_id" in changes or "user_id_alt" in changes:
+        updated["user_id"] = changes.get("user_id")
+        updated["user_id_alt"] = changes.get("user_id_alt")
+    elif normalize_platform(updated.get("platform")) != previous_platform:
+        updated["user_id"], updated["user_id_alt"] = "", ""
+    if "user_name" in changes:
+        updated["user_name"] = changes["user_name"]
+    elif any(key in changes for key in ("platform", "user_id", "user_id_alt")):
+        updated.pop("user_name", None)
+    return updated

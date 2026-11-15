@@ -8,6 +8,12 @@ another machine is copying one directory.
 
 A home without a pointer keeps its own store and binds as its own installation says.
 
+Hermes on another machine can use a [remote entry](remote-entries.md#hermes-on-the-client-machine) of this same store.
+Its entry home and grants live on the store machine. The Hermes profile keeps the remote address, token and pending
+hooks, and opens no local database. The store-side handler reuses the local Hermes source and audience functions. Private and group routes need
+their own exact grants, and the token trusts its holder with every route granted to that entry. The remote installer
+selects the provider automatically; use the remote attach command and retention guidance in the linked setup.
+
 ## What is where
 
 ```
@@ -124,9 +130,10 @@ store; a 1.x or 2.x store is migrated into the agent's home first (`scope-recall
 A local coding assistant brings no grants of its own: whoever types into it on this machine is
 the owner, as at the Hermes CLI. `attach` gives it the owner grants of entries already attached,
 Hermes homes and other clients alike (`--grants-like`, their ids comma separated, or `all`): it
-reads every scope their owner rows read and may write where they may. What the owner types into
+reads the scopes their effective owner rows read and may write where they may. Owner rows whose platform/user
+is not an approved owner principal are ignored when copying grants, just as at runtime. What the owner types into
 it is captured into the scope another entry's owner captures into (`--capture-like`), which must
-be one every owner row of every attached entry reads, so that every agent hears it; otherwise
+be one every effective owner row of every attached entry reads, so that every agent hears it; otherwise
 `attach` refuses and names the rows that would not. No other entry's grants change and the
 worker keeps running. On a store no other entry is attached to, leave both options out: the
 client brings the owner's scope ([A store of clients alone](#a-store-of-clients-alone)).

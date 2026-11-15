@@ -342,6 +342,9 @@ SUITES = {
         "tests/storage_native/test_in_process_lance_store.py",
     ],
     "host": [
+        "tests/host/hermes/test_remote_entry.py",
+        "tests/host/hermes/test_remote_audit.py",
+        "tests/host/hermes/test_remote_final.py",
         "tests/host/hermes/test_memory_write.py",
         "tests/host/hermes/test_capture_retry_properties.py",
         "tests/host/hermes/test_capture_boundaries.py",
@@ -426,6 +429,7 @@ SUITES = {
     "packaging": [
         "tests/storage_native/test_process_numeric_threads.py",
         "tests/packaging/test_hermes_catalog_setup.py",
+        "tests/packaging/test_hermes_remote_install.py",
         "tests/packaging/test_setup.py",
         "tests/packaging/test_setup_repairs.py",
         "tests/packaging/test_setup_cleanup.py",

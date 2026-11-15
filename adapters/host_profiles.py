@@ -210,3 +210,26 @@ def is_codex_suggestions_reply(message: str) -> bool:
     if not isinstance(value, dict) or len(value) != 1:
         return False
     return any(isinstance(value.get(key), shape) for key, shape in HOSTS["codex"].generated_reply_shapes)
+
+
+# Hermes uses compact snapshots and bounded gzip bodies on the existing remote channel.
+HERMES_MAX_WIRE_BYTES = 8 * 1024 * 1024
+HERMES_MAX_FACT_BYTES = 64 * 1024 * 1024
+
+HERMES_BINDING_FIELDS = frozenset(
+    {
+        "platform",
+        "agent_identity",
+        "agent_workspace",
+        "agent_context",
+        "user_id",
+        "user_id_alt",
+        "user_name",
+        "chat_type",
+        "chat_id",
+        "thread_id",
+        "gateway_session_key",
+        "parent_session_id",
+        "local_account_principal",
+    }
+)
