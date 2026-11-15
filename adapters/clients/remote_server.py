@@ -36,6 +36,7 @@ import os
 import re
 import threading
 import time
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -47,9 +48,11 @@ from ...contracts import ContractError
 from ...core.private import calibrated_event_time, parse_recording_command
 from ...runtime.remote_clock import private_metadata
 from ...runtime.worker_entry import host_process_credential_environment
+from ...runtime.worker_launch import RUNTIME_CONFIG_FILENAME
+from ..host_profiles import HERMES_MAX_FACT_BYTES
 from . import transcript
 from .boundary import IN_CONTEXT_FIELD, without_lone_surrogates
-from .config import CodexConfigError, load_shared_client
+from .config import CodexConfigError, SharedClientConfig, load_server_entry, load_shared_client
 from .handler import CodexHookHandler, SystemHookClock
 from .identity import resolve_runtime_audience, trusted_context
 from .local_endpoint import KeptRecaller, entry_files, file_stamp
@@ -160,7 +163,7 @@ def _digest(value: object) -> str:
 
 def write_server_config(home: Path, host: str, *, listen: str, port: int, token_sha256: str) -> Path:
     """Record where the entry is served and the SHA-256 of the client's token; the client must exist."""
-    load_shared_client(home, host)
+    load_server_entry(home, host)
     path = config_path(home)
     body = {
         "schema": "scope-recall.remote-server/1",
@@ -592,7 +595,32 @@ def _checked_body(config, body):
     return filtered, refused, state["private_rules"]
 
 
-def build_app(config: RemoteServerConfig, *, warm: bool = False):
+class RemoteRequestTooLarge(RemoteServerError):
+    """A valid transport envelope exceeds the decoded size allowance."""
+
+
+def _hook_body(config: RemoteServerConfig, encoding: str | None, raw: bytes) -> dict:
+    if config.host == "hermes" and encoding == "gzip":
+        decoder = zlib.decompressobj(31)
+        try:
+            raw = decoder.decompress(raw, HERMES_MAX_FACT_BYTES + 1)
+        except zlib.error as exc:
+            raise RemoteServerError("invalid compressed Hermes facts") from exc
+        if len(raw) > HERMES_MAX_FACT_BYTES:
+            raise RemoteRequestTooLarge("compressed Hermes facts exceed decoded bound")
+        if not decoder.eof or decoder.unused_data:
+            raise RemoteServerError("invalid compressed Hermes facts")
+    return json.loads(raw.decode("utf-8"))
+
+
+def build_app(
+    config: RemoteServerConfig,
+    *,
+    warm: bool = False,
+    hook_handler=None,
+    private_handler=None,
+    tools_server=None,
+):
     """The entry's MCP tools at ``/mcp``, its hook at ``/hook``, both behind the token."""
     from mcp.server.transport_security import TransportSecuritySettings
     from starlette.concurrency import run_in_threadpool
@@ -602,19 +630,22 @@ def build_app(config: RemoteServerConfig, *, warm: bool = False):
 
     from .mcp_server import build_server
 
-    client = load_shared_client(config.home, config.host)
+    client = load_server_entry(config.home, config.host)
     host_name = f"[{config.listen}]" if ":" in config.listen else config.listen
-    tools = build_server(client, workspace=None)
+    if tools_server is None:
+        assert isinstance(client, SharedClientConfig)
+        tools_server = build_server(client, workspace=None).server
     kept = KeptRecaller(
         lambda: CodexHookHandler.from_home(str(config.home), config.host, remote_paths=True),
-        stamp=lambda: file_stamp(client.runtime_config_path, *entry_files(config.home)),
+        stamp=lambda: file_stamp(config.home / "scope-recall" / RUNTIME_CONFIG_FILENAME, *entry_files(config.home)),
     )
     atexit.register(kept.close)
-    if warm:
+    if warm and config.host != "hermes":
         kept.warm()
-    app = tools.server.streamable_http_app(
+    app = tools_server.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
+        max_request_body_size=MAX_REQUEST_BYTES,
         host=config.listen,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
@@ -634,12 +665,16 @@ def build_app(config: RemoteServerConfig, *, warm: bool = False):
         if len(raw) > MAX_REQUEST_BYTES:
             return JSONResponse({"error": "request_too_large"}, status_code=413)
         try:
-            body = json.loads(raw.decode("utf-8"))
+            body = _hook_body(config, request.headers.get("content-encoding"), raw)
             if not isinstance(body, dict):
                 raise RemoteServerError("body must be an object")
             payload = body.get("payload")
             event = str(payload.get("hook_event_name"))[:40] if isinstance(payload, dict) else None
-            answer = await run_in_threadpool(handle_request, config, body, started=started, recaller=kept)
+            answer = await run_in_threadpool(
+                hook_handler or handle_request, config, body, started=started, recaller=kept
+            )
+        except RemoteRequestTooLarge:
+            return JSONResponse({"error": "decoded_request_too_large"}, status_code=413)
         except (UnicodeError, json.JSONDecodeError, RecursionError, RemoteServerError) as exc:
             # The request itself, which the client drops on a 400.  An error from the store (a ContractError is a
             # ValueError too) is this machine's and answers 500, so the client keeps the hook to send again.
@@ -689,7 +724,7 @@ def build_app(config: RemoteServerConfig, *, warm: bool = False):
             return JSONResponse({"error": "request_too_large"}, status_code=413)
         try:
             body = json.loads(raw.decode("utf-8"))
-            answer = await run_in_threadpool(private_check, config, body)
+            answer = await run_in_threadpool(private_handler or private_check, config, body)
         except (UnicodeError, json.JSONDecodeError, RecursionError, RemoteServerError) as exc:
             return JSONResponse({"error": "invalid_request", "detail": str(exc)[:200]}, status_code=400)
         except ValueError as exc:
@@ -758,12 +793,13 @@ def log_to_file(home: Path) -> logging.Handler:
     return handler
 
 
-def serve(config: RemoteServerConfig, *, env_file: Path | None = None) -> None:
+def serve(config: RemoteServerConfig, *, env_file: Path | None = None, app_factory=build_app) -> None:
     import uvicorn
 
     if env_file is not None:
-        client = load_shared_client(config.home, config.host)
-        os.environ.update(host_process_credential_environment(client.runtime_config_path, env_file))
+        load_server_entry(config.home, config.host)
+        runtime_path = config.home / "scope-recall" / RUNTIME_CONFIG_FILENAME
+        os.environ.update(host_process_credential_environment(runtime_path, env_file))
     log_to_file(config.home)
 
     _log.info(
@@ -771,7 +807,7 @@ def serve(config: RemoteServerConfig, *, env_file: Path | None = None) -> None:
     )
     # log_config=None keeps uvicorn's own errors in the file above instead of a console there is none of.
     uvicorn.run(
-        build_app(config, warm=True),
+        app_factory(config, warm=True),
         host=config.listen,
         port=config.port,
         log_level="warning",
@@ -787,14 +823,14 @@ def _absolute(value: str, field: str) -> Path:
     return path
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, app_factory=build_app) -> int:
     parser = argparse.ArgumentParser(prog="scope-recall-remote-server", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("configure", help="record where an entry is served and its client's token digest")
     run = sub.add_parser("serve", help="serve an entry to its client on another machine")
     for command in (setup, run):
         command.add_argument("--home", required=True, help="absolute home of the client's entry, on this machine")
-        command.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh"))
+        command.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh", "hermes"))
     setup.add_argument("--listen", required=True, help="this machine's private (tailnet) address")
     setup.add_argument("--port", required=True, type=int)
     setup.add_argument("--token-sha256", required=True, help="what remote_client token printed on the client")
@@ -815,6 +851,7 @@ def main(argv: list[str] | None = None) -> int:
         serve(
             load_server_config(home, args.host),
             env_file=_absolute(args.env_file, "env_file") if args.env_file else None,
+            app_factory=app_factory,
         )
     except (RemoteServerError, CodexConfigError) as exc:
         raise SystemExit(str(exc)) from None

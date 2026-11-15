@@ -1,8 +1,9 @@
 name: Hermes catalog install
 
 # A fresh Hermes on Linux and macOS installs Scope Recall the way the plugin catalog does, runs setup, and is checked
-# for recall in a new session and a correction against a loopback model. Runs when the Hermes install path changes,
-# and on demand.
+# for recall in a new session and a correction against a loopback model. A second profile then uses the same store
+# as a remote entry through the public remote commands, checked for recall both ways and replay after an outage.
+# Runs when the Hermes install path or the remote entry path changes, and on demand.
 # During development the catalog manifest pins a released core, testing the installation offered by the default branch.
 # On a release PR it pins the new version, supplied by WHEELS.
 on:
@@ -10,6 +11,18 @@ on:
     paths:
       - "distribution/hermes/**"
       - "adapters/hermes/**"
+      - "adapters/clients/**"
+      - "adapters/codex/remote_server.py"
+      - "adapters/host_identity.py"
+      - "adapters/host_profiles.py"
+      - "adapters/installation.py"
+      - "adapters/shared_entries.py"
+      - "maintenance/install_remote.py"
+      - "maintenance/install_hermes.py"
+      - "maintenance/shared.py"
+      - ".github/scripts/hermes_remote_install.py"
+      - "packaging/v11-module-allowlist.json"
+      - "pyproject.toml"
       - "maintenance/setup*.py"
       - "maintenance/onboarding.py"
       - "maintenance/hermes_config.py"
@@ -47,6 +60,10 @@ jobs:
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           WHEELS: ${{ runner.temp }}/wheels
         run: bash .github/scripts/hermes_catalog_install.sh
+      - name: Check two real Hermes homes over the remote entry
+        env:
+          WHEELS: ${{ runner.temp }}/wheels
+        run: python .github/scripts/hermes_remote_install.py
       - name: Compare the installed Hermes source with the reviewed inventory
         if: always()
         env:

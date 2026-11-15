@@ -165,14 +165,139 @@ def test_dockerfile_uses_nonroot_tini_and_checked_version():
     assert not re.search(r"(?i)(?:api[_-]?key|secret|token)\s*[:=]\s*[\"']?[A-Za-z0-9_-]{16,}", dockerfile)
 
 
-def test_initialize_attach_and_configure_remote_entry(tmp_path):
+@pytest.mark.parametrize("host", ["codex", "hermes"])
+def test_initialize_attach_and_configure_remote_entry(tmp_path, host):
     """Exercise the documented initial registration against a synthetic store."""
+    from dataclasses import replace
+
     from scope_recall.adapters.clients.remote_server import write_server_config
+    from scope_recall.adapters.installation import build_installation_manifest
+    from scope_recall.distribution.docker.entry import discover_entries
     from scope_recall.maintenance.shared import attach, init_shared
 
     store = tmp_path / "store"
-    home = tmp_path / "homes" / "codex"
+    home = tmp_path / "homes" / host
     home.mkdir(parents=True)
     init_shared(root=store, test_mode=True)
-    attach(host="codex", instance_root=home, root=store, entry_id="codex", display_name="Codex")
-    write_server_config(home, "codex", listen="127.0.0.1", port=18765, token_sha256="0" * 64)
+    options = {}
+    if host == "hermes":
+        from scope_recall.adapters.shared_entries import read_shared_payload
+
+        grants = build_installation_manifest(
+            home,
+            agent_id=read_shared_payload(store)["agent_id"],
+            agent_workspace="hermes",
+            local_platforms=("desktop",),
+            test_mode=True,
+        )
+        options["grants_from"] = replace(grants, agent_identity="default")
+    attach(host=host, instance_root=home, root=store, entry_id=host, display_name=host, **options)
+    write_server_config(home, host, listen="127.0.0.1", port=18765, token_sha256="0" * 64)
+    assert [config.host for config in discover_entries(tmp_path / "homes")] == [host]
+
+
+def test_real_hermes_remote_exercise_uses_existing_job_and_loopback():
+    """The real-host exercise is part of both catalog jobs and its source parses on the supported Python."""
+    script = ROOT / ".github/scripts/hermes_remote_install.py"
+    source = script.read_text(encoding="utf-8-sig")
+    ast.parse(source, filename=str(script), feature_version=(3, 11))
+    workflow = yaml.safe_load((ROOT / ".github/workflows/hermes-catalog-install.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["install"]
+    assert job["strategy"]["matrix"]["os"] == ["ubuntu-latest", "macos-latest"]
+    assert any(step.get("run") == "python .github/scripts/hermes_remote_install.py" for step in job["steps"])
+    assert "loopback_chat_model.py" in source
+    assert '"--listen",\n            "127.0.0.1"' in source or '"--listen", "127.0.0.1"' in source
+
+
+def _remote_exercise_module():
+    import importlib.util
+
+    path = ROOT / ".github/scripts/hermes_remote_install.py"
+    spec = importlib.util.spec_from_file_location("TEST_remote_exercise", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("wrong", [None, "version", "implementation"])
+def test_real_host_probe_rejects_other_core_before_chat(tmp_path, wrong):
+    import runpy
+    import zipfile
+
+    from scope_recall._version import __version__
+    from scope_recall.adapters.hermes import remote
+
+    script = _remote_exercise_module()
+    home, work = tmp_path / "TEST-home", tmp_path / "work"
+    work.mkdir()
+    wrapper = home / "plugins/scope-recall/__init__.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("# TEST isolated provider\n", encoding="utf-8")
+    wheel = tmp_path / "TEST-core.whl"
+    version = "0.0.0" if wrong == "version" else __version__
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("TEST.dist-info/METADATA", f"Name: hermes-scope-recall\nVersion: {version}\n")
+        archive.writestr(
+            "scope_recall/adapters/hermes/remote.py",
+            b"TEST wrong build" if wrong == "implementation" else Path(remote.__file__).read_bytes(),
+        )
+    calls = []
+
+    class Job:
+        def run(self, argv, env, **kwargs):
+            calls.append(argv)
+            runpy.run_path(str(wrapper))
+
+    job = Job()
+    job.work = work
+    if wrong is None:
+        script.verify_core(job, ["hermes", "-p", "TEST-profile"], {}, home, wheel)
+    else:
+        with pytest.raises(AssertionError, match="wrong Hermes core"):
+            script.verify_core(job, ["hermes", "-p", "TEST-profile"], {}, home, wheel)
+    assert calls == [["hermes", "-p", "TEST-profile", "memory", "status"]]
+
+
+def test_ci_cleanup_only_signals_recorded_private_groups(tmp_path, monkeypatch):
+    script = _remote_exercise_module()
+    calls, signals = [], []
+
+    class Child:
+        pid = 912345
+
+        def wait(self, timeout):
+            return 0
+
+    def start(argv, **kwargs):
+        calls.append(kwargs)
+        return Child()
+
+    monkeypatch.setattr(script.subprocess, "Popen", start)
+    monkeypatch.setattr(script.os, "killpg", lambda group, sig: signals.append((group, sig)), raising=False)
+    monkeypatch.setattr(script.signal, "SIGKILL", 9, raising=False)
+    job = script.Exercise(tmp_path)
+    child = job.start(["TEST-hermes"], {})
+    assert calls[0]["start_new_session"] is True
+    job.stop(child)
+    job.close()
+    assert signals == [(child.pid, script.signal.SIGINT), (child.pid, script.signal.SIGKILL)]
+    assert not job.groups
+
+
+def test_catalog_paths_cover_remote_implementations():
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/hermes-catalog-install.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+    paths = workflow["on"]["pull_request"]["paths"]
+    import fnmatch
+
+    for dependency in (
+        ".github/scripts/hermes_remote_install.py",
+        "adapters/clients/remote_client.py",
+        "adapters/clients/hermes_queue.py",
+        "adapters/codex/remote_server.py",
+        "maintenance/shared.py",
+        "maintenance/install_remote.py",
+        "adapters/host_profiles.py",
+    ):
+        assert any(fnmatch.fnmatchcase(dependency, pattern) for pattern in paths), dependency

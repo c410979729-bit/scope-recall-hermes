@@ -633,6 +633,13 @@ def test_a_remote_client_waits_as_long_as_a_local_one():
 @pytest.mark.parametrize("host", remote_client.HOSTS)
 def test_the_plugin_sends_hooks_and_tools_to_the_server(tmp_path, host):
     config = _client(tmp_path, host, 18765)
+    if host == "hermes":
+        home = tmp_path / "TEST-hermes-home"
+        files = install_remote.plugin_files(config, home)
+        assert json.loads(files[home / "scope-recall" / "remote-client.json"])["host"] == "hermes"
+        assert "register_memory_provider" in files[home / "plugins" / "scope-recall" / "__init__.py"]
+        assert not (home / "memory.sqlite3").exists()
+        return
     if host in ("workbuddy", "dsh"):
         # Native home installs must never fall through to a Codex plugin.
         with pytest.raises(remote_client.RemoteClientError, match="no plugin"):

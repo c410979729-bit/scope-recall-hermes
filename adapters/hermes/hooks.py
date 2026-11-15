@@ -45,48 +45,78 @@ def _unregister_adapter_instance(adapter: Any) -> None:
         _ADAPTERS.discard(adapter)
 
 
+def _profile_matches(adapter: Any, kwargs: dict) -> bool:
+    """Compare profile home keys silently before route matching."""
+    from pathlib import Path
+
+    identity = getattr(adapter, "_identity", None)
+    home = (
+        getattr(adapter, "_home", None) if hasattr(adapter, "remote_hook") else getattr(identity, "hermes_home", None)
+    )
+    if kwargs.get("hermes_home"):
+        return home is not None and Path(kwargs["hermes_home"]).resolve() == Path(home).resolve()
+    try:
+        from agent.secret_scope import (  # pyright: ignore[reportMissingImports]
+            current_secret_scope_home,
+            is_multiplex_active,
+        )
+        from hermes_constants import (  # pyright: ignore[reportMissingImports]
+            get_hermes_home,
+            get_hermes_home_override,
+            hermes_home_key,
+        )
+    except ImportError:
+        return True
+    caller = get_hermes_home_override() or current_secret_scope_home()
+    if caller is None:
+        if is_multiplex_active():
+            return False
+        caller = get_hermes_home()
+    return home is not None and hermes_home_key(caller) == hermes_home_key(home)
+
+
+def _route_key(adapter: Any) -> tuple:
+    if hasattr(adapter, "remote_hook"):
+        return "remote", adapter.hook_route
+    identity = adapter._identity
+    return (
+        "local",
+        identity.binding,
+        tuple(sorted(identity.runtime_audience.allowed_scope_ids)),
+        identity.local_scope_id,
+        identity.read_only,
+        identity.scope.chat_type,
+        identity.scope.chat_id,
+        identity.scope.thread_id,
+    )
+
+
 def _active_adapter(kwargs: dict[str, Any]) -> Any | None:
-    session_id = str(kwargs.get(HOSTS["hermes"].session_field) or "").strip()
-    if not session_id:
+    """Choose once across local and remote providers; no candidate and ambiguity both refuse dispatch."""
+    session = str(kwargs.get(HOSTS["hermes"].session_field) or "").strip()
+    if not session:
         return None
     platform = str(kwargs.get("platform") or "").strip().lower()
-    sender_id = str(kwargs.get("sender_id") or "").strip()
+    sender = str(kwargs.get("sender_id") or "").strip()
     with _REGISTRY_LOCK:
         matches = []
         for adapter in tuple(_ADAPTERS):
-            identity = getattr(adapter, "_identity", None)
-            if identity is None or not getattr(adapter, "_initialized", False):
+            if not getattr(adapter, "_initialized", False) or not _profile_matches(adapter, kwargs):
                 continue
-            if identity.session_id != session_id:
-                continue
-            if platform and identity.scope.platform != platform:
-                continue
-            if sender_id and not identity.is_sender(sender_id):
-                continue
-            matches.append(adapter)
-        if not matches:
+            if hasattr(adapter, "remote_hook"):
+                matching = adapter.matches_hook(kwargs)
+            else:
+                identity = getattr(adapter, "_identity", None)
+                matching = (
+                    identity is not None
+                    and identity.session_id == session
+                    and (not platform or identity.scope.platform == platform)
+                    and (not sender or identity.is_sender(sender))
+                )
+            if matching:
+                matches.append(adapter)
+        if not matches or len({_route_key(item) for item in matches}) != 1:
             return None
-        bindings = {adapter._identity.binding for adapter in matches}
-        audiences = {
-            (
-                tuple(sorted(item._identity.runtime_audience.allowed_scope_ids)),
-                item._identity.local_scope_id,
-                item._identity.read_only,
-                item._identity.scope.chat_type,
-                item._identity.scope.chat_id,
-                item._identity.scope.thread_id,
-            )
-            for item in matches
-        }
-        if len(bindings) != 1 or len(audiences) != 1:
-            # A global hook must never choose one installation for an
-            # ambiguous session identifier.
-            return None
-        # Hermes rebuilds an agent its cache evicted: a new provider binds the same session, and the old one, retired
-        # but not shut down, stays registered.  Chosen by the lower id(), the hooks would often go to the old one:
-        # pre_llm_call would store the message there under the turn's id, while on_turn_start and sync_turn reach the
-        # new one, which would store the message again under an ordinal and the reply with it (the first turn after
-        # each rebuild).  The adapter that bound it last is the host's.
         return max(matches, key=lambda item: _BOUND.get(item, 0))
 
 
@@ -118,6 +148,9 @@ def _dispatch(event: str, kwargs: dict[str, Any], *, wait: float) -> Any | None:
     adapter = _active_adapter(kwargs)
     if adapter is None:
         return None
+    if hasattr(adapter, "remote_hook"):
+        adapter.remote_hook(event, kwargs)
+        return adapter
     if event == "post_llm_call":
         # Runs before Hermes sends the reply and writes nothing: it keeps its copy under the adapter's own
         # small lock, which also drops it when a session switch has cleared the turn meanwhile.
@@ -163,7 +196,7 @@ def _global_callback(event: str) -> Callable[..., None]:
                 elapsed,
                 timeout,
             )
-            if adapter is not None:
+            if adapter is not None and hasattr(adapter, "_calls"):
                 adapter._calls.count(f"{event}_overran")
 
     # Hermes names a callback in its timeout and skip lines; every plugin's closure called ``callback`` read alike.

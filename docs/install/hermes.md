@@ -1,5 +1,37 @@
 # Hermes
 
+## Remote store
+
+Hermes gateway, CLI and Desktop can use a store on another machine. Follow
+[the remote-entry commands](../remote-entries.md#hermes-on-the-client-machine): on the store machine,
+`scope-recall attach --host hermes --remote-profile default` creates the entry without a Hermes install;
+`--grants-like all --capture-like <existing-entry>` shares effective owner scopes in that command; unverified owner rows are excluded. Configure and serve
+it through `remote_server` with `--host hermes`. CLI and Desktop owner routes are included; gateway users and
+chats require exact audience rows through `scope-recall grants`.
+
+On the client, add the plugin from the catalog (`hermes plugins install scope-recall`) without running setup, so the
+environment Hermes runs plugins in has the core. Then, from a virtual environment with the same Scope Recall version,
+make the token and run `remote_client install --config <client.json> --plugin-dir <client-home>`. Installation keeps
+the catalog's plugin, pins it to that version, writes the transport binding and selects `memory.provider:
+scope-recall` in `config.yaml`. Other bytes are preserved and changed files are backed up. If the pinned version
+differs from the catalog's, turn the plugin off and on so Hermes rebuilds its environment. Stop the profile's running
+backend (`hermes gateway stop`, or restart a gateway service) before starting a new session: a running backend keeps
+the plugin it loaded. Do not run local setup or `hermes memory setup` in this remote profile. An existing local store
+binding is refused. Remote mode opens and creates no client database.
+
+The token represents the entire entry, including every granted chat, rather than independently authenticating
+individual senders. Read tools and automatic recall use the existing HTTP service; mutations are unavailable because
+Hermes' tool context does not independently attest the conversation and latest human authorization. Tool calls,
+tool output, memory-file and delegation hooks are not recorded remotely.
+
+Snapshots coalesce per turn in the existing spool, bounded to 64 MiB. Later lifecycle calls or `remote_client flush`
+replay them without adding a background process. Pre-compression checkpoints keep their necessary rows until replay,
+even when later history is shorter. `remote_client status` reports byte occupancy, capacity/size losses and the first
+loss time. Permanently oversized snapshots are counted and removed; transient failures retain pending snapshots. For average snapshot size B bytes and R turns/hour, estimate the retention window as
+`64 * 1024 * 1024 / (B * R)` hours. This is finite buffering. Once recording rules are known, a failed policy check
+also prevents new content from being queued; no content is sent until a metadata-only check succeeds. See the
+[remote limits and trust boundary](../remote-entries.md#data-trust-and-limits).
+
 ## Plugin catalog
 
 For a published Scope Recall entry in the Hermes plugin catalog:

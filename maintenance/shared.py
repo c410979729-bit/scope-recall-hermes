@@ -29,10 +29,11 @@ import shutil
 import sqlite3
 import sys
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,7 @@ from ..adapters.hermes.shared_entries import (
     shared_entry_record,
     write_shared_payload,
 )
+from ..adapters.host_identity import matches_owner_principal
 from ..contracts import ContractError, InstanceBinding, TrustedContext
 from ..core.storage import SQLiteStorage
 from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
@@ -246,7 +248,12 @@ def _client_grants(
     others: running the same attach again finishes or repeats it.
     """
     others = {
-        entry["entry_id"]: [row for row in entry["audiences"] if row.get("kind") == "owner_private"]
+        entry["entry_id"]: [
+            row
+            for row in entry["audiences"]
+            if row.get("kind") == "owner_private"
+            and matches_owner_principal(entry["owner_principals"], platform=row["platform"], user_id=row["user_id"])
+        ]
         for entry in payload["entries"]
         if not entry.get("detached_at") and entry["entry_id"] != entry_id
     }
@@ -338,7 +345,7 @@ def init_shared(
 def _refuse_misfit(
     host: str,
     home: Path,
-    grants_from: Path | InstallationManifest | None,
+    grants_from: Path | InstallationManifest | Callable | None,
     grants_like: tuple[str, ...],
     capture_like: str | None,
 ) -> None:
@@ -427,7 +434,7 @@ def attach(
     root: Path,
     entry_id: str,
     display_name: str,
-    grants_from: Path | InstallationManifest | None = None,
+    grants_from: Path | InstallationManifest | Callable | None = None,
     runtime_config_from: Path | None = None,
     python_executable: Path | None = None,
     grants_like: tuple[str, ...] = (),
@@ -460,7 +467,9 @@ def attach(
                     "the grant options given are not used (scope-recall grants changes grants)"
                 )
         elif host == "hermes":
-            if isinstance(grants_from, InstallationManifest):
+            if callable(grants_from):
+                source = grants_from(instance_root, payload)
+            elif isinstance(grants_from, InstallationManifest):
                 source = grants_from
                 if source.hermes_home.resolve() != instance_root.resolve():
                     raise SharedStoreError("grant manifest belongs to another home")
@@ -966,6 +975,52 @@ def entries(*, root: Path, now: str | None = None) -> dict[str, Any]:
     }
 
 
+def remote_hermes_grants(home: Path, payload: dict, *, profile: str, like: tuple[str, ...], capture_like: str | None):
+    """Build CLI/Desktop grants from existing owner grants while attach holds its store lock."""
+    allowed, writable, capture = _client_grants(payload, home, "", like, capture_like)
+    base = fresh_installation(home, payload, profile, local_platforms=("desktop",))
+    rows = tuple(
+        {
+            **dict(row),
+            "allowed_scope_ids": sorted(allowed),
+            "writable_scope_ids": sorted(writable),
+            "capture_scope_id": capture,
+        }
+        for row in base.audiences
+        if row["kind"] == "owner_private"
+    )
+    return replace(
+        base,
+        scope_ids=frozenset(allowed),
+        audience_scopes={key: capture for key in base.audience_scopes},
+        audiences=rows,
+    )
+
+
+def _attach_cli(args):
+    """Convert CLI options into the existing locked attachment operation."""
+    like = tuple(name.strip() for name in (args.grants_like or "").split(",") if name.strip())
+    source = _absolute(args.grants_from, "grants_from") if args.grants_from else None
+    if args.remote_profile is not None:
+        if args.host != "hermes" or source is not None:
+            raise SharedStoreError("--remote-profile requires --host hermes and no --grants-from")
+        source = partial(remote_hermes_grants, profile=args.remote_profile, like=like, capture_like=args.capture_like)
+    return attach(
+        host=args.host,
+        instance_root=_absolute(args.instance_root, "instance_root"),
+        root=_absolute(args.root, "root"),
+        entry_id=args.entry,
+        display_name=args.display_name,
+        grants_from=source,
+        runtime_config_from=_absolute(args.runtime_config_from, "runtime_config_from")
+        if args.runtime_config_from
+        else None,
+        python_executable=_absolute(args.python, "python") if args.python else None,
+        grants_like=() if args.remote_profile is not None else like,
+        capture_like=None if args.remote_profile is not None else args.capture_like,
+    )
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="scope-recall")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -979,6 +1034,10 @@ def main(argv: list[str]) -> int:
     join.add_argument("--root", required=True)
     join.add_argument("--entry", required=True, help="2 to 32 lowercase letters, digits or hyphens")
     join.add_argument("--display-name", required=True, help="the name a reader is shown, at most 32 characters")
+    join.add_argument(
+        "--remote-profile",
+        help="create a remote Hermes CLI/Desktop entry for this profile, without a local Hermes install",
+    )
     join.add_argument("--grants-from", help="the installation.json of the home's own store, moved aside")
     join.add_argument(
         "--grants-like",
@@ -1020,20 +1079,7 @@ def main(argv: list[str]) -> int:
         if args.command == "init-shared":
             result = init_shared(root=_absolute(args.root, "root"), agent_id=args.agent_id, test_mode=args.test_mode)
         elif args.command == "attach":
-            result = attach(
-                host=args.host,
-                instance_root=_absolute(args.instance_root, "instance_root"),
-                root=_absolute(args.root, "root"),
-                entry_id=args.entry,
-                display_name=args.display_name,
-                grants_from=_absolute(args.grants_from, "grants_from") if args.grants_from else None,
-                runtime_config_from=_absolute(args.runtime_config_from, "runtime_config_from")
-                if args.runtime_config_from
-                else None,
-                python_executable=_absolute(args.python, "python") if args.python else None,
-                grants_like=tuple(name.strip() for name in (args.grants_like or "").split(",") if name.strip()),
-                capture_like=args.capture_like,
-            )
+            result = _attach_cli(args)
         elif args.command == "detach":
             result = detach(instance_root=_absolute(args.instance_root, "instance_root"))
         elif args.command == "grants":

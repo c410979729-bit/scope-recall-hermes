@@ -51,7 +51,7 @@ def discover_entries(homes: Path) -> list[RemoteServerConfig]:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             host = raw.get("host") if isinstance(raw, dict) else None
-            if host not in {"codex", "claude-code", "workbuddy", "dsh"}:
+            if host not in {"codex", "claude-code", "workbuddy", "dsh", "hermes"}:
                 raise ValueError("invalid remote host")
             entries.append(load_server_config(home, host))
         except (OSError, ValueError) as exc:
@@ -107,14 +107,14 @@ def preserve_lock_for_exec(fd: int) -> None:
 
 def main() -> int:
     """Validate the mounted store and replace this process with foreground Supervisor."""
-    from ...adapters.clients.config import load_shared_client
+    from ...adapters.clients.config import load_server_entry
 
     try:
         store = DATA / "store"
         handle = acquire_container_lock(store)
         entries = discover_entries(DATA / "homes")
         for config in entries:
-            client = load_shared_client(config.home, config.host)
+            client = load_server_entry(config.home, config.host)
             if client.data_directory.resolve() != store.resolve():
                 raise ValueError(f"remote entry {config.home} points to another store")
         if not SECRET.is_file():

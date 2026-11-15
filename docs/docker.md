@@ -1,8 +1,9 @@
 # Shared store in Docker
 
 The image runs the shared store and its remote entry servers on a Linux host. Hooks and MCP clients run on each
-host machine and reach the store through a remote entry. The Hermes provider opens store files directly: to share
-memory with Hermes, install the complete shared store locally instead of using this image.
+host machine and reach the store through a remote entry. Hermes can use the same remote service: its gateway,
+CLI or Desktop profile runs the forwarding memory provider, while the container runs the ordinary Hermes adapter.
+See [Hermes remote entries](remote-entries.md#hermes-on-the-client-machine).
 
 Use one local named volume and one container for a store. Stop local processes that open the store before starting
 the container, and keep them stopped while it runs. The container lease excludes another container using this image;

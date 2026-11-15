@@ -31,9 +31,11 @@ from ..host_identity import (
     owner_subjects,
     principal_ref,
     resolve_runtime_audience,
+    switched_scope,
 )
 from ..host_identity import context_ref as _context_ref
 from ..host_identity import host_scope_payload as host_scope_payload
+from ..host_identity import normalize_platform as _normalize_platform
 from .audiences import LOCAL_PLATFORMS, LOCAL_USER_ID, approved_local_platforms
 from .installation import (
     HermesIdentityError,
@@ -74,11 +76,6 @@ class SessionUnbound(HermesIdentityError):
 
 def _scope_component(label: str, value: str) -> str:
     return f"{label}:{len(value)}:{value}"
-
-
-def _normalize_platform(value: object) -> str:
-    text = str(value or "cli").strip().lower()
-    return text or "cli"
 
 
 def _normalize_user_id(
@@ -201,6 +198,8 @@ class HermesIdentity:
     read_only: bool
     #: The user's name as the gateway passes it (Telegram's first and last name); empty where it passes none.
     user_name: str = ""
+    #: The remote host's OS-account principal, supplied only by its authenticated forwarding adapter.
+    local_account_principal: str | None = None
 
     @property
     def writable_scope_ids(self) -> frozenset[str]:
@@ -229,7 +228,15 @@ class HermesIdentity:
         if sender_id == user:
             return True
         local = self.scope.platform == "cli" or self.scope.platform in LOCAL_PLATFORMS
-        return local and user == LOCAL_USER_ID and _names_this_account(sender_id)
+        return (
+            local
+            and user == LOCAL_USER_ID
+            and (
+                sender_id == self.local_account_principal
+                if self.local_account_principal is not None
+                else _names_this_account(sender_id)
+            )
+        )
 
     @property
     def runtime_config_path(self) -> Path | None:
@@ -499,7 +506,12 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
     agent_identity, agent_workspace, agent_context = _agent_fields(kwargs, manifest)
     local_platforms = approved_local_platforms(manifest.owner_principals)
     conversation = _transport_conversation(platform, kwargs)
-    if conversation and _names_this_account(kwargs.get("user_id")):
+    account = kwargs.get("trusted_local_account_principal")
+    if conversation and (
+        str(kwargs.get("user_id") or "").strip() == account
+        if account is not None
+        else _names_this_account(kwargs.get("user_id"))
+    ):
         # The person at this machine, bound as a session that names no user is on these surfaces.  Named, though, it
         # is somebody, the owner: where the installer approved no grant it binds no scope, as a login nobody approved
         # does, and is not refused.
@@ -541,6 +553,7 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
         runtime_audience=runtime_audience,
         read_only=agent_context in _NON_PRIMARY_CONTEXTS or not runtime_audience.writable_scope_ids,
         user_name=_user_name(kwargs.get("user_name")),
+        local_account_principal=str(account) if account is not None else None,
     )
 
 
@@ -566,22 +579,12 @@ def switch_hermes_identity(
     A missing principal inherits only on the same platform. An explicit empty
     principal must pass the normal CLI fallback/non-CLI missing-principal gate.
     """
-    values: dict[str, object] = asdict(current.scope)
-    values.update({key: kwargs[key] for key in values if key in kwargs})
-    if "user_id" in kwargs or "user_id_alt" in kwargs:
-        values["user_id"] = kwargs.get("user_id")
-        values["user_id_alt"] = kwargs.get("user_id_alt")
-    elif _normalize_platform(values["platform"]) != current.scope.platform:
-        values["user_id"] = ""
-    # The name goes with the person: kept for the same one, given anew with them, dropped for another.
-    if "user_name" in kwargs:
-        values["user_name"] = kwargs["user_name"]
-    elif not any(key in kwargs for key in ("platform", "user_id", "user_id_alt")):
-        values["user_name"] = current.user_name
+    values = switched_scope({**asdict(current.scope), "user_name": current.user_name}, kwargs)
     fresh = bind_hermes_identity(
         new_session_id,
         hermes_home=current.hermes_home,
         parent_session_id=parent_session_id or current.parent_session_id,
+        trusted_local_account_principal=current.local_account_principal,
         **values,
     )
     assert_same_installation(current, fresh)

@@ -450,13 +450,12 @@ class TurnCapture:
             and direct_owner_cli(identity)
             and context.actor_origin == "human_direct"
             and private.parse_recording_command(current_message)
+            and getattr(self._adapter, "_recording_command_allowed", True)
             and kwargs.get("attachments") in (None, [])
         ):
-            core = self._adapter._require_core()
-            if private.parse_recording_command(current_message) == "pause":
-                private.open_interval(core.storage, core.clock, context, target="session", session=context.session_id)
-            else:
-                private.close_interval(core.storage, core.clock, context, target="session", session=context.session_id)
+            command = private.parse_recording_command(current_message)
+            assert command is not None
+            self._adapter._recording_command(context, command, turn_id)
             with self._adapter._said_lock:
                 self._adapter._user_captured_turns[turn_id] = None
             return
