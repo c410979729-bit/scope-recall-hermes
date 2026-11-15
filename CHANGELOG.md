@@ -2,6 +2,12 @@
 
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``).
 
+## [4.0.4] - 2026-11-14
+
+The repository moved to https://github.com/c410979729-bit/scope-recall-hermes with its full history, and releases are now published from it. Links in the package metadata, `SECURITY.md` and `CONTRIBUTORS.md` no longer point to the old repository. The code is the same as 4.0.3.
+
+No schema change is needed: stores from 4.0.0 through 4.0.3 work directly with this release.
+
 ## [4.0.3] - 2026-11-07
 
 `hermes memory setup` and `scope-recall setup --host hermes` now give a new Hermes entry's memory to Hermes Desktop on the same machine as well as to the CLI: the entry gets the owner principal `(desktop, local)` and its `owner_private` row on the CLI row's scope, so a Desktop chat recalls and captures without a `scope-recall grants` edit. `hermes --tui` still needs the owner's approval, because the browser dashboard's chat tab runs the TUI and a dashboard on loopback can serve it without a login. Running setup again keeps an existing entry's grants; add Desktop to an entry made by an earlier release as `docs/install/hermes.md` describes.
