@@ -189,6 +189,12 @@ def prepare_catalog(job: Exercise, env: dict) -> tuple:
     )
     assert pins == 1, f"the catalog manifest does not pin one core package: {manifest}"
     manifest.write_text(pinned, encoding="utf-8")
+    # A dependency upgrade does not approve an existing entry's OS account. This operator-owned fixture
+    # explicitly approves its isolated local entry; package loading and remote forwarding must never do so.
+    job.run(
+        [python, "-m", CLI, "approve-local-account", "--host", "hermes", "--instance-root", str(local), "--yes"],
+        local_env,
+    )
     return python, local, launcher, wheel, local_env
 
 

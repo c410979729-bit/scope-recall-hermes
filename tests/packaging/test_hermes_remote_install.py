@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import tomllib
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 from scope_recall._version import __version__
 from scope_recall.adapters.clients.remote_client import RemoteClientError
+from scope_recall.adapters.hermes import bind_hermes_identity
 from scope_recall.adapters.hermes.shared_entries import load_binding_for_home
+from scope_recall.adapters.shared_entries import read_shared_payload, write_shared_payload
 from scope_recall.maintenance import install_remote, shared
+from scope_recall.maintenance.cli import main as maintenance_main
 from scope_recall.maintenance.install_common import manifest_version
 from scope_recall.maintenance.install_hermes import DIST_HERMES, wrapper_manifest, wrapper_pyproject
 
@@ -68,6 +74,80 @@ def test_attach_remote_profile_shares_owner_grants_and_needs_no_hermes(tmp_path,
     assert load_binding_for_home(remote).audiences == added.audiences
     assert not (remote / "plugins").exists()
     assert not list(remote.glob("*.sqlite3"))
+
+
+def test_catalog_candidate_preparation_explicitly_approves_the_legacy_local_entry(tmp_path, capsys):
+    """The released catalog entry stays inaccessible until the candidate's operator approval runs."""
+    runner, store = tmp_path / "runner", tmp_path / "TEST-store"
+    home = runner / "hermes-catalog-install/home/.hermes"
+    assert shared.main(["init-shared", "--root", str(store), "--test-mode"]) == 0
+    assert (
+        shared.main(
+            [
+                "attach",
+                "--host",
+                "hermes",
+                "--instance-root",
+                str(home),
+                "--root",
+                str(store),
+                "--entry",
+                "hermes",
+                "--display-name",
+                "TEST catalog",
+            ]
+        )
+        == 0
+    )
+    legacy = read_shared_payload(store)
+    legacy["entries"][0].pop("local_account_id")
+    write_shared_payload(store, legacy)
+    sent = dict(hermes_home=str(home), platform="cli", agent_identity="default", agent_workspace="hermes")
+    before = bind_hermes_identity("TEST-before-approval", **sent)
+    assert before.read_only and not before.runtime_audience.allowed_scope_ids
+    plugin = home / "plugins/scope-recall"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text('pip_dependencies: ["hermes-scope-recall[vectors]==4.0.4"]\n', encoding="utf-8")
+    launcher = home / "bin/hermes"
+    launcher.parent.mkdir()
+    launcher.write_text("# TEST launcher placeholder; not executed", encoding="utf-8")
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    with zipfile.ZipFile(wheels / "hermes_scope_recall-TEST.whl", "w") as wheel:
+        wheel.writestr("hermes_scope_recall-TEST.dist-info/METADATA", f"Version: {__version__}\n")
+    script = Path(__file__).resolve().parents[2] / ".github/scripts/hermes_remote_install.py"
+    spec = importlib.util.spec_from_file_location("TEST_hermes_catalog_exercise", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = []
+
+    def run(argv, env, **kwargs):
+        # Environment creation is outside this fixture; the explicit management operation is real.
+        calls.append(argv)
+        if argv[1:3] == ["-m", module.CLI]:
+            assert maintenance_main(argv[3:]) == 0
+        else:
+            assert argv[1:3] in (["-m", "venv"], ["-m", "pip"])
+        return ""
+
+    work = tmp_path / "exercise"
+    work.mkdir()
+    module.prepare_catalog(
+        SimpleNamespace(work=work, run=run),
+        {
+            "RUNNER_TEMP": str(runner),
+            "HERMES_HOME": str(home),
+            "WHEELS": str(wheels),
+        },
+    )
+    after = bind_hermes_identity("TEST-after-approval", **sent)
+    assert after.runtime_audience.includes_owner_private and not after.read_only
+    expected = legacy["entries"][0]
+    actual = read_shared_payload(store)["entries"][0]
+    assert actual.pop("local_account_id")
+    assert actual == expected, "approval must preserve identity and existing grants"
+    assert any("approve-local-account" in argv for argv in calls)
 
 
 def test_remote_install_selects_provider_preserves_bytes_and_backs_up(tmp_path):
