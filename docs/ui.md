@@ -82,9 +82,9 @@ and English otherwise. The language selector switches between both languages.
   You can still browse, read history, correct and manage your memory under either
   mode, through this page or the memory command, without model or embedding
   requests for inspection. Full mode prevents agents from recalling it;
-  read-only permits recall. An agent's explicit forget or correction request
-  still applies under either mode, with its usual authorization and revision
-  checks. If the rules change after a close preview, confirmation is refused;
+  read-only permits recall. The agent `forget` and `revise` tools are closed
+  because the hosts lack a verified latest-message binding for each model request.
+  If the rules change after a close preview, confirmation is refused;
   create a new preview before closing the current rules.
 - **Export** writes visible memory to a new directory or a new path ending in
   `.zip`, with optional retained attachments. Type the destination on this

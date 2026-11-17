@@ -11,6 +11,42 @@ Select a shared store with `--root /path/to/store`. For an installation with its
 `--host hermes|codex|claude-code|workbuddy|dsh --instance-root /path/to/home`. An attached entry directs you to the shared
 store root so management sees the whole installation. Examples below use a shared root.
 
+## Local account approval
+
+Local host owner routes require the OS account approved at installation or attachment.
+The account comes from the process token on Windows or the OS UID elsewhere, never a username environment variable.
+Its pin is stored once in the installation configuration, or in the selected shared entry's record.
+Existing grants remain unchanged. A missing pin, unreadable account or different account grants no local owner audience.
+Loading a configuration, capturing a prompt and calling an MCP tool never enroll an account.
+Account enforcement requires the updated adapter; older adapter code does not enforce the optional pin.
+
+An older unbound installation needs explicit approval from the owner's local account:
+
+```sh
+scope-recall approve-local-account --host hermes --instance-root /path/to/home --yes
+scope-recall approve-local-account --host codex --instance-root /path/to/client-home --yes
+```
+
+For another attached client, select its host and home instead. This command preserves scopes and identities,
+backs up the configuration under its receipts directory, and changes only the selected entry's pin in a shared store.
+It refuses to replace a pin belonging to a different account. The whole-store management capability described above
+remains an explicit local operator capability; it is not exposed through an agent tool.
+
+## Correction retries
+
+`MemoryManagement.revise` and `scope-recall memory revise --request-id ID` accept an explicit occurrence ID.
+Reuse it only to resend the exact same correction with the same expected revision and value, under the same
+operator account, session, principal and scopes. An exact retry returns the original action, item, source and epoch
+from SQLite, including after reopening Core, and writes no additional version or source. Reusing the ID with a
+different command is refused. A later target revision, deletion, private interval or withdrawn capability also
+prevents replay. Each new user command needs a new ID; omitting it retains ordinary version checks.
+The receipt stores the command's digest and content-free result alongside its truthful local-management audit.
+It does not store another copy of the correction text.
+
+This receipt applies to the explicit management API and CLI. The management page does not supply occurrence IDs.
+Core's model revision path has no durable revision receipt; Hermes and MCP model `revise` and `forget` continue to
+refuse requests without verified latest-message binding.
+
 ## Entry controls
 
 The installation owner can list entries, inspect recent activity and change an entry's state. A local store uses
@@ -346,5 +382,58 @@ The Review page lists unconfirmed cross-session observations. The held-content p
 Use **Confirm observation** to record review, or open the fact detail to edit the body or delete it. Confirmation
 keeps the `derived_summary` basis and the original multi-session evidence. A source withdrawal still invalidates
 an observation after confirmation. Existing `memory show`, `memory revise` and deletion commands handle these
-claim references. The agent `revise` tool accepts `new_value: {"confirmed": true}` when the current owner message
-explicitly confirms the referenced observation; edits and retractions retain the same conversation authority checks.
+claim references. The agent `revise` tool is closed because the hosts lack a verified latest-message binding
+for each model request. Use local memory management for explicit edits and retractions.
+
+## Correct source provenance
+
+`memory origin` corrects the attribution of stored source versions. It previews by default; `--yes` applies
+all displayed consequences in one transaction. Use `--preview-id` to require the exact earlier preview.
+Bare event references select their current version; `EVENT@REVISION` selects that exact content version.
+
+```sh
+scope-recall memory origin EVENT@1 --origin host_generated --reason "Host notification" --root /path/to/store --json
+scope-recall memory origin EVENT@1 --origin host_generated --reason "Host notification" --root /path/to/store --yes --preview-id HASH
+scope-recall memory history EVENT --root /path/to/store --json
+scope-recall memory origin EVENT@1 --origin human_direct --reason "Undo attribution correction" --root /path/to/store --yes
+scope-recall memory origin-candidates --root /path/to/store --json
+scope-recall memory origin-candidates --root /path/to/store --after SOURCE_ID --limit 100 --snippet
+```
+
+Targets are `host_generated` or `origin_unknown`. `human_direct` is available only for a source with a recorded
+correction from human attribution. The source's content revision stays fixed: changing it would invalidate
+existing evidence references, including mixed evidence that must remain intact. `origin_history` in `show` and
+`history` records provenance revisions, actor, time, previous attribution and reason separately. Restoring human
+attribution does not restore withdrawn facts or cancelled work; review those decisions separately.
+
+The preview lists each affected claim and all its versions, including revision, state, validity interval and
+selected versus other evidence roots. Main and auxiliary references follow derived source lineage. A claim is
+automatically retracted only when its head is not already retracted, every unretracted version relies entirely
+on the selected sources, and all those versions have exactly the head's validity interval. This appends one
+ordinary head retraction with unchanged payload. History and earlier `known_at` knowledge remain available.
+Mixed evidence is retained as `mixed_unchanged`. Differing validity intervals, sole-source versions alongside
+versions supported elsewhere, legacy denial heads, and facts migrated from a legacy store, whose evidence exists
+only as links, are listed as `review`; their claim histories stay intact.
+Review those cases with `memory revise --retract`, `memory mute` or `memory forget`, checking each command's
+preview and scope before applying. Observations and conversation summaries remain `source_view_unchanged`;
+already withdrawn claims remain `historical_unchanged`.
+
+The preview also enumerates queued extraction and candidate evaluation work to invalidate. Pending corrections
+become obsolete; affected adoption bindings return to review and sole-source resolved references become
+unresolved. Content, source indices and episode membership remain intact; the memory epoch advances so later
+recall and injection read current attribution.
+In-flight derivations check attribution again before accepting results. An injection already delivered before
+the transaction cannot be recalled. Deleted or unavailable sources remain behind their existing visibility
+boundaries; this command does not reconstruct deleted content or reverse completed deletion operations.
+
+`origin-candidates` and provenance previews read in ordinary read-only transactions, including committed rows
+in the WAL. They do not change database rows, initialize or migrate the store. SQLite may create or update
+`-wal` and `-shm` files beside the database, as it can for any reader. To preserve a backup's files unchanged,
+run these commands on its copy. With `--yes`, the command previews first, then recomputes and compares the
+preview under the write lock before applying.
+
+`origin-candidates` is paged by source ID, and omits bodies unless `--snippet` is given (120 characters).
+It reuses the Hermes adapter's marker recognition and platform-ID precedence, and also recognizes the legacy
+import review prompt. Historical envelopes that did not retain platform message IDs cannot distinguish a host
+prefix from a person's pasted prefix. Treat matches without IDs as review candidates and check the original
+conversation before correcting attribution. The command does not inspect any host installation's conversation files.

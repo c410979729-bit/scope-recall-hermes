@@ -200,6 +200,7 @@ _LEXICAL_PROJECTION_1108 = (
     "CREATE INDEX lexical_source ON lexical_projection(event_id,source_revision)",
 )
 _SCHEMA_STEPS = {
+    1135: {"tables": ("model_revision_receipts",)},
     1134: {
         "before": tuple(
             f"DROP TRIGGER {name}"
@@ -348,6 +349,9 @@ def downgrade_store(path, version: int) -> None:
     # Closed here: left to the garbage collector, the connection moved its pages from the WAL into the file at a
     # moment nobody chose, and a byte comparison after it failed at random.
     with closing(sqlite3.connect(path)) as conn:
+        # Current-reader indexes can name columns absent in older stores;
+        # initialization rebuilds these accelerators after the schema upgrade.
+        conn.execute("DROP INDEX IF EXISTS source_adoption_order")
         for step in sorted((step for step in _SCHEMA_STEPS if step > version), reverse=True):
             objects = _SCHEMA_STEPS[step]
             for statement in objects.get("before", ()):

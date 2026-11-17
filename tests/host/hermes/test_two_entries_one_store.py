@@ -17,7 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 from scope_recall.adapters.clients import CodexHookHandler
-from scope_recall.adapters.hermes import HermesIdentityError, ScopeRecallHermesAdapter, bind_hermes_identity
+from scope_recall.adapters.hermes import HermesIdentityError, ScopeRecallHermesAdapter, bind_hermes_identity, hooks
 from scope_recall.adapters.hermes.identity import switch_hermes_identity
 from scope_recall.adapters.hermes.installation import build_installation_manifest, write_installation_manifest
 from scope_recall.adapters.hermes.shared_entries import (
@@ -169,8 +169,57 @@ def test_the_same_host_session_and_turn_on_two_entries_are_two_sources(root, ent
     assert all(f":{entry}:TEST-same-session:" in key for entry, _session, key in rows)
 
 
+def _native_forget(provider, home, command, body, monkeypatch):
+    """Execute one synthetic request through the same public callbacks as a native host."""
+    registered, middleware = {}, {}
+    ctx = Mock(
+        register_hook=lambda name, fn: registered.__setitem__(name, fn),
+        register_middleware=lambda name, fn: middleware.__setitem__(name, fn),
+    )
+    monkeypatch.setattr(hooks, "_iter_hook_callbacks", lambda: ())
+    hooks.register_capture_hooks(ctx, provider)
+    ids = dict(
+        session_id="TEST-session-1",
+        turn_id="TEST-turn-2",
+        api_request_id="TEST-delete-api",
+        task_id="TEST-delete-task",
+        hermes_home=str(home),
+    )
+    row = dict(role="user", content=command, message_uid="TEST-delete-uid", _row_id=1)
+    request = dict(messages=[dict(role="user", content=command)])
+    registered["pre_api_request"](
+        **ids,
+        user_message=command,
+        conversation_history=[row],
+        request_messages=request["messages"],
+        retry_count=0,
+        started_at=1.0,
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    tool_calls=[SimpleNamespace(id="TEST-delete-call", function=SimpleNamespace(name="forget"))]
+                )
+            )
+        ]
+    )
+    middleware["llm_execution"](**ids, request=request, next_call=lambda _: response)
+    return json.loads(
+        middleware["tool_execution"](
+            **ids,
+            tool_name="forget",
+            tool_call_id="TEST-delete-call",
+            args=body,
+            next_call=lambda args: provider.handle_tool_call("forget", args),
+        )
+    )
+
+
 @pytest.mark.parametrize("slow_write", [False, True], ids=["store", "slow_store"])
-def test_a_deletion_through_one_entry_is_gone_for_every_entry(root, entries, slow_capture_store, slow_write):
+def test_a_deletion_through_one_entry_is_gone_for_every_entry(
+    root, entries, slow_capture_store, slow_write, monkeypatch
+):
     """Deletion blocks every entry's recall and purges the shared source, including after a slow capture."""
     agent3, agent2 = entries
     told, deleting = _provider(agent2), _provider(agent3)
@@ -181,18 +230,13 @@ def test_a_deletion_through_one_entry_is_gone_for_every_entry(root, entries, slo
             session_id="TEST-session-1", turn_id="TEST-turn-1", user_message="TEST 我的储物柜编号是 4471。"
         )
         ref, revision = told._current_source_refs[-1].rsplit("@", 1)
-        deleting.observe_pre_llm(session_id="TEST-session-1", turn_id="TEST-turn-2", user_message=f"忘记 {ref}。")
-        receipt = json.loads(
-            deleting.handle_tool_call(
-                "forget",
-                {
-                    "protocol_version": "1.1",
-                    "target_refs": [ref],
-                    "mode": "delete",
-                    "expected_revisions": {ref: int(revision)},
-                },
-            )
-        )
+        command = f"忘记 {ref}。"
+        deleting.on_turn_start(1, command, turn_id="TEST-turn-2", session_id="TEST-session-1")
+        deleting.observe_pre_llm(session_id="TEST-session-1", turn_id="TEST-turn-2", user_message=command)
+        body = dict(protocol_version="1.1", target_refs=[ref], mode="delete", expected_revisions={ref: int(revision)})
+        unbound = json.loads(deleting.handle_tool_call("forget", body))
+        assert unbound["error"]["field"] == "request_message_binding", unbound
+        receipt = _native_forget(deleting, agent3, command, body, monkeypatch)
         assert receipt["result"]["mode"] == "delete", receipt
         told.on_session_switch("TEST-session-2")
         injected = told.prefetch("储物柜编号 4471")

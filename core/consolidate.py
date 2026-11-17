@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from ..contracts import ContractError, validate_evidence_positions
 from .adoption_dedup import is_bound_duplicate
-from .adoption_work import schedule_adoptions
+from .adoption_schedule import schedule_adoptions
 from .candidate_lifecycle import CandidateSnapshot, candidate_model_subject
 from .claim_storage import parse_source_ref
 from .consolidation_chunks import ChunkedSource, ConsolidationChunk

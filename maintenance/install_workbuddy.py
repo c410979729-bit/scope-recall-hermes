@@ -47,6 +47,9 @@ SETTINGS_FILENAME = "settings.json"
 #: The user's own MCP servers (WorkBuddy's ``customMcpConfigPath``), not ``.mcp.json``.
 MCP_FILENAME = "mcp.json"
 SERVER_NAME = "scope-recall"
+#: What the person sets on the server themselves in WorkBuddy's MCP settings: a server they turned off stays off when
+#: an install or upgrade writes its command again.
+PERSON_SERVER_KEYS = ("disabled",)
 #: What WorkBuddy shows beside the server in its MCP settings, where it waits to be approved.
 SERVER_DESCRIPTION = "Scope Recall: the memory this machine's agents share"
 #: The most a hook's own work takes once its interpreter has started: the entry's ``hook_processing_seconds``, at most
@@ -328,8 +331,9 @@ def _servers(config: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def with_server(config: dict[str, Any], server: dict[str, Any], recognise: Callable[[object], bool]) -> dict[str, Any]:
-    """``config`` with ``server`` as the MCP server ``scope-recall``, every other server and key as it is.  A server of
-    that name ``recognise`` does not take for this install's is refused."""
+    """``config`` with ``server`` as the MCP server ``scope-recall``, every other server and key as it is, and the
+    person's own settings on that server (``PERSON_SERVER_KEYS``) kept.  A server of that name ``recognise`` does not
+    take for this install's is refused."""
     servers = _servers(config) or {}
     present = servers.get(SERVER_NAME)
     if present is not None and not recognise(present):
@@ -337,6 +341,8 @@ def with_server(config: dict[str, Any], server: dict[str, Any], recognise: Calla
             f"WorkBuddy's {MCP_FILENAME} already has an MCP server named {SERVER_NAME} that is not "
             "this entry's: take it out first"
         )
+    if isinstance(present, dict):
+        server = {**server, **{key: copy.deepcopy(present[key]) for key in PERSON_SERVER_KEYS if key in present}}
     return {**copy.deepcopy(config), "mcpServers": {**copy.deepcopy(servers), SERVER_NAME: server}}
 
 

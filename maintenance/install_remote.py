@@ -8,15 +8,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import shutil
 import sys
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from scope_recall._version import stamp_manifest_version
 
 from ..adapters.clients.remote_client import HOOK_TIMEOUTS, RemoteClientError, absolute_path, load_client_config
 from . import install_dsh as dsh
@@ -26,7 +23,6 @@ from .install_common import (
     CLAUDE_CODE_DESCRIPTION,
     CODEX_LONG_DESCRIPTION,
     CODEX_SHORT_DESCRIPTION,
-    PACKAGE_VERSION,
     REMOTE_STORE_NOTE,
     SKILLS,
     InstallError,
@@ -55,12 +51,12 @@ def hermes_files(config: dict[str, Any], home: Path) -> dict[Path, str]:
     it would also replace the package's ``register`` function once imported). The core declaration keeps the form
     the plugin directory already has: Hermes' package manager does not rebuild a plugin whose declaration moves
     between ``plugin.yaml``'s ``pip_dependencies`` and an authored ``pyproject.toml``, and disables it instead. A
-    directory the catalog installed keeps its pin in ``plugin.yaml``; a home plugin the local installer wrote keeps
-    its ``pyproject.toml``.
+    directory the catalog installed keeps its pin in ``plugin.yaml``; an existing authored project keeps its
+    ``pyproject.toml``. Fresh wrappers use the manifest form in both local and remote installation.
     """
     from ..adapters.hermes.remote import config_path
     from .hermes_config import provider_configuration
-    from .install_hermes import DIST_HERMES, home_plugin_dir, wrapper_manifest, wrapper_pyproject
+    from .install_hermes import home_plugin_dir, wrapper_files
 
     if any((home / "scope-recall" / name).exists() for name in ("attachment.json", "installation.json")):
         raise RemoteClientError("Hermes profile already has a local store binding; use a separate profile")
@@ -68,32 +64,12 @@ def hermes_files(config: dict[str, Any], home: Path) -> dict[Path, str]:
     remote = {key: str(config[key]) for key in ("url", "host", "token_file", "state_dir")}
     try:
         configuration = provider_configuration(home / "config.yaml").decode("utf-8")
+        files = wrapper_files(wrapper)
     except InstallError as exc:
         raise RemoteClientError(str(exc)) from exc
-    template = (DIST_HERMES / "plugin.yaml").read_text(encoding="utf-8")
-    files = {
-        home / "config.yaml": configuration,
-        config_path(home): json.dumps(remote, indent=2) + "\n",
-        wrapper / "__init__.py": (DIST_HERMES / "__init__.py").read_text(encoding="utf-8"),
-    }
-    if (wrapper / "pyproject.toml").is_file():
-        files[wrapper / "plugin.yaml"] = wrapper_manifest(template)
-        files[wrapper / "pyproject.toml"] = wrapper_pyproject()
-    else:
-        files[wrapper / "plugin.yaml"] = _pinned_manifest(template)
+    files[home / "config.yaml"] = configuration
+    files[config_path(home)] = json.dumps(remote, indent=2) + "\n"
     return files
-
-
-_CORE_PIN = re.compile(r'"hermes-scope-recall\[vectors\]==[^"]*"')
-
-
-def _pinned_manifest(template: str) -> str:
-    """The catalog manifest stamped with this package and pinning it exactly, development builds included."""
-    stamped = stamp_manifest_version(template, PACKAGE_VERSION)
-    pinned, count = _CORE_PIN.subn(f'"hermes-scope-recall[vectors]=={PACKAGE_VERSION}"', stamped)
-    if count != 1:
-        raise RemoteClientError("the catalog manifest does not pin exactly one core package")
-    return pinned
 
 
 def plugin_files(config: dict[str, Any], plugin_dir: Path) -> dict[Path, str]:

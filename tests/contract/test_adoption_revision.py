@@ -9,8 +9,8 @@ from scope_recall.core.worker_adoption import prepare_adoptions, publish_adoptio
 from scope_recall.core.worker_consolidation import build_consolidation_model
 from scope_recall.runtime.models import AuxiliaryModelError
 
-from tests.contract.test_adoption import PLAN, assistant, selected
-from tests.contract.test_claims import accept, app, capture, draft
+from tests.contract.test_adoption import PLAN, assistant, capture, selected
+from tests.contract.test_claims import accept, app, draft
 
 
 def reply(selection=None, *, forged=False, supported=True):

@@ -14,6 +14,7 @@ from typing import Any
 
 from ..contracts import ContractError
 from .adoption import fragments
+from .adoption_order import preceding_occurrence, prior_assistant_contents, revision_before
 
 
 @dataclass(frozen=True)
@@ -63,29 +64,22 @@ def _owner_bound(tx, owner, assistant):
 def adoption_context(tx, owner):
     """Find the preceding assistant occurrence in this session and audience.
 
-    First capture orders occurrences: an edit appended later cannot masquerade
-    as a new turn before confirmation. Deleted rows identify an unavailable
-    predecessor but lend no words. Imported and reinjected approvals cannot bind.
+    The first witnessed envelope fixes each occurrence's position. Deleted rows
+    and waiting captures occupy positions but lend no words. Imported and
+    reinjected approvals cannot bind.
     """
     if owner.event["origin"] != "human_direct" or owner.event["role"] != "user":
         return None
     conn = tx._check()
-    row = conn.execute(
-        """SELECT event_id,max(source_revision) AS revision,origin FROM source_events
-        WHERE session_id=? AND scope_id=? AND project_id IS ? AND branch_id IS ? AND entry_id=?
-        AND event_id!=? GROUP BY event_id HAVING min(source_id)<
-        (SELECT min(source_id) FROM source_events WHERE event_id=?)
-        ORDER BY min(source_id) DESC LIMIT 1""",
-        (owner.session_id, owner.scope_id, owner.project_id, owner.branch_id, owner.entry_id, owner.ref, owner.ref),
-    ).fetchone()
-    if row is None or row["origin"] != "assistant_visible":
+    row = preceding_occurrence(conn, owner)
+    if row is None or row["origin"] != "assistant_visible" or row["role"] != "assistant" or row["source_revision"] != 1:
         return None
-    revision = conn.execute(
-        """SELECT max(source_revision) FROM source_events WHERE event_id=? AND source_id<
-        (SELECT min(source_id) FROM source_events WHERE event_id=?)""",
-        (row["event_id"], owner.ref),
-    ).fetchone()[0]
+    revision = revision_before(conn, row["event_id"], owner)
     assistant = tx.source(row["event_id"], revision)
+    if assistant is not None and (
+        assistant.event["origin"] != "assistant_visible" or assistant.event["role"] != "assistant"
+    ):
+        return None
     if not _owner_bound(tx, owner, assistant):
         return None
     parts = fragments(assistant.event["content"]) if assistant is not None else ()
@@ -132,11 +126,11 @@ def binding_reason(tx, snapshot, selection):
 
 
 def owner_selection_reason(tx, snapshot, selection):
-    """Require the exact persisted owner choice, never a model-supplied flag."""
+    """Require the persisted owner choice and honor later Undo of its published fact."""
     reviewed = (
         tx._check()
         .execute(
-            "SELECT selection_json,state,reason FROM adoption_relations "
+            "SELECT selection_json,state,reason,claim_ref,claim_revision FROM adoption_relations "
             "WHERE confirmation_ref=? AND confirmation_revision=?",
             (snapshot.confirmation.ref, snapshot.confirmation.revision),
         )
@@ -147,6 +141,20 @@ def owner_selection_reason(tx, snapshot, selection):
     stored = json.loads(reviewed["selection_json"])
     if reviewed["reason"] == "owner_review_rejected":
         return "owner_review_rejected"
+    # Undo restores the binding's earlier fact pointer. Its audit retains the
+    # newer restored revision, even when the restored head was already active.
+    if (
+        tx._check()
+        .execute(
+            "SELECT 1 FROM management_actions a,json_each(a.targets_json,'$.restored') r "
+            "WHERE a.action='review_undo' AND json_extract(a.targets_json,'$.key[0]')='fact' "
+            "AND json_extract(a.targets_json,'$.key[1]')=? AND r.key=? AND r.value>? LIMIT 1",
+            (reviewed["claim_ref"], reviewed["claim_ref"], reviewed["claim_revision"]),
+        )
+        .fetchone()
+        is not None
+    ):
+        return "owner_review_undo"
     if stored.get("owner_reviewed") and stored != selection:
         return "owner_review_changed"
     if selection.get("owner_reviewed"):
@@ -160,18 +168,7 @@ def reference_reason(tx, snapshot, selection):
     labels = _binding_labels(snapshot, selection)
     if labels is None:
         return "reference_unbound"
-    rows = (
-        tx._check()
-        .execute(
-            """SELECT e.content FROM source_events e WHERE e.session_id=? AND e.scope_id=? AND e.project_id IS ?
-        AND e.branch_id IS ? AND e.entry_id=? AND e.origin='assistant_visible'
-        AND e.source_id<(SELECT min(source_id) FROM source_events WHERE event_id=?)
-        AND NOT EXISTS(SELECT 1 FROM source_events n WHERE n.event_id=e.event_id
-                       AND n.source_revision>e.source_revision)""",
-            (owner.session_id, owner.scope_id, owner.project_id, owner.branch_id, owner.entry_id, owner.ref),
-        )
-        .fetchall()
-    )
+    rows = prior_assistant_contents(tx._check(), owner)
     if not labels and len(rows) != 1:
         return "ambiguous_reference"
     for label in labels:

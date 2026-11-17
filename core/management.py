@@ -16,7 +16,7 @@ from ..contracts import ContractError
 from .delete_storage import OBJECT_TABLES, canonical
 from .importance import set_importance
 from .management_query import MemoryFilter, browse, partition, session_refs, source_metadata, witnesses
-from .management_revision import correct
+from .management_revision import correct, replay_revision, revision_request
 from .quarantine_management import preview_release, release_source, review_page
 from .restore import InstallationMaintenance, maintenance_context
 from .secret_patterns import contains_secret_like_text
@@ -284,6 +284,18 @@ class MemoryManagement:
 
         return find_secrets(self.core.storage, self._context())
 
+    def preview_origin(self, refs, *, origin, reason):
+        """Preview exact source provenance and authority changes for the local owner."""
+        from .source_origin import preview
+
+        return preview(self, refs, origin=origin, reason=reason)
+
+    def apply_origin(self, preview):
+        """Apply an unchanged provenance preview under the installation owner's capability."""
+        from .source_origin import apply
+
+        return apply(self, preview)
+
     def _location(self, tx, ref):
         kind = str(ref).split("-", 1)[0]
         if kind not in OBJECT_TABLES:
@@ -307,7 +319,13 @@ class MemoryManagement:
             scoped = replace(context, project_id=row["project_id"], branch_id=row["branch_id"])
             if revision is None:
                 revision = row["revision"]
-        return asdict(self.core.inspect_object(scoped, ref, revision, owner_authority=self.authority))
+        result = asdict(self.core.inspect_object(scoped, ref, revision, owner_authority=self.authority))
+        if _kind == "event":
+            from .source_origin import history
+
+            with self.core.storage.read(scoped) as tx:
+                result["origin_history"] = history(tx._check(), ref, revision)
+        return result
 
     def history(self, ref, *, before=None, limit=30):
         """Return a bounded newest-first history page, checked by normal inspection."""
@@ -639,20 +657,28 @@ class MemoryManagement:
             )
         return self.show(ref)
 
-    def revise(self, ref, *, expected_revision, value):
-        """Correct a derived claim; a null value withdraws it while keeping history."""
+    def revise(self, ref, *, expected_revision, value, request_id=None):
+        """Correct a claim; an explicit retry key recovers its original durable response."""
         context = self._context()
+        identity, digest = revision_request(context, ref, expected_revision, value, request_id)
         with self.core.storage.write(context, remaining_seconds=10) as tx:
             kind, row = self._location(tx, ref)
             if kind != "claim":
                 raise ContractError("ACCESS_DENIED", "source_text_immutable")
             view = partition(tx, context, row["project_id"], row["branch_id"], writable=True)
-            action, item, source = correct(view, self.core.clock, ref, expected_revision, value)
-            self._audit(tx, action, "revise", [dict(ref=ref, revision=item.revision, source_ref=source)])
-            return dict(
+            prior = replay_revision(view, self.core.clock, identity, digest)
+            if prior is not None:
+                return prior
+            action, item, source = correct(view, self.core.clock, ref, expected_revision, value, action_id=identity)
+            result = dict(
                 item=asdict(item),
                 actor="local_user_management",
                 action_id=action,
                 source_ref=source,
                 memory_epoch=tx.status().memory_epoch,
             )
+            target: dict[str, object] = dict(ref=ref, revision=item.revision, source_ref=source)
+            if identity is not None:
+                target["receipt"] = dict(request_sha256=digest, result=result)
+            self._audit(tx, action, "revise", [target])
+            return result

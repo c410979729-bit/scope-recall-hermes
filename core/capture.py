@@ -192,6 +192,9 @@ def record_event(
         context = _import_context(value, context, prepared)
     try:
         with storage.write(context, remaining_seconds=remaining_seconds - (clock.monotonic() - started)) as tx:
+            tx.claims.require_request_message(
+                proposal_refs=prepared.events[0].get("evidence_refs", []) if prepared.events else []
+            )
             if _inbox_token is not None and _inbox_entry_gone(tx, _inbox_token, scope_id, context):
                 return CaptureReceipt(
                     "cancelled",

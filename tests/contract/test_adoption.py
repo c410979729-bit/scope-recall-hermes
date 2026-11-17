@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from scope_recall.core.adoption import adoption_messages, decode_selection, fragments
@@ -10,14 +11,30 @@ from scope_recall.core.consolidate import consolidation_messages
 from scope_recall.core.worker_adoption import prepare_adoptions, publish_adoption
 from v11_support import recall_request, source_event
 
-from tests.contract.test_claims import accept, app, capture, draft
+from tests.contract.test_claims import accept, app, draft
+from tests.contract.test_claims import capture as capture_source
 
 PLAN = "方案一：直接覆盖配置。\n\n方案二：先备份配置，再平滑重启，失败时恢复备份。"
+
+
+def witnessed(core):
+    """Give synthetic conversational occurrences distinct, increasing host times."""
+    return (datetime(2026, 9, 1, 12, tzinfo=UTC) + timedelta(seconds=next(core.test_sequence))).isoformat()
+
+
+def capture(core, ctx, text, **kwargs):
+    """Capture a synthetic owner message at its witnessed conversation position."""
+    moment = kwargs.pop("when", witnessed(core))
+    kwargs.setdefault("recorded_at", moment or core.clock.utc_now())
+    return capture_source(core, ctx, text, when=moment, **kwargs)
 
 
 def assistant(core, ctx, text=PLAN, **kwargs):
     key = kwargs.pop("key", f"TEST-plan/{next(core.test_sequence)}")
     revision = kwargs.pop("revision", 1)
+    moment = witnessed(core)
+    kwargs.setdefault("occurred_at", moment)
+    kwargs.setdefault("recorded_at", moment)
     event = source_event(
         source_event_key=key,
         source_revision=revision,

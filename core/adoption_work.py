@@ -21,48 +21,6 @@ from .worker_outcomes import (
 )
 
 
-def schedule_adoptions(tx, source_refs, *, now):
-    """Checkpoint adjacent replies only after their ordinary consolidation commits.
-
-    Reusing each source's completed work row keeps retries, ownership and deletion
-    in the existing queue. A completed checkpoint prevents rescheduling on replay.
-    """
-    conn = tx._check(write=True)
-    for key in source_refs:
-        ref, revision = key.rsplit("@", 1)
-        source = tx.source(ref, int(revision))
-        snapshot = adoption_context(tx, source) if source is not None else None
-        if snapshot is None:
-            continue
-        row = conn.execute(
-            "SELECT work_id FROM work_items WHERE work_type='consolidate' "
-            "AND subject_ref=? AND subject_revision=? AND state='done'",
-            (ref, int(revision)),
-        ).fetchone()
-        if row is None:
-            continue
-        inserted = conn.execute(
-            "INSERT OR IGNORE INTO adoption_processing(work_id,confirmation_ref,confirmation_revision,"
-            "assistant_ref,assistant_revision,payload_json) VALUES (?,?,?,?,?,?)",
-            (
-                row[0],
-                ref,
-                int(revision),
-                snapshot.assistant_ref,
-                snapshot.assistant_revision,
-                json.dumps(
-                    dict(stage="locate", entry_fence=entry_fence(tx, (snapshot.confirmation, snapshot.assistant)))
-                ),
-            ),
-        ).rowcount
-        if inserted:
-            conn.execute(
-                "UPDATE work_items SET state='pending',attempt=0,available_at=?,last_error_code=NULL "
-                "WHERE work_id=? AND state='done'",
-                (now, row[0]),
-            )
-
-
 def adoption_checkpoint(tx, work_id):
     """Read one source-version checkpoint without mixing it with ordinary model input."""
     row = tx._check().execute("SELECT * FROM adoption_processing WHERE work_id=?", (work_id,)).fetchone()

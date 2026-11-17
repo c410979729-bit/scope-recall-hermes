@@ -138,16 +138,31 @@ def test_delete_idempotence_is_zero_mutation_even_after_authorization_source_rem
     assert one == two and core.storage.path.read_bytes() == before
 
 
-def test_unknown_and_unauthorized_targets_use_same_error_and_do_not_disclose_existence(app):
+def test_unknown_and_unauthorized_targets_use_same_error_and_do_not_disclose_existence(app, monkeypatch):
     core, ctx = app
     item, source = initial(core, ctx)
     other = replace(ctx, project_id="TEST-other")
-    for ref in (source.ref, "event-" + "f" * 64):
+    refs = (source.ref, "event-" + "f" * 64)
+    proof = capture(core, other, "删除 " + " ".join(refs))
+    with core.storage.read(other) as tx:
+        assert tx.claims.current_human((f"{proof.ref}@1",), proof.scope_id).ref == proof.ref
+    from scope_recall.core.delete_storage import Deletions
+
+    looked_up = []
+    original = Deletions.target
+
+    def target(self, ref):
+        looked_up.append(ref)
+        return original(self, ref)
+
+    monkeypatch.setattr(Deletions, "target", target)
+    for ref in refs:
         with pytest.raises(ContractError) as error:
             core.forget(
                 other, dict(protocol_version="1.1", mode="delete", target_refs=[ref], expected_revisions={ref: 1})
             )
         assert (error.value.code, error.value.field) == ("ACCESS_DENIED", "target_unavailable")
+    assert looked_up == list(refs)
     assert core.source(ctx, source.ref, 1)
 
 

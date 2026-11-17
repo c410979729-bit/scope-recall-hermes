@@ -425,7 +425,7 @@ def test_preview_creates_nothing_and_codex_install_doctor_uninstall(tmp_path):
     command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     _assert_hook_uses_current_interpreter(command, Path(sys.executable))
     assert str(instance_root / "codex-installation.json") in command
-    assert "unsupported" not in json.dumps(hooks)
+    assert "unsupported" not in json.dumps(hooks) and {"PreModelRequest", "PreToolUse"} <= set(hooks["hooks"])
 
     tracked = [
         instance_root / "codex-installation.json",
@@ -583,13 +583,13 @@ def _hand_made_wrapper(inside):
 
 @pytest.fixture
 def released(monkeypatch):
-    """The install as a release builds it, whatever this tree's version: only a release on PyPI declares its core
-    to Hermes, and between releases the tree is a candidate."""
+    """Render installation declarations for a release, whatever this tree's version."""
     from scope_recall.maintenance import install_hermes
 
     from packaging_hooks.module_inventory import stamped_manifest
 
     version = "3.10.3"
+    monkeypatch.setattr(install_hermes, "__version__", version)
     manifest, project = install_hermes.wrapper_manifest, install_hermes.wrapper_pyproject
     monkeypatch.setattr(
         install_hermes,
@@ -647,11 +647,75 @@ def test_development_install_replaces_old_home_declaration(tmp_path, capsys, com
     if command == "plan-install":
         assert any(c["path"] == str(inside / "pyproject.toml") and c["action"] == "replace" for c in result["changes"])
         notes = " ".join(c.get("detail", "") for c in result["changes"] if c["action"] == "restart")
-        assert all(part in notes for part in ("UV_FIND_LINKS", "hermes_cli.venv_sync", "hermes update", "disabled"))
+        assert all(
+            part in notes
+            for part in (
+                "UV_FIND_LINKS",
+                "hermes plugins disable",
+                "hermes plugins enable",
+                "hermes update",
+                "disabled",
+            )
+        )
     else:
         dependencies = tomllib.loads((inside / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
         assert dependencies == [f"hermes-scope-recall[vectors]=={candidate}"]
         assert "pip_dependencies" not in yaml.safe_load((inside / "plugin.yaml").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("build", ["released", "candidate"])
+@pytest.mark.parametrize("declaration", ["fresh", "manifest", "pyproject"])
+def test_local_install_keeps_dependency_declaration_form(tmp_path, request, build, declaration):
+    """Local install and reapply retain Hermes's dependency source so its locked plugin member stays valid."""
+    version = request.getfixturevalue(build)
+    instance, _outside, project = _install_paths(tmp_path, host="hermes")
+    plugin = instance / "plugins" / "scope-recall"
+    if declaration == "pyproject":
+        _hand_made_wrapper(plugin)
+    elif declaration == "manifest":
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            "name: scope-recall\nversion: 3.10.0\npip_dependencies:\n  - hermes-scope-recall==3.10.0\n",
+            encoding="utf-8",
+        )
+        (plugin / "__init__.py").write_text("# TEST wrapper\n", encoding="utf-8")
+    for _ in range(2):
+        plan = _hermes_plan(instance, plugin, project)
+        assert plan.conflicts == []
+        apply_install(plan)
+        assert (plugin / "pyproject.toml").is_file() == (declaration == "pyproject")
+        if declaration == "pyproject":
+            dependencies = tomllib.loads((plugin / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+                "dependencies"
+            ]
+        else:
+            dependencies = yaml.safe_load((plugin / "plugin.yaml").read_text(encoding="utf-8"))["pip_dependencies"]
+        assert dependencies == [f"hermes-scope-recall[vectors]=={version}"]
+
+
+@pytest.mark.parametrize("declaration", ["manifest", "pyproject"])
+def test_local_upgrade_keeps_receipted_dependency_declaration(tmp_path, monkeypatch, declaration):
+    """A version upgrade keeps the locked member, backs up its old declaration and reuses the bound store."""
+    from scope_recall.maintenance import install_hermes
+
+    instance, _outside, project = _install_paths(tmp_path, host="hermes")
+    plugin = instance / "plugins" / "scope-recall"
+    if declaration == "pyproject":
+        _hand_made_wrapper(plugin)
+    initial = apply_install(_hermes_plan(instance, plugin, project))
+    source = plugin / ("pyproject.toml" if declaration == "pyproject" else "plugin.yaml")
+    original = source.read_bytes()
+    version = "4.0.5+local"
+    monkeypatch.setattr(install_hermes, "__version__", version)
+    upgraded = apply_install(_hermes_plan(instance, plugin, project))
+    assert upgraded.installation_id == initial.installation_id
+    assert any(Path(path).read_bytes() == original for path in upgraded.backups)
+    assert (plugin / "pyproject.toml").is_file() == (declaration == "pyproject")
+    if declaration == "pyproject":
+        dependencies = tomllib.loads(source.read_text(encoding="utf-8"))["project"]["dependencies"]
+    else:
+        dependencies = yaml.safe_load(source.read_text(encoding="utf-8"))["pip_dependencies"]
+    assert dependencies == [f"hermes-scope-recall[vectors]=={version}"]
 
 
 @pytest.mark.parametrize("version", ["4.0.0rc1", "4.0.0.dev1", "4.0.0+local"])
@@ -663,6 +727,11 @@ def test_non_pypi_home_declarations_pin_exact_version(tmp_path, monkeypatch, ver
     inside = instance_root / "plugins" / "scope-recall"
     plan = _hermes_plan(instance_root, inside, project_root)
     assert any(change.action == "restart" and "UV_FIND_LINKS" in change.detail for change in plan.changes)
+    files = install_hermes.planned_files(plan)
+    assert inside / "pyproject.toml" not in files
+    assert yaml.safe_load(files[inside / "plugin.yaml"])["pip_dependencies"] == [
+        f"hermes-scope-recall[vectors]=={version}"
+    ]
     project = tomllib.loads(install_hermes.wrapper_pyproject(version))
     assert project["project"]["dependencies"] == [f"hermes-scope-recall[vectors]=={version}"]
     template = "name: scope-recall\nversion: 1.0.0\n"
@@ -675,17 +744,14 @@ def test_non_pypi_home_declarations_pin_exact_version(tmp_path, monkeypatch, ver
 
 
 def test_the_home_plugin_directory_declares_the_core_with_its_vector_extra(tmp_path, released):
-    """Hermes's package manager builds the environment it runs plugins in from the declaration there, and a
-    ``pyproject.toml`` wins over ``plugin.yaml``: both declare the core with ``[vectors]`` to enable binary indexing."""
-    import tomllib
-
+    """A fresh home wrapper pins the core and its vector extra in the manifest Hermes reads."""
     import yaml
 
     instance_root, _outside, project_root = _install_paths(tmp_path, host="hermes")
     inside = instance_root / "plugins" / "scope-recall"
     apply_install(_hermes_plan(instance_root, inside, project_root))
     wanted = f"hermes-scope-recall[vectors]=={released}"
-    assert tomllib.loads((inside / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"] == [wanted]
+    assert not (inside / "pyproject.toml").exists()
     assert yaml.safe_load((inside / "plugin.yaml").read_text(encoding="utf-8"))["pip_dependencies"] == [wanted]
     apply_uninstall(plan_uninstall(instance_root=instance_root))
     assert not (inside / "pyproject.toml").exists()
@@ -2155,10 +2221,8 @@ def test_the_cli_passes_a_symlinked_interpreter_on_as_given(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["python_executable"] == str(link)
 
 
-def test_a_released_wrapper_declares_its_core_and_a_candidate_declares_nothing():
-    """Hermes builds the environment it runs plugins in from what their manifests declare, and rebuilds it
-    on updates: a wrapper that declares nothing loses its core then.  A requirement Hermes cannot
-    resolve fails its whole build, so only a release on PyPI is declared."""
+def test_pyproject_wrapper_manifest_defers_non_pypi_dependencies_to_project():
+    """An authored project pins builds absent from PyPI without a competing manifest dependency."""
     import yaml
     from packaging.requirements import Requirement
     from scope_recall._version import manifest_version

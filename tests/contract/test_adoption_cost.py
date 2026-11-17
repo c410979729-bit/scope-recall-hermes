@@ -8,8 +8,8 @@ import pytest
 from scope_recall.core.recall_budget import estimate_tokens
 from scope_recall.core.worker_consolidation import build_consolidation_model
 
-from tests.contract.test_adoption import assistant, selected
-from tests.contract.test_claims import app, capture, draft
+from tests.contract.test_adoption import assistant, capture, selected
+from tests.contract.test_claims import app, draft
 
 
 @pytest.mark.parametrize("with_adoptions", [False, True], ids=["no-adoptions", "mixed"])

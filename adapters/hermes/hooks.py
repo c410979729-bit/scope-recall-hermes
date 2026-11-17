@@ -184,9 +184,14 @@ def _dispatch(event: str, kwargs: dict[str, Any], *, wait: float) -> Any | None:
 def _global_callback(event: str) -> Callable[..., None]:
     def callback(**kwargs: Any) -> None:
         started, timeout = time.monotonic(), host_hook_timeout()
+        selected = _active_adapter(kwargs) if event == "pre_api_request" else None
+        native = getattr(selected, "_native_requests", None)
+        candidate = native.observe(selected, kwargs) if native is not None else None
         adapter = _dispatch(
             event, kwargs, wait=_SESSION_WAIT_CAP_S if timeout is None else min(_SESSION_WAIT_CAP_S, timeout / 3)
         )
+        if native is not None and adapter is selected:
+            native.finish(candidate)
         elapsed = time.monotonic() - started
         if timeout is not None and elapsed >= timeout:
             _log.warning(
@@ -227,12 +232,30 @@ def register_capture_hooks(ctx: Any, adapter: Any) -> list[str]:
     if iter_hook_callbacks is None or _context_registered(ctx):
         return []
     registered: list[str] = []
+    if callable(getattr(ctx, "register_middleware", None)):
+        for kind in ("llm_execution", "tool_execution"):
+            ctx.register_middleware(kind, _execution_callback(kind))
     for event in _SUPPORTED_HOOKS:
         callback = _global_callback(event)
         ctx.register_hook(event, callback)
         registered.append(event)
     _mark_context_registered(ctx)
     return registered
+
+
+def _execution_callback(kind):
+    """Use the existing exact profile/session router for public middleware too."""
+
+    def execute(*, next_call, **kwargs):
+        adapter = _active_adapter(kwargs)
+        native = getattr(adapter, "_native_requests", None)
+        payload = kwargs.get("request" if kind == "llm_execution" else "args")
+        if native is None:
+            return next_call(payload)
+        method = native.llm if kind == "llm_execution" else native.tool
+        return method(adapter, kwargs, next_call, payload)
+
+    return execute
 
 
 def update_adapter_binding(adapter: Any) -> None:

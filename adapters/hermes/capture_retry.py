@@ -20,6 +20,7 @@ from scope_recall.core import MemoryCore
 from scope_recall.core.deadline import fits
 from scope_recall.core.failure_policy import HERMES_DISK_RETRY, HERMES_MEMORY_SECONDS, HERMES_REPLAY
 
+from ..host_identity import resolve_granted_audience as resolve_runtime_audience
 from . import kept_captures
 from .authorization import build_ingress_authorizer
 from .boundary import SourceIdentity
@@ -27,7 +28,6 @@ from .capture import CAPTURE_TIMEOUT_S, RETRY_CAPACITY, RetryCapture, label
 from .identity import (
     HermesIdentity,
     HermesIdentityError,
-    resolve_runtime_audience,
 )
 from .installation import assert_binding_matches_manifest
 from .shared_entries import load_binding_for_home

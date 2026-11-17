@@ -66,19 +66,17 @@ READ_VIEW_BUDGET_GUIDANCE = (
 #: whole source message, and every other fact drawn from it, with the one named.
 REVISE_GUIDANCE = (
     "When the user states a new value in conversation, no tool call is needed. "
-    "Use revise only when they explicitly ask to change a specific stored fact. "
-    "Original messages (event refs) cannot be revised; do not retry or edit storage. "
-    "Correct or withdraw one remembered fact: writes a new version and keeps the "
-    "old one as history (new_value null withdraws it). Refused unless the user's "
-    "own latest message asks for it, contains the new value and names what is "
-    "being corrected."
+    "Execution requires a host-verified binding to the exact latest complete user message in this model request. "
+    "Cite that message's captured source reference; old evidence does not authorize a new correction. "
+    "When request_message_binding is unavailable, use the local memory management page or memory command. "
+    "The revision contract keeps the old version as history (new_value null withdraws it)."
 )
 FORGET_GUIDANCE = (
-    "suppress: stop using a memory unasked; it stays readable on request, and "
-    "nothing undoes this. delete: erase it together with the whole message it came "
-    "from and every other fact taken from that message; it cannot be undone. Tell "
-    "the user which before calling. Refused unless the user's own latest message "
-    "asks for it plainly and names the item."
+    "Execution requires a host-verified binding to the exact latest complete user message in this model request, "
+    "with an explicit suppression or deletion command naming the target and its current version. "
+    "When request_message_binding is unavailable, use the local memory management page or memory command. "
+    "Suppression stops automatic use while preserving explicit reads; nothing undoes this "
+    "implicitly. Deletion erases the whole message it came from and every other fact taken from that message."
 )
 
 

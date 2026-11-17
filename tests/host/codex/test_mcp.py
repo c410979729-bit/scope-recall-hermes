@@ -14,6 +14,7 @@ from uuid import uuid4
 import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.server.mcpserver.exceptions import ToolError
 from scope_recall.adapters.clients import CodexHookHandler, install_codex_scope_recall
 from scope_recall.adapters.clients.identity import resolve_runtime_audience, trusted_context
 from scope_recall.contracts import SourceEvent
@@ -197,8 +198,7 @@ def test_mcp_stdio_all_tools_and_host_thread_bound_mutations(tmp_path: Path) -> 
                 candidate = await session.call_tool(
                     "propose_memory", {"protocol_version": "1.1", "content": "候选，不是权威事实"}, meta=meta
                 )
-                assert not candidate.is_error, candidate
-                assert candidate.structured_content["result"]["authority"] == "assistant_visible_only"
+                assert candidate.is_error and "request_message_binding" in candidate.content[0].text, candidate
                 revised = await session.call_tool(
                     "revise",
                     {
@@ -212,9 +212,7 @@ def test_mcp_stdio_all_tools_and_host_thread_bound_mutations(tmp_path: Path) -> 
                     },
                     meta=meta,
                 )
-                assert not revised.is_error, revised
-                # Core's authority rule requires the latest same-thread human
-                # source to be the evidence for each destructive operation.
+                assert revised.is_error and "request_message_binding" in revised.content[0].text, revised
                 hook_capture(f"删除 {claim_ref}。", "turn-3")
                 forgotten = await session.call_tool(
                     "forget",
@@ -222,11 +220,15 @@ def test_mcp_stdio_all_tools_and_host_thread_bound_mutations(tmp_path: Path) -> 
                         "protocol_version": "1.1",
                         "target_refs": [claim_ref],
                         "mode": "delete",
-                        "expected_revisions": {claim_ref: 2},
+                        "expected_revisions": {claim_ref: 1},
                     },
                     meta=meta,
                 )
-                assert not forgotten.is_error, forgotten
+                assert (
+                    forgotten.is_error
+                    and "request_message_binding" in forgotten.content[0].text
+                    and core.claim_history(human, claim_ref)[-1].revision == 1
+                ), forgotten
                 denied = await session.call_tool(
                     "forget",
                     {
@@ -263,7 +265,7 @@ def test_mcp_stdio_all_tools_and_host_thread_bound_mutations(tmp_path: Path) -> 
     asyncio.run(run())
 
 
-def test_mcp_revise_with_a_null_value_withdraws_the_fact(tmp_path: Path) -> None:
+def test_mcp_retraction_requires_request_message_binding(tmp_path: Path) -> None:
     """``new_value`` null withdraws a fact, as the tool's description says.  The server drops the arguments a caller
     left unset; a null new value is set, and reaches the core as one."""
     project = tmp_path / "project"
@@ -328,19 +330,18 @@ def test_mcp_revise_with_a_null_value_withdraws_the_fact(tmp_path: Path) -> None
     asked = said("TEST-withdraw-3", "撤回 TEST-project 的蓝色。")
     assert core.current_claim(human, claim.ref).revision == claim.revision
     revise = adapter.server._tool_manager.get_tool("revise")
-    result = revise.fn(
-        SimpleNamespace(request_context=SimpleNamespace(meta={"threadId": thread})),
-        "1.1",
-        claim.ref,
-        claim.revision,
-        None,
-        [],
-        [f"{asked}@1"],
-        None,
-    )
-    assert "error" not in result, result
-    assert core.current_claim(human, claim.ref) is None
-    assert core.claim_history(human, claim.ref)[-1].state == "retracted"
+    with pytest.raises(ToolError, match="request_message_binding"):
+        revise.fn(
+            SimpleNamespace(request_context=SimpleNamespace(meta={"threadId": thread})),
+            "1.1",
+            claim.ref,
+            claim.revision,
+            None,
+            [],
+            [f"{asked}@1"],
+            None,
+        )
+    assert core.current_claim(human, claim.ref).revision == claim.revision
 
 
 def test_recall_epoch_race_scrubs_compiled_payload_surface(tmp_path: Path) -> None:

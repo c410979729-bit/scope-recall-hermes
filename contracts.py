@@ -748,6 +748,58 @@ def _validate_compaction(sequence: int | None, epoch: str | None) -> None:
 
 
 @dataclass(frozen=True)
+class RequestMessageBinding:
+    """Runtime witness of one native request's latest complete user occurrence.
+
+    Adapters create this after capture, outside model arguments. The liveness
+    callback revokes a witness when execution ends or a newer request starts.
+    It conveys no scope grant and is never serialized into stored sources.
+    """
+
+    binding: InstanceBinding
+    entry_id: str | None
+    session_id: str
+    project_id: str | None
+    branch_id: str | None
+    scope_id: str
+    source_ref: str
+    source_revision: int
+    content_sha256: str
+    occurrence: str
+    human_principal: TrustedSourcePrincipal
+    live: Callable[[], bool] = dataclass_field(compare=False, repr=False)
+
+    def validate(self, context, source) -> None:
+        """Require the same live request, verified speaker and unfiltered source."""
+        principal = self.human_principal
+        if (
+            not self.live()
+            or (self.binding, self.entry_id, self.session_id, self.project_id, self.branch_id)
+            != (context.binding, context.entry_id, context.session_id, context.project_id, context.branch_id)
+            or self.scope_id not in context.allowed_scope_ids
+            or principal is None
+            or verified_human_principal_ref(principal.to_payload()) is None
+            or context.actor_origin not in {"human_direct", "assistant_visible"}
+            or (context.actor_origin == "human_direct" and context.source_principal != principal)
+            or source is None
+            or (source.ref, source.revision, source.scope_id, source.session_id, source.project_id, source.branch_id)
+            != (self.source_ref, self.source_revision, self.scope_id, self.session_id, self.project_id, self.branch_id)
+            or source.entry_id != (context.entry_id or "local")
+            or source.project_root != context.project_root
+            or source.project_identity != "local"
+            or context.project_identity != "local"
+            or source.event.get("source_principal") != principal.to_payload()
+            or source.event["origin"] != "human_direct"
+            or source.event["role"] != "user"
+            or source.event["capture_state"] != "complete"
+            or source.capture_gaps
+            or source.suppressed
+            or hashlib.sha256(source.event["content"].encode("utf-8")).hexdigest() != self.content_sha256
+        ):
+            raise ContractError("ACCESS_DENIED", "request_message_binding")
+
+
+@dataclass(frozen=True)
 class TrustedContext:
     """Host-attested request identity and scope grants, with runtime proofs kept outside model payloads."""
 
@@ -790,6 +842,7 @@ class TrustedContext:
     subject_resolver: Callable[[str | None], tuple[str, ...]] | None = dataclass_field(
         default=None, compare=False, repr=False
     )
+    request_message: RequestMessageBinding | None = dataclass_field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.binding, InstanceBinding):
@@ -834,8 +887,15 @@ class TrustedContext:
             self.actor_origin != "imported" or not isinstance(self.import_provenance, ImportProvenance)
         ):
             raise ContractError("IDENTITY_UNBOUND", "import_provenance")
-        if self.source_principal is not None and not isinstance(self.source_principal, TrustedSourcePrincipal):
-            raise ContractError("IDENTITY_UNBOUND", "source_principal")
+        invalid_request = self.request_message is not None and not isinstance(
+            self.request_message, RequestMessageBinding
+        )
+        if invalid_request or (
+            self.source_principal is not None and not isinstance(self.source_principal, TrustedSourcePrincipal)
+        ):
+            raise ContractError(
+                "IDENTITY_UNBOUND", "request_message_binding" if invalid_request else "source_principal"
+            )
 
 
 def validate_model_request(name: str, value: str | bytes | dict, context: TrustedContext) -> dict:

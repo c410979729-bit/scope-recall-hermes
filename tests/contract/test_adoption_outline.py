@@ -10,9 +10,9 @@ from scope_recall.core.adoption import adoption_messages, decode_selection, frag
 from scope_recall.core.worker_adoption import prepare_adoptions
 from scope_recall.core.worker_consolidation import build_consolidation_model
 
-from tests.contract.test_adoption import assistant, selected
+from tests.contract.test_adoption import assistant, capture, selected
 from tests.contract.test_adoption_revision import Port, reply
-from tests.contract.test_claims import app, capture
+from tests.contract.test_claims import app
 
 
 def owner(text="采用方案二"):

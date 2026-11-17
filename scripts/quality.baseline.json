@@ -41,7 +41,7 @@
    "reportOptionalOperand": 1
   },
   "adapters/hermes/tool_surface.py": {
-   "reportAttributeAccessIssue": 15
+   "reportAttributeAccessIssue": 13
   },
   "adapters/runtime_wiring.py": {
    "reportArgumentType": 2
@@ -395,13 +395,7 @@
    "UP017": 2
   },
   "core/claim_storage.py": {
-   "C901": {
-    "Claims.append": 18
-   },
-   "E501": 10,
-   "PLR0912": {
-    "Claims.append": 18
-   }
+   "E501": 10
   },
   "core/consolidate.py": {
    "B905": 2
@@ -975,7 +969,7 @@
   },
   "tests/host/codex/test_mcp.py": {
    "PLR0915": {
-    "test_mcp_stdio_all_tools_and_host_thread_bound_mutations": 63
+    "test_mcp_stdio_all_tools_and_host_thread_bound_mutations": 62
    }
   },
   "tests/host/codex/test_remote.py": {

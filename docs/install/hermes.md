@@ -113,18 +113,29 @@ Updating the interpreter that runs the `hermes` command does not update that env
 recorded environment, package version and NumPy availability. An unreadable environment remains unverified.
 
 After stopping the gateway and workers and backing up their configuration and store, refresh the wrapper with
-`plan-install` and `apply-install`, selecting the home's `plugins/scope-recall` directory. Rebuild through Hermes's
-own environment sync. If the pinned version is unavailable from the package index, keep a directory containing
-its exact wheel available as `UV_FIND_LINKS` during every rebuild, including after `hermes update`. Keep that
-wheel directory. For example, from a POSIX shell:
+`plan-install` and `apply-install`, selecting the home's `plugins/scope-recall` directory. For wrappers it manages,
+the local installer preserves the dependency declaration form, as the remote installer does: an existing
+`pyproject.toml` keeps the pin there; a directory without one keeps the pin in `plugin.yaml`'s `pip_dependencies`.
+Fresh wrappers use the manifest form, including for development builds. Do not add or remove `pyproject.toml`
+to switch forms: Hermes's lock can still refer to the previous plugin member and fail with `Distribution not found`,
+then disable the plugin. Catalog-managed plugin files remain under Hermes's control; update them through Hermes.
+
+Rebuild the plugin environment by disabling the plugin and enabling it again. Enabling an already enabled plugin
+does not rebuild it. If the pinned version is unavailable
+from the package index, keep a directory containing its exact wheel available as `UV_FIND_LINKS` during every
+rebuild, including after `hermes update`. Keep that wheel directory. For example, from a POSIX shell:
 
 ```sh
-HERMES_HOME=/path/to/hermes-home UV_FIND_LINKS=/path/to/wheels /path/to/hermes-python -m hermes_cli.venv_sync --project-root /path/to/hermes-source --json
+HERMES_HOME=/path/to/hermes-home hermes plugins disable scope-recall
+HERMES_HOME=/path/to/hermes-home UV_FIND_LINKS=/path/to/wheels hermes plugins enable scope-recall
 ```
 
-Use the actual Hermes interpreter and source directory. On Windows, set `HERMES_HOME` and `UV_FIND_LINKS` in the
-invoking process and run the same Python module and arguments from PowerShell.
-Then restart through the host controller and verify doctor and a real host recall. The
+Use the intended profile's Hermes command. On Windows, set `HERMES_HOME` and `UV_FIND_LINKS` in the
+invoking process and run `hermes plugins disable scope-recall`, then `hermes plugins enable scope-recall` from
+PowerShell. Check that the plugin is enabled;
+an environment sync reporting success alone does not prove that. Stop any remaining backend with
+`hermes gateway stop` (or restart its gateway service), then start a new session and verify doctor and a real host
+recall. The
 [package-managed upgrade procedure](../../maintenance/AGENT_WORKFLOW.md#12-a-hermes-that-builds-its-own-plugin-environment)
 gives the sync command and failure recovery steps.
 

@@ -48,6 +48,7 @@ from .corroboration import CORROBORATED_REASON, corroboration_promotes
 from .evidence_quote import resolve_evidence_quotes, same_evidence
 from .evidence_support import positioned, support_verdict
 from .fact_temporal_semantics import date_value
+from .model_revision_storage import ModelRevisionReceipts
 from .reflection_revision import revise_observation
 from .reflection_validity import reflection_live
 from .review_policy import PENDING, REVIEW_REASONS, held_proposal, owner_publication, policy
@@ -754,7 +755,12 @@ def _revision_head(tx, request):
     if not history:
         raise ContractError("SOURCE_MISSING")
     head = next(v for v in history if v.revision == v.current_revision)
-    tx.claims.require_target(head)
+    try:
+        tx.claims.require_target(head)
+    except ContractError:
+        # Global facts can be readable while outside this request's write context.
+        # Match an unknown target's refusal before reporting revision conflicts.
+        raise ContractError("SOURCE_MISSING") from None
     if head.current_revision != request["expected_revision"]:
         raise ContractError("VERSION_CONFLICT")
     return head
@@ -951,15 +957,27 @@ def _revise_in_transaction(tx, clock, request) -> Mutation:
     return _record_revision(tx, clock, head, updated, qualification, request, authority)
 
 
-def revise(storage, clock, context: TrustedContext, value, *, remaining_seconds: float = 1.0) -> MutationReceipt:
+def revise(
+    storage, clock, context: TrustedContext, value, *, request_id: str | None = None, remaining_seconds: float = 1.0
+) -> MutationReceipt:
+    """Apply a model revision inside the storage writer's transaction."""
     request = validate_model_request("revise_request", value, context)
     with storage.write(context, remaining_seconds=remaining_seconds) as tx:
         from .entry_control import capture_refusal
 
+        tx.claims.require_request_message()
         if reason := capture_refusal(tx, context):
             raise ContractError("ACCESS_DENIED", reason)
+        receipts = ModelRevisionReceipts(tx, clock, request, request_id) if request_id is not None else None
+        if receipts is not None and (row := receipts.replay()) is not None:
+            return MutationReceipt(
+                (Mutation(row["result_ref"], row["result_revision"], row["disposition"], row["state"]),),
+                row["memory_epoch"],
+            )
         item = _revise_in_transaction(tx, clock, request)
         epoch = tx.status().memory_epoch
+        if receipts is not None:
+            receipts.record(item, epoch)
     return MutationReceipt((item,), epoch)
 
 

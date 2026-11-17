@@ -66,7 +66,18 @@ HOSTS = {
         local_surfaces=frozenset({"desktop", "tui"}),
     ),
     "codex": HostProfile(
-        events=frozenset({"SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "Interrupt", "SessionEnd"}),
+        events=frozenset(
+            {
+                "SessionStart",
+                "UserPromptSubmit",
+                "PreModelRequest",
+                "PreToolUse",
+                "Stop",
+                "PostToolUse",
+                "Interrupt",
+                "SessionEnd",
+            }
+        ),
         generated_reply_shapes=(("suggestions", list), ("suggestion", str)),
         record_format="codex",
         record_directory=("payload", "cwd"),

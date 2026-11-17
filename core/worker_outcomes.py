@@ -180,10 +180,11 @@ def _digest(text: str | None) -> str | None:
 
 
 def _source_state(tx, ref: str, revision: int) -> tuple | None:
+    """Freeze provenance as well as ingress identity: attribution can change without a content revision."""
     conn = tx._check()
     row = conn.execute(
         """SELECT e.event_sha256,e.read_blocked,e.suppressed,e.scope_id,e.project_id,e.branch_id,
-                  e.source_group_key,b.read_blocked,b.suppressed,b.operation_id,e.entry_id
+                  e.source_group_key,b.read_blocked,b.suppressed,b.operation_id,e.entry_id,e.origin,e.source_original_origin
            FROM source_events e LEFT JOIN object_blocks b ON b.object_kind='event' AND b.object_ref=e.event_id
            WHERE e.event_id=? AND e.source_revision=?""",
         (ref, revision),

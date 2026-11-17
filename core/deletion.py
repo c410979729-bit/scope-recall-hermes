@@ -77,6 +77,7 @@ def forget(storage, clock, context, value, *, remaining_seconds=1.0):
     with storage.write(context, remaining_seconds=remaining_seconds) as tx:
         from .entry_control import capture_refusal
 
+        tx.claims.require_request_message()
         if reason := capture_refusal(tx, context):
             raise ContractError("ACCESS_DENIED", reason)
         op, _ = tx.deletions.request_key(request)

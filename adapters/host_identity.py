@@ -10,9 +10,11 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
 from scope_recall.contracts import InstanceBinding, SourcePrincipal
+from scope_recall.core.entry_control import account_pin, local_account_matches
 
+from .audiences import LOCAL_PLATFORMS
 from .installation import REQUIRED_FIELDS, SCHEMA_VERSION, HermesIdentityError, InstallationManifest, is_archive_scope
-from .shared_entries import ENTRY_HOSTS, read_shared_payload
+from .shared_entries import CLIENT_HOSTS, ENTRY_HOSTS, read_shared_payload
 
 
 def _opaque_ref(prefix: str, *parts: str) -> str:
@@ -101,6 +103,15 @@ def _route_matches(row: Mapping[str, object], route: Mapping[str, str]) -> bool:
 
 
 def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntimeScope) -> RuntimeAudience:
+    """Admit local routes only under the entry's explicitly approved OS account."""
+    if scope.platform in {"cli", *LOCAL_PLATFORMS, *CLIENT_HOSTS} and not local_account_matches(
+        manifest.local_account_id
+    ):
+        return RuntimeAudience(frozenset(), None, ("capability_gap:local_account_binding",), False)
+    return resolve_granted_audience(manifest, scope)
+
+
+def resolve_granted_audience(manifest: InstallationManifest, scope: HermesRuntimeScope) -> RuntimeAudience:
     """Match one exact, installer-approved audience mapping.
 
     Audience rows are deliberately not wildcards.  In particular, a group is
@@ -200,10 +211,13 @@ def _owner_grants(binding: InstanceBinding) -> dict[str, frozenset[tuple[str, st
         speakers = {
             ("human", principal_ref("human", binding.installation_id, owner["platform"], owner["user_id"]))
             for owner in fields["owner_principals"]
+            if owner["platform"] not in {"cli", *LOCAL_PLATFORMS, *CLIENT_HOSTS}
+            or account_pin(record.get("local_account_id")) is not None
         }
-        speakers.add(
-            ("assistant", principal_ref("assistant", binding.installation_id, binding.agent_id, record["entry_id"]))
-        )
+        if speakers:
+            speakers.add(
+                ("assistant", principal_ref("assistant", binding.installation_id, binding.agent_id, record["entry_id"]))
+            )
         grants[record["entry_id"]] = frozenset(speakers)
     return grants
 
@@ -229,7 +243,7 @@ def entry_owner(binding: InstanceBinding, entry_id: str, principal: SourcePrinci
         except (HermesIdentityError, OSError, ValueError):
             pass
     expected = memo[key].get(entry_id)
-    if expected is None:
+    if not expected:
         return None
     # None identifies the reader's entry owner, not an unknown source actor.
     # Visibility still comes from the already scoped trusted context.
@@ -243,8 +257,7 @@ def owner_subjects(
 ) -> tuple[str, ...]:
     """Read human subject equivalents from the same approvals used by claim ordering.
 
-    Only a local stdio entry supplies its approved capture identity as ``current``;
-    that approval does not compare OS accounts at runtime.
+    Only a local stdio entry supplies its account-checked capture identity as ``current``.
     A gateway must name its message's principal; knowing the entry owner alone
     does not identify whoever is speaking. No audience grant is returned here.
     """

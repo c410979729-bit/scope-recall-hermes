@@ -52,7 +52,8 @@ from ...runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 from ..host_profiles import HERMES_MAX_FACT_BYTES
 from . import transcript
 from .boundary import IN_CONTEXT_FIELD, without_lone_surrogates
-from .config import CodexConfigError, SharedClientConfig, load_server_entry, load_shared_client
+from .config import CodexConfigError, SharedClientConfig, load_server_entry
+from .config import load_remote_client as load_shared_client
 from .handler import CodexHookHandler, SystemHookClock
 from .identity import resolve_runtime_audience, trusted_context
 from .local_endpoint import KeptRecaller, entry_files, file_stamp

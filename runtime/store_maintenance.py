@@ -8,7 +8,7 @@ from contextlib import closing
 from ..contracts import InstanceBinding
 from ..core.backup_primitives import sqlite_busy
 from ..core.lexical_index import claim_backfill_pending
-from ..core.schema import SCHEMA_VERSION, UPGRADE_CHAIN, stale_header_schema
+from ..core.schema import SCHEMA_VERSION, UPGRADE_CHAIN, source_session_index_present, stale_header_schema
 from ..core.truth_connection import connect_truth_database
 
 # Maintenance has its own watchdog window, independent of a model drain.
@@ -26,7 +26,10 @@ def store_upgrade_pending(binding: InstanceBinding, *, timeout_seconds: float = 
             return (
                 version in UPGRADE_CHAIN
                 or stale_header_schema(conn) is not None
-                or (version == SCHEMA_VERSION and claim_backfill_pending(conn))
+                or (
+                    version == SCHEMA_VERSION
+                    and (claim_backfill_pending(conn) or not source_session_index_present(conn))
+                )
             )
     except sqlite3.OperationalError as exc:
         if sqlite_busy(exc):

@@ -12,9 +12,9 @@ from scope_recall.core.retrieval import CandidateRef, RetrievalResult, Retrieved
 from scope_recall.core.worker_adoption import prepare_adoptions
 from v11_support import recall_request
 
-from tests.contract.test_adoption import assistant, prepared, publish
+from tests.contract.test_adoption import assistant, capture, prepared, publish
 from tests.contract.test_adoption_revision import reply
-from tests.contract.test_claims import app, capture
+from tests.contract.test_claims import app
 
 
 def adopted(core, ctx):

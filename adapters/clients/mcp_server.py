@@ -3,9 +3,10 @@
 This module deliberately contains no storage implementation.  The process is
 given a verified installation config and a verified project workspace once at
 startup; clients cannot supply identity, paths, scopes, or SQL.  The MCP
-session id is an adapter capability (there is no Codex conversation id on the
-stdio boundary), so it is reported as such and is never treated as a user
-identity.  A client attached to a shared store (Codex or Claude Code) is given
+session id belongs to the server. Reserved client metadata may identify a
+conversation. Local Codex native hooks can bind a retained user occurrence to
+one tool invocation; missing or unsupported witnesses refuse writes. A client attached to a
+shared store (Codex or Claude Code) is given
 its entry instead: its audience is the entry's, while the server's working
 directory names the project for a project-scoped private interval.  Claude Code
 sends no conversation id at all, so its mutations are refused.
@@ -51,6 +52,7 @@ from ..tool_common import (
 )
 from .config import CodexInstallationConfig, SharedClientConfig
 from .identity import CodexRuntimeAudience, resolve_runtime_audience, trusted_context
+from .native_binding import request_context as native_request_context
 from .runtime_wiring import TrustedHostRuntime, attach_trusted_host_runtime
 from .tool_schema import host_schema
 
@@ -67,8 +69,8 @@ _RECALL_BUDGET_GUIDANCE = (
 _BUDGET_CAP_GAPS = ("budget_token_cap", "budget_packet_cap")
 #: The request metadata a client binds a tool call to its conversation with.
 _THREAD_META = {host: profile.thread_meta for host, profile in HOSTS.items() if profile.thread_meta}
-#: The tools that change the store.  Core takes one only on the word of the person's latest message in the same
-#: conversation, so they are served only to a client that names its conversation on every call (``_THREAD_META``).
+#: Tools requiring a conversation binding. Revise and forget additionally fail
+#: closed because the host supplies no attested latest-message occurrence.
 _MUTATIONS = frozenset({"propose_memory", "revise", "forget"})
 
 _READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -301,8 +303,8 @@ class CodexMCPServer:
 
         The model cannot provide this value as a tool argument.  A missing or
         malformed host binding remains usable for reads with an explicit gap,
-        while mutations fail closed because Core's same-session human evidence
-        check cannot be satisfied by the independent server session.
+        while writes require a conversation. Native request witnesses are checked
+        separately before revisions, forgetting or linked proposals reach Core.
         """
         thread_id = self._thread_id(ctx)
         if thread_id is None:
@@ -311,8 +313,8 @@ class CodexMCPServer:
             return self._context(origin)
         if self._host_runtime is not None:
             self._host_runtime.rebind_session(thread_id, self.audience.allowed_scope_ids)
-        # Codex Hook stores the raw host session_id; MCP must use the same
-        # value so Core current_human evidence can interoperate.
+        # Capture and read tools share the raw host session_id. This identifies
+        # a conversation without attesting which message a model request saw.
         return replace(
             trusted_context(
                 self.config,
@@ -625,7 +627,14 @@ class CodexMCPServer:
             "capture_state": "complete",
             "evidence_refs": list(refs),
         }
-        receipt = self.core.record_event(context, event, scope_id=self.audience.capture_scope_id, remaining_seconds=1.0)
+        human = self._request_context(ctx, mutation=True, origin="human_direct")
+        with native_request_context(self, ctx, "propose_memory", body, human) as bound:
+            proof = bound.request_message
+            event["evidence_refs"] = list(dict.fromkeys([*refs, f"{proof.source_ref}@{proof.source_revision}"]))
+            context = replace(context, request_message=proof)
+            receipt = self.core.record_event(
+                context, event, scope_id=self.audience.capture_scope_id, remaining_seconds=1.0
+            )
         return self._reply(ctx, call_id, {"candidate": True, "authority": "assistant_visible_only", "receipt": receipt})
 
     def revise(
@@ -653,13 +662,11 @@ class CodexMCPServer:
         body["new_value"] = new_value
         body["valid_from"] = valid_from
         body.pop("request_id")
-        # The stdio server has no attested Codex user turn.  Core still
-        # requires its own human evidence and expected revision before
-        # changing state.
-        receipt = self.core.revise(
-            self._request_context(ctx, mutation=True, origin="human_direct"), body, remaining_seconds=1.0
-        )
-        return self._reply(ctx, call_id, receipt)
+        context = self._request_context(ctx, mutation=True, origin="human_direct")
+        validate_model_request("revise_request", body, context)
+        with native_request_context(self, ctx, "revise", body, context) as bound:
+            result = self.core.revise(bound, body, request_id=request_id)
+        return self._reply(ctx, call_id, result)
 
     def forget(
         self,
@@ -680,10 +687,11 @@ class CodexMCPServer:
             reason=reason,
         )
         body.pop("request_id")
-        receipt = self.core.forget(
-            self._request_context(ctx, mutation=True, origin="human_direct"), body, remaining_seconds=1.0
-        )
-        return self._reply(ctx, call_id, receipt)
+        context = self._request_context(ctx, mutation=True, origin="human_direct")
+        validate_model_request("forget_request", body, context)
+        with native_request_context(self, ctx, "forget", body, context) as bound:
+            result = self.core.forget(bound, body)
+        return self._reply(ctx, call_id, result)
 
     def status(
         self, ctx: Context, protocol_version: Literal["1.1"] = "1.1", request_id: StrictStr | None = None

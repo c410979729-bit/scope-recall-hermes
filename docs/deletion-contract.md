@@ -3,12 +3,21 @@
 Online event/Claim governance runs in the same SQLite transaction as its
 deletion operation, dependency blocks, epoch change and late work invalidation.
 
-`forget` requires current captured human authorization, the exact target versions,
+The Hermes and MCP `forget` tools refuse calls because their host contracts do
+not attest the exact latest user message seen by the calling model request.
+A local CLI or valid MCP thread receives `ACCESS_DENIED / request_message_binding`
+before any target or receipt lookup. This includes receipt retries. Use the local
+memory management page or `scope-recall memory` command to delete or suppress memory.
+The host requirements and error ordering are in [Claim mutation](claim-mutation-contract.md).
+
+The trusted in-process `forget` primitive requires current captured human authorization, the exact target versions,
 scope/project/branch ownership and explicit references for a batch. Unknown and
 unauthorized targets share the same error. Repeating the same authorized operation
 returns its original receipt without a new write, including after the authorizing
 source has been erased. The receipt states the requested references, actual scopes,
 project/branch, affected object count, minimum content unit and each cleanup layer.
+Its caller owns request authorization. The stored-source checks alone cannot
+establish the latest message of a model request.
 
 `suppress` blocks automatic use and preserves explicitly requested reads. It does
 not become a permanent unsuppress when a later conversation discusses the object.

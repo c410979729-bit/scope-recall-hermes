@@ -1,12 +1,13 @@
 """Versioned target DDL. Only explicit initialization/maintenance executes this."""
 
+from .adoption_order import SOURCE_ADOPTION_ORDER_INDEX
 from .handoff_schema import STATEMENTS as HANDOFF_STATEMENTS
 from .injection_schema import SEED_STATEMENTS as INJECTION_SEEDS
 from .injection_schema import STATEMENTS as INJECTION_STATEMENTS
 from .injection_schema import install as install_injection_schema
 from .retractions import SAFETY_RETRACTIONS
 
-SCHEMA_VERSION = 1134
+SCHEMA_VERSION = 1135
 #: Schemas a store may carry and be brought forward from, oldest first. Any
 #: other version is unsupported and never touched.
 UPGRADE_CHAIN = tuple(range(1105, SCHEMA_VERSION))
@@ -95,6 +96,23 @@ PRIVATE_TARGET_INDEX = (
     "CREATE INDEX private_target ON private_intervals(target_kind,session_id,project_path,ends_at,starts_at)"
 )
 PRIVATE_ACTIVE_INDEX = "CREATE INDEX private_active ON private_intervals(ends_at,starts_at)"
+
+#: Retry metadata is distinct from human management audit. Foreign keys remove
+#: orphan receipts during physical deletion; logical deletion is checked at read.
+MODEL_REVISION_STATEMENT = """CREATE TABLE model_revision_receipts (
+    request_key TEXT PRIMARY KEY NOT NULL CHECK(length(request_key)=64),
+    payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),
+    scope_id TEXT NOT NULL REFERENCES instance_scopes(scope_id) ON DELETE CASCADE,
+    source_ref TEXT NOT NULL, source_revision INTEGER NOT NULL,
+    target_ref TEXT NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,
+    target_revision INTEGER NOT NULL CHECK(target_revision>=1), target_sha256 TEXT NOT NULL,
+    result_ref TEXT NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,
+    result_revision INTEGER NOT NULL CHECK(result_revision>=1), result_sha256 TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK(disposition IN ('revised','retracted','duplicate','inserted','historical')),
+    state TEXT NOT NULL, memory_epoch INTEGER NOT NULL CHECK(memory_epoch>=0),
+    FOREIGN KEY(source_ref,source_revision) REFERENCES source_events(event_id,source_revision) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID"""
+
 
 #: Management actions carry object identities and versions, never a copied
 #: conversation body. They are distinct from host-captured user messages.
@@ -632,6 +650,7 @@ STATEMENTS = (
     ) STRICT""",
         """CREATE TABLE instance_scopes (scope_id TEXT PRIMARY KEY NOT NULL) STRICT""",
         MANAGEMENT_STATEMENT,
+        MODEL_REVISION_STATEMENT,
         PRIVATE_INTERVALS_STATEMENT,
         PRIVATE_TARGET_INDEX,
         PRIVATE_ACTIVE_INDEX,
@@ -666,6 +685,7 @@ STATEMENTS = (
     ) STRICT""",
         "CREATE INDEX source_scope_time ON source_events(scope_id,occurred_at,event_id,source_revision)",
         SOURCE_SESSION_INDEX,
+        SOURCE_ADOPTION_ORDER_INDEX,
         # A repeated tool output is looked up by its content hash at capture (core/admission.py)
         # and by the retention pass (runtime/vector_retention.py).
         "CREATE INDEX source_content ON source_events(scope_id,role,content_sha256)",
@@ -902,16 +922,20 @@ def stale_header_schema(connection) -> int | None:
 
 
 def source_session_index_present(connection) -> bool:
-    """Check the optional index with one schema lookup, without reading source rows."""
+    """Check both optional conversation indexes without reading source rows."""
     return (
-        connection.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='source_session'").fetchone()
-        is not None
+        connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' "
+            "AND name IN ('source_session','source_adoption_order')"
+        ).fetchone()[0]
+        == 2
     )
 
 
 def ensure_source_session_index(connection):
     """Supply the optional lookup index inside a verified initialization transaction."""
     connection.execute(SOURCE_SESSION_INDEX)
+    connection.execute(SOURCE_ADOPTION_ORDER_INDEX)
 
 
 def upgrade_1105(connection):
@@ -1341,3 +1365,10 @@ def upgrade_1133(connection):
         connection.execute(statement)
     connection.execute("UPDATE instance_meta SET schema_version=1134 WHERE singleton=1")
     connection.execute("PRAGMA user_version=1134")
+
+
+def upgrade_1134(connection):
+    """Add model revision retry metadata without rewriting sources, claims or grants."""
+    connection.execute(MODEL_REVISION_STATEMENT)
+    connection.execute("UPDATE instance_meta SET schema_version=1135 WHERE singleton=1")
+    connection.execute("PRAGMA user_version=1135")

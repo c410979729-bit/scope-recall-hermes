@@ -117,7 +117,12 @@ def test_session_lookup_uses_its_index_and_preserves_the_latest_series(app):
         conn.set_trace_callback(None)
         lookup = next(sql for sql in statements if "ORDER BY ee.sequence DESC LIMIT 1" in sql)
         plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + lookup)]
-        assert any("USING INDEX source_session (session_id=? AND scope_id=?)" in line for line in plan), plan
+        # Either session/scope accelerator is a seek; SQLite chooses by its estimated cost.
+        assert any(
+            f"SEARCH s USING INDEX {index} (session_id=? AND scope_id=?" in line
+            for line in plan
+            for index in ("source_session", "source_adoption_order")
+        ), plan
         assert before == after == (expected, "session")
 
 

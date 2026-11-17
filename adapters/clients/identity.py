@@ -22,6 +22,7 @@ from scope_recall.adapters.host_identity import (
     principal_ref,
 )
 from scope_recall.contracts import ContractError, Origin, TrustedContext, TrustedSourcePrincipal
+from scope_recall.core.entry_control import local_account_matches, require_local_account
 from scope_recall.core.private import normalize_project_path
 from scope_recall.runtime.remote_clock import stored_session_id as session_identity
 
@@ -48,9 +49,10 @@ def _norm(path: Path) -> str:
 
 
 def _shared_principal(config: SharedClientConfig, origin: Origin) -> TrustedSourcePrincipal | None:
-    # The entry was attached as the owner at this machine: the operator's approval,
-    # like the Hermes CLI's, is what verifies the person typing into the client.
+    # Attachment approves one OS account, never an arbitrary process with file access.
     if origin == "human_direct":
+        if not config.local_account_attested or not local_account_matches(config.manifest.local_account_id):
+            return TrustedSourcePrincipal("human", "unresolved")
         return TrustedSourcePrincipal(
             "human", "verified", principal_ref("human", config.installation_id, config.host, LOCAL_USER_ID)
         )
@@ -70,7 +72,7 @@ def _shared_principal(config: SharedClientConfig, origin: Origin) -> TrustedSour
 def _source_principal(config: CodexInstallationConfig | SharedClientConfig, origin: Origin) -> TrustedSourcePrincipal:
     """Use the entry's capture identity.
 
-    Shared local owners are approved at attachment, without an OS-account comparison.
+    Shared local owners require the OS account approved at attachment.
     """
     if isinstance(config, SharedClientConfig):
         shared = _shared_principal(config, origin)
@@ -94,11 +96,15 @@ def _source_principal(config: CodexInstallationConfig | SharedClientConfig, orig
 
 
 def capture_owner_principal(config: SharedClientConfig) -> TrustedSourcePrincipal:
-    """Return the identity this entry uses to capture user input, without comparing OS accounts."""
+    """Return the entry's account-checked capture identity."""
     return _source_principal(config, "human_direct")
 
 
 def resolve_runtime_audience(config: CodexInstallationConfig | SharedClientConfig, cwd: object) -> CodexRuntimeAudience:
+    """Resolve grants only for the local account explicitly approved by installation."""
+    pin = config.manifest.local_account_id if isinstance(config, SharedClientConfig) else config.local_account_id
+    if (not isinstance(config, SharedClientConfig) or config.local_account_attested) and not local_account_matches(pin):
+        return CodexRuntimeAudience(frozenset(), None, None, ("capability_gap:local_account_binding",))
     if isinstance(config, SharedClientConfig):
         audience = config.audience
         return CodexRuntimeAudience(
@@ -168,6 +174,10 @@ def trusted_context(
     """Bind a host request with owner equivalences, without a current-person fallback or additional scope grants."""
     if not session_id.strip():
         raise ValueError("session_id is required")
+    if not isinstance(config, SharedClientConfig) or config.local_account_attested:
+        require_local_account(
+            config.manifest.local_account_id if isinstance(config, SharedClientConfig) else config.local_account_id
+        )
     shared = isinstance(config, SharedClientConfig)
     # A shared entry's mutations are bounded by what it may write; a local
     # installation's by its visible scopes.

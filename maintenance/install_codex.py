@@ -47,7 +47,18 @@ from .install_common import (
 )
 from .shared_run import HOME_LOCK_FILENAME
 
-CODEX_HOOK_EVENTS = frozenset({"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "Interrupt", "SessionEnd"})
+CODEX_HOOK_EVENTS = frozenset(
+    {
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreModelRequest",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Interrupt",
+        "SessionEnd",
+    }
+)
 #: Seconds Codex waits for each hook (hooks.json).  Codex holds a prompt until its hook answers and allows 600 s
 #: unless told otherwise; SessionEnd and Interrupt allow at most 3.  These are ceilings, not waits: a hook
 #: answers as soon as its work is done, and a prompt's work is bounded by the entry's ``hook_processing_seconds``
@@ -57,6 +68,8 @@ HOOK_TIMEOUTS = {
     "SessionStart": 5,
     "UserPromptSubmit": 15,
     "PostToolUse": 2,
+    "PreModelRequest": 5,
+    "PreToolUse": 2,
     "Stop": 10,
     "Interrupt": 3,
     "SessionEnd": 3,

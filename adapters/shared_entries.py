@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from scope_recall.contracts import ENTRY_ID, InstanceBinding, TrustedContext
+from scope_recall.core.entry_control import account_pin, current_account_pin
 from scope_recall.core.storage import SQLiteStorage
 
 from .audiences import (
@@ -221,6 +222,7 @@ def _entry_view(store: Path, payload: dict[str, Any], record: Mapping[str, Any])
         entry_id=_entry_id(record.get("entry_id")),
         entry_name=_display_name(record.get("display_name")),
         entry_host=record["host"],
+        local_account_id=account_pin(record.get("local_account_id")),
         agent_identity=bounded_text(record["agent_identity"], field="agent_identity")
         if "agent_identity" in record
         else None,
@@ -322,6 +324,7 @@ def shared_entry_record(
         "attached_at": bounded_text(attached_at, field="attached_at"),
         "scope_ids": mapped,
         "owner_principals": [dict(item) for item in source.owner_principals],
+        "local_account_id": source.local_account_id,
         "audience_scopes": {kind: scope for kind, scope in source.audience_scopes.items() if scope in mapped},
         "audiences": rows,
     }
@@ -374,6 +377,7 @@ def client_entry_record(
         "attached_at": bounded_text(attached_at, field="attached_at"),
         "scope_ids": list(row["allowed_scope_ids"]),
         "owner_principals": [dict(platform=host, user_id=LOCAL_USER_ID)],
+        "local_account_id": current_account_pin(),
         "audience_scopes": {"owner_private": capture_scope_id},
         "audiences": [row],
     }

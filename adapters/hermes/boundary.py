@@ -605,6 +605,27 @@ def _classify_opener(
     return "origin_unknown"
 
 
+def stored_origin_rule(message: dict[str, Any], *, imported: bool = False) -> str | None:
+    """Name a stored user row's host marker using the opener's evidence order.
+
+    Legacy conversation imports also contain the review prompt issued by the old host. That prompt is a
+    maintenance candidate only; this reader does not change live capture classification. Platform IDs retained
+    by an importer take precedence over prefix matching just as they do for a staged opener.
+    """
+    if message.get("role") != "user":
+        return None
+    text = extract_user_text(message.get("content"))
+    if opener_origin([message], text, local_surface=False, staged=True) == "host_generated":
+        if carries_gateway_origin(text):
+            return "gateway_origin"
+        if _unstamped(text) != text:
+            return "replay_timestamp"
+        return "hermes_prefix"
+    if imported and not _platform_id(message) and _unstamped(text).startswith("Review the conversation above and"):
+        return "legacy_review"
+    return None
+
+
 #: How Hermes 0.21.5 begins the notices it delivers into a running turn the way it delivers a steer, with the chat's
 #: origin: a background process's heartbeat or end, a delegation's report.  They are not the person's words.
 _STEER_NOTICE_HEADS = ("[Background process ", "[IMPORTANT: Background process", "[ASYNC DELEGATION BATCH COMPLETE")

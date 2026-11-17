@@ -48,6 +48,7 @@ from .install_common import (
 # The public installer must bind that exact host value; identifiers are not aliased.
 DEFAULT_AGENT_WORKSPACE = "hermes"
 DIST_HERMES = REPO_ROOT / "distribution" / "hermes"
+_CORE_PIN = re.compile(r'"hermes-scope-recall\[vectors\]==[^"]*"')
 
 
 def profile_identity(home: Path) -> str:
@@ -171,8 +172,8 @@ def environment_notes(plan: InstallPlan, home_plugin: Path | None) -> tuple[str,
     if not _non_pypi_version(__version__):
         return ()
     return (
-        "Rebuild the Hermes plugin environment with hermes_cli.venv_sync and "
-        "UV_FIND_LINKS=<directory containing this wheel>; repeat after every hermes update, "
+        "With UV_FIND_LINKS=<directory containing this wheel>, run hermes plugins disable scope-recall "
+        "then hermes plugins enable scope-recall to rebuild its environment; repeat after every hermes update, "
         "or the rebuild will fail and the plugin will be disabled.",
     )
 
@@ -211,8 +212,8 @@ def wrapper_manifest(template: str, version: str = __version__) -> str:
     there by hand, and Hermes installs what a memory provider's manifest declares
     (``pip_dependencies``) when the provider is set up; it reads the manifest from ``home_plugin_dir`` once
     the core is gone.  The pin is exact, as the wrapper and the core are one release.  A
-    pre-release, development or local build declares no ``pip_dependencies`` here; its home plugin's
-    ``pyproject.toml`` pins the build and its wheel source must be supplied during environment sync.
+    pre-release, development or local build declares no ``pip_dependencies`` in this form; an existing
+    ``pyproject.toml`` pins that build instead. Manifest-only plugins use ``_pinned_manifest`` for every build.
     """
     template = stamp_manifest_version(template, version)
     if _non_pypi_version(version):
@@ -220,19 +221,42 @@ def wrapper_manifest(template: str, version: str = __version__) -> str:
     return template
 
 
-def planned_files(plan: InstallPlan) -> dict[Path, str | bytes]:
-    files: dict[Path, str | bytes] = {}
-    host_owned = host_owned_plugin(plan.instance_root, plan.target_plugin_dir)
-    for name in () if host_owned else ("__init__.py", "plugin.yaml"):
+def _pinned_manifest(template: str, version: str) -> str:
+    """Stamp the catalog manifest and pin its core exactly, including development builds."""
+    stamped = stamp_manifest_version(template, version)
+    pinned, count = _CORE_PIN.subn(f'"hermes-scope-recall[vectors]=={version}"', stamped)
+    if count != 1:
+        raise InstallError("the catalog manifest does not pin exactly one core package")
+    return pinned
+
+
+def wrapper_files(target: Path) -> dict[Path, str]:
+    """Render a wrapper without writes, preserving its dependency declaration form.
+
+    Hermes locks the plugin member by declaration source; changing that source can disable the plugin during a
+    rebuild. Existing authored projects keep their form. Fresh and manifest-only directories pin every build in
+    ``plugin.yaml``, with the same wheel-source requirement as an authored project for builds absent from PyPI.
+    """
+    files: dict[Path, str] = {}
+    for name in ("__init__.py", "plugin.yaml"):
         source = DIST_HERMES / name
         if not source.is_file():
             raise InstallError(f"distribution template missing: {source}")
-        text = source.read_text(encoding="utf-8")
-        files[plan.target_plugin_dir / name] = wrapper_manifest(text) if name == "plugin.yaml" else text
-    if not host_owned and normalized_path(plan.target_plugin_dir) == normalized_path(
-        home_plugin_dir(plan.instance_root)
-    ):
-        files[plan.target_plugin_dir / "pyproject.toml"] = wrapper_pyproject()
+        files[target / name] = source.read_text(encoding="utf-8")
+    manifest = target / "plugin.yaml"
+    if (target / "pyproject.toml").is_file():
+        files[manifest] = wrapper_manifest(files[manifest], __version__)
+        files[target / "pyproject.toml"] = wrapper_pyproject(__version__)
+    else:
+        files[manifest] = _pinned_manifest(files[manifest], __version__)
+    return files
+
+
+def planned_files(plan: InstallPlan) -> dict[Path, str | bytes]:
+    """Render installer-owned wrappers and skills, leaving catalog-managed plugin files to Hermes."""
+    files: dict[Path, str | bytes] = {}
+    if not host_owned_plugin(plan.instance_root, plan.target_plugin_dir):
+        files.update(wrapper_files(plan.target_plugin_dir))
     for name, source in SKILLS.items():
         files[plan.instance_root / "skills" / name / "SKILL.md"] = source.read_text(encoding="utf-8")
     return files

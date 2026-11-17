@@ -14,6 +14,13 @@ hooks, and opens no local database. The store-side handler reuses the local Herm
 their own exact grants, and the token trusts its holder with every route granted to that entry. The remote installer
 selects the provider automatically; use the remote attach command and retention guidance in the linked setup.
 
+Local owner routes are pinned to the account approved for each entry, independently of other entries.
+Older unbound local entries require the [explicit account approval](manage.md#local-account-approval) command.
+A token forwarded from another machine does not prove that machine's OS account or identify its human user.
+Remote coding clients and Hermes local routes retain their token-authorized entry scopes, while captured human
+principals remain unresolved; the server's OS account cannot promote them to the local owner.
+Remote channel routes continue to require their exact platform sender grants.
+
 ## What is where
 
 ```
@@ -389,9 +396,10 @@ fact (`different_source_principal`).
 retains its existing peer-account checks. Owner approvals are rechecked only through the last identity resolution;
 they are not an atomic snapshot with the database and do not cover later manifest changes.
 
-These corrections are stated in conversation and take effect through background consolidation. On a Hermes entry,
-the `revise` and `forget` tools remain available only at the CLI; Desktop, TUI, gateway routes and A2A peers cannot
-use them.
+These corrections are stated in conversation and take effect through background consolidation.
+The Hermes and MCP `revise` and `forget` tools are closed because their dispatch contracts lack a verified
+binding to the exact latest user message seen by each model request. Local memory management provides explicit
+correction and deletion. See [Claim mutation](claim-mutation-contract.md) for host requirements and errors.
 
 ## Repeated evidence in recall
 

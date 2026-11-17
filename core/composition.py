@@ -1058,7 +1058,10 @@ class MemoryCore:
         self._private_read_refusal(context, after=marker)
         return result
 
-    def revise(self, context: TrustedContext, value, *, remaining_seconds: float | None = None):
+    def revise(
+        self, context: TrustedContext, value, *, request_id: str | None = None, remaining_seconds: float | None = None
+    ):
+        """Revise a claim; an explicit request ID identifies a retry of one native user occurrence."""
         from .mutate import revise
 
         return revise(
@@ -1066,6 +1069,7 @@ class MemoryCore:
             self.clock,
             context,
             value,
+            request_id=request_id,
             remaining_seconds=self.config.write_timeout_seconds if remaining_seconds is None else remaining_seconds,
         )
 

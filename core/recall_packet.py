@@ -574,13 +574,16 @@ class RecallPacketCompiler:
                     return draft.discard(verified)
                 self._prefetch(tx, context, verified)
                 verified = fence_entity_query(tx, context, verified, draft.gaps)
+                refreshed = []
                 for candidate, obj in verified:
                     fresh = self._recheck(tx, context, candidate, obj, draft.gaps)
                     note_superseded_evidence(tx, draft.gaps, draft.withheld_evidence)
                     if fresh is None:
                         return draft.discard(verified, "release_delete_fence")
+                    refreshed.append((candidate, fresh))
                     if self._remaining_ms(context) == 0:
                         return draft.discard(verified, "deadline_exceeded_release_fence")
+                verified = refreshed
                 if draft.note_epoch(self.storage_reader.epoch(tx), "epoch_changed_release_fence", retracted=retracted):
                     return draft.discard(verified)
         except Exception as exc:

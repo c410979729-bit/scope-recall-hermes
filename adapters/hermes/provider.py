@@ -24,6 +24,7 @@ from .identity import HermesIdentity, HermesIdentityError
 from .outcomes import TurnOutcomeTracker
 from .prefetch import Prefetch
 from .protocol import PublicMemoryProvider
+from .request_binding import NativeRequests
 from .runtime_wiring import TrustedHostRuntime
 from .session_binding import SessionBinding
 from .tool_surface import HermesToolSurface
@@ -162,6 +163,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         self._retry = CaptureRetry(self)
         self._writer = CaptureWriter(self)
         self._turns = TurnCapture(self)
+        self._native_requests = NativeRequests()
         self._prefetch = Prefetch(self)
         self._binding = SessionBinding(self)
         self._calls = HostBackpressure(self)

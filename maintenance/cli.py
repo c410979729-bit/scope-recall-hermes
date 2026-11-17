@@ -117,6 +117,13 @@ def _memory(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _approve_local_account(argv: list[str]) -> int:
+    """Route explicit local approval without opening an agent or a memory request."""
+    from .local_account import main
+
+    return main(argv[1:])
+
+
 def _private(argv: list[str]) -> int:
     from .private import main
 
@@ -148,6 +155,10 @@ def _source_review(argv: list[str]) -> int:
 
 
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
+    "approve-local-account": (
+        "approve the current OS account for a selected local installation",
+        _approve_local_account,
+    ),
     "release-budget-reservations": ("preview or release uncertain auxiliary charges", _release_budget_reservations),
     "review-sources": ("preview and decide a batch of pending source reviews as the local owner", _source_review),
     "injection-policy": ("inspect or set the store's optional owner quote exception", _source_review),

@@ -407,21 +407,22 @@ class HermesToolSurface:
         )
         return self._reply(body["request_id"], view)
 
-    def _handle_revise(self, args: object) -> str:
+    def _handle_revise(self: Any, args: object) -> str:
         context = self._tool_context(mutation=True)
+        retry_id = args.get("request_id") if isinstance(args, dict) else None
         body = self._tool_body(args, "revise")
-        request_id = body.pop("request_id")
-        # Core remains the only authority for current human evidence,
-        # expected revisions, scope, and transaction/receipt semantics.
-        receipt = self._require_core().revise(context, body, remaining_seconds=1.0)
-        return self._reply(request_id, receipt)
+        call_id = body.pop("request_id")
+        validate_model_request("revise_request", body, context)
+        context = self._native_requests.context(self, context)
+        return self._reply(call_id, self._require_core().revise(context, body, request_id=retry_id))
 
-    def _handle_forget(self, args: object) -> str:
+    def _handle_forget(self: Any, args: object) -> str:
         context = self._tool_context(mutation=True)
         body = self._tool_body(args, "forget")
-        request_id = body.pop("request_id")
-        receipt = self._require_core().forget(context, body, remaining_seconds=1.0)
-        return self._reply(request_id, receipt)
+        call_id = body.pop("request_id")
+        validate_model_request("forget_request", body, context)
+        context = self._native_requests.context(self, context)
+        return self._reply(call_id, self._require_core().forget(context, body))
 
     def _handle_status(self, args: object) -> str:
         body = self._tool_body({} if args is None else args, "status")

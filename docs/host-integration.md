@@ -29,6 +29,15 @@ null withdraws the fact. Required `valid_from` accepts null and preserves it in 
 arguments remain strict integers; booleans and numeric strings cannot substitute for them. Extra identity, scope,
 path and session arguments remain forbidden.
 
+## Native Hermes request binding
+
+Hermes model mutations require an executor-owned request identity and the latest complete user's durable message
+UID. The recorded occurrence must match the actual provider input and the captured source. Execution middleware
+binds the witness only around its real tool callback and revokes it on return. Known Chat Completions tool calls
+and completed Responses function-call outputs are recognized before host normalization. Failed or incomplete
+Responses outputs and unknown or ambiguous layouts grant no mutation authority; ordinary capture and reads retain
+their existing paths.
+
 ## Recovery and privacy
 
 The next end hook and the existing background worker reconcile session ledgers with captured sources. A timed-out or
@@ -68,6 +77,31 @@ command. A package-only upgrade leaves that copied JavaScript file unchanged. Do
 but does not compare this plugin copy against the package. The background worker must be configured and running to
 provide resident recall. Without it hooks retain their bounded direct recall and ledger recovery, with any unavailable
 or late channel recorded in diagnostics.
+
+## What Codex attests
+
+The Codex MCP server binds a call to a conversation through Codex's reserved MCP thread metadata only; the model
+cannot supply it as a tool argument. Without it, reads still answer and report the gap
+`mcp_session_is_not_codex_conversation_id`, and `propose_memory`, `revise` and `forget` are refused.
+
+Local Codex shared entries also require `PreModelRequest` and an actual `PreToolUse` witness. The MCP call id,
+parent item and sampled history watermark must identify the latest complete retained user occurrence. Its source
+must already exist in SQLite with the same verified person and pinned local account. Thread or turn metadata alone
+does not authorize writes. Independent installations with unresolved human identities, remote clients, unsupported
+transcripts, and clients without these hooks keep reads and ordinary capture but refuse model mutations.
+
+`propose_memory` uses the same verified request source and adds its reference to the proposal's evidence. Its text
+remains an `assistant_visible` source with a capture receipt, neither a published fact nor the owner's approval.
+Facts come from consolidation: a separately configured background model reads stored sources, and every fact it
+proposes cites a source reference, its revision and an exact quotation, all checked before acceptance. A proposal
+without the native source binding refuses instead of storing an unassociated candidate.
+
+A prompt that an application delivers into Codex's user box reaches the hooks as an ordinary user prompt, and nothing
+in that signal tells typing from automation. It is stored as the owner's direct input and carries the owner's
+authority in that session, including for a correction or deletion it asks for. The entry's `verified` principal
+attests the approved account, not who pressed the keys, and there is no delegated-input origin. Keep work between
+agents out of the user box: `handoff_write` records an external agent report (see Task handoffs), and pausing
+recording keeps a session's input out of the store ([Private mode](private-mode.md)).
 
 ## Task handoffs
 

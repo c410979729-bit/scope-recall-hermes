@@ -2145,3 +2145,21 @@ def _workbuddy_visible_names(home):
     """Rollback copies sit beside their source files but are not active host configuration."""
     prefixes = ("mcp.json.scope-recall-", "settings.json.scope-recall-")
     return {path.name for path in home.iterdir() if not (path.name.startswith(prefixes) and path.suffix == ".bak")}
+
+
+def test_a_workbuddy_server_the_person_turned_off_stays_off_when_written_again():
+    """An install or an upgrade writes this entry's MCP server again; the person's own switch on it stays theirs."""
+    old = {"type": "stdio", "command": "C:/TEST/old/python.exe", "args": ["--TEST-old"], "description": "TEST"}
+    new = {"type": "stdio", "command": "C:/TEST/new/python.exe", "args": ["--TEST-new"], "description": "TEST"}
+    other = {"command": "C:/TEST/other.exe", "args": ["--TEST"], "disabled": True}
+    config = {"TEST-key": 1, "mcpServers": {"TEST-other-server": other, "scope-recall": {**old, "disabled": True}}}
+
+    merged = install_workbuddy.with_server(config, new, lambda _server: True)
+
+    assert merged["mcpServers"]["scope-recall"] == {**new, "disabled": True}
+    assert merged["mcpServers"]["TEST-other-server"] == other
+    assert merged["TEST-key"] == 1
+    # A server the person left on gains no switch, and neither does a first install.
+    left_on = install_workbuddy.with_server({"mcpServers": {"scope-recall": old}}, new, lambda _server: True)
+    assert left_on["mcpServers"]["scope-recall"] == new
+    assert install_workbuddy.with_server({}, new, lambda _server: True)["mcpServers"]["scope-recall"] == new

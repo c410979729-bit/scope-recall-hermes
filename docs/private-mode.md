@@ -93,8 +93,8 @@ with the local memory command or [management page](ui.md) while private mode
 applies under either mode. Owner inspection makes no model or embedding request
 and preserves scope and deletion checks. Agents cannot use owner inspection;
 full mode blocks their recall and outbound work, while read-only permits both
-for existing memory. An agent's explicit forget or correction request still
-applies under either mode, with its usual authorization and revision checks.
+for existing memory. The agent `forget` and `revise` tools are closed because
+the hosts lack a verified latest-message binding for each model request.
 
 Overlapping rules take the stricter mode: `full` beats `read-only`. Closing one
 rule never closes another, so `off --all` does not release a session or project

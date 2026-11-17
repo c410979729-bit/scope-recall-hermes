@@ -8,8 +8,8 @@ from functools import partial
 
 from scope_recall.contracts import ContractError, InstanceBinding, SourcePrincipal
 
-from ..host_identity import entry_owner
-from .identity import HermesRuntimeScope, resolve_runtime_audience
+from ..host_identity import HermesRuntimeScope, entry_owner
+from ..host_identity import resolve_granted_audience as resolve_runtime_audience
 from .installation import (
     HermesIdentityError,
     InstallationManifest,

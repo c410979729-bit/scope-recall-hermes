@@ -17,7 +17,12 @@ from types import MappingProxyType
 from typing import Any
 
 from scope_recall.adapters.audiences import LOCAL_USER_ID
-from scope_recall.adapters.host_identity import HermesRuntimeScope, RuntimeAudience, resolve_runtime_audience
+from scope_recall.adapters.host_identity import (
+    HermesRuntimeScope,
+    RuntimeAudience,
+    resolve_granted_audience,
+    resolve_runtime_audience,
+)
 from scope_recall.adapters.installation import HermesIdentityError, InstallationManifest, bounded_text
 from scope_recall.adapters.shared_entries import (
     CLIENT_HOSTS,
@@ -28,6 +33,7 @@ from scope_recall.adapters.shared_entries import (
 )
 from scope_recall.contracts import ContractError, InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.entry_control import account_pin, current_account_pin
 from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 
 from ..installation_identity import path_identity
@@ -56,6 +62,7 @@ class CodexInstallationConfig:
     test_mode: bool
     config_path: Path
     location_id: str | None = None
+    local_account_id: str | None = None
 
     def to_binding(self) -> InstanceBinding:
         return InstanceBinding(
@@ -146,6 +153,7 @@ def load_codex_config(config_path: Path | str) -> CodexInstallationConfig:
         test_mode=_strict_bool(payload.get("test_mode"), field="test_mode"),
         config_path=path.resolve(),
         location_id=payload.get("location_id"),
+        local_account_id=account_pin(payload.get("local_account_id")),
     )
     if (config.location_id if config.location_id is not None else config.installation_id) != _installation_id(path):
         raise CodexConfigError("installation_id mismatch")
@@ -160,8 +168,8 @@ class SharedClientConfig:
     """A local client attached to a shared store as an entry (``attach --host codex|claude-code``).
 
     The grants are the entry's, in the store's manifest; the home keeps the
-    pointer and the entry's runtime config.  Whoever types into the client here
-    is the owner, in whatever directory it runs, so the audience is fixed when
+    pointer and the entry's runtime config. The approved OS account is checked
+    before granting the local owner audience, which is fixed when
     the config loads and a session's cwd plays no part in it.
     """
 
@@ -171,6 +179,8 @@ class SharedClientConfig:
     audience: RuntimeAudience
     #: The route every capture records, re-checked against the entry's grants when it is replayed.
     scope: HermesRuntimeScope
+    #: Remote tokens authorize an entry's grants, never the client's OS account or person.
+    local_account_attested: bool = True
 
     @property
     def installation_id(self) -> str:
@@ -210,6 +220,16 @@ class SharedClientConfig:
 
 
 def load_shared_client(home: Path | str, host: str) -> SharedClientConfig:
+    """Bind a local client using the entry's OS-account approval."""
+    return _load_shared_client(home, host, local=True)
+
+
+def load_remote_client(home: Path | str, host: str) -> SharedClientConfig:
+    """Bind a token-authorized entry without pretending the server is the remote person."""
+    return _load_shared_client(home, host, local=False)
+
+
+def _load_shared_client(home: Path | str, host: str, *, local: bool) -> SharedClientConfig:
     """The entry ``home`` is of a shared store, for the client ``host``."""
     if host not in CLIENT_HOSTS:
         raise CodexConfigError(f"host must be one of {', '.join(CLIENT_HOSTS)}")
@@ -237,18 +257,18 @@ def load_shared_client(home: Path | str, host: str) -> SharedClientConfig:
         agent_context="primary",
         entry_id=str(manifest.entry_id),
     )
-    audience = resolve_runtime_audience(manifest, scope)
+    audience = (resolve_runtime_audience if local else resolve_granted_audience)(manifest, scope)
     if not audience.allowed_scope_ids or audience.capture_scope_id is None:
         raise CodexConfigError("the entry's grants give this client nothing to read or no scope to capture into")
     if not (manifest.data_directory / "memory.sqlite3").is_file():
         raise CodexConfigError("verified core database is required")
-    return SharedClientConfig(host, path, manifest, audience, scope)
+    return SharedClientConfig(host, path, manifest, audience, scope, local_account_attested=local)
 
 
 def load_server_entry(home: Path | str, host: str) -> SharedClientConfig | InstallationManifest:
     """Verify the server-local entry without treating a Hermes gateway as a fixed local-owner client."""
     if host != "hermes":
-        return load_shared_client(home, host)
+        return load_remote_client(home, host)
     path = Path(home).expanduser()
     if not path.is_absolute():
         raise CodexConfigError("home must be absolute")
@@ -273,6 +293,7 @@ def write_codex_config(config: CodexInstallationConfig) -> None:
         "allow_owner_private": config.allow_owner_private,
         "project_roots": {path: scope for path, scope in config.project_roots.items()},
         "test_mode": config.test_mode,
+        "local_account_id": config.local_account_id,
     }
     if config.location_id is not None:
         payload["location_id"] = config.location_id
@@ -314,6 +335,7 @@ def install_codex_scope_recall(
         project_roots=MappingProxyType({_norm_root(project): audience["project"]}),
         test_mode=test_mode,
         config_path=config_path,
+        local_account_id=current_account_pin(),
     )
     from datetime import UTC, datetime
 

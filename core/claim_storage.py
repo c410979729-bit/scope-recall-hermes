@@ -799,6 +799,25 @@ class Claims:
                 (revision, slot_key, proposal["subject"], proposal["predicate"], ref),
             )
         lexical_index.index_claim(conn, ref)
+        # Withdrawing an unchanged payload grants no new authority. Its evidence can already be historical;
+        # promotion and changed payloads must still cite the newest source versions.
+        self._link_evidence(
+            ref,
+            revision,
+            scope_id,
+            proposal,
+            allow_historical=previous is not None
+            and qualification.state == "retracted"
+            and proposal == previous.payload,
+        )
+        conn.execute("UPDATE instance_meta SET memory_epoch=memory_epoch+1 WHERE singleton=1")
+        version = next(v for v in self.versions(ref) if v.revision == revision)
+        _project_claim(self._tx, version, now=recorded, advance_head=advance_head)
+        return version
+
+    def _link_evidence(self, ref, revision, scope_id, proposal, *, allow_historical=False):
+        """Validate source visibility, audience and quotes, then record exact evidence for one claim version."""
+        conn, ctx = self._tx._check(write=True), self._tx.context
         for span in proposal["evidence_spans"]:
             source = self._tx.source(span["source_ref"], span["source_revision"])
             # Three different findings, each with its own name, so a diagnostic
@@ -811,7 +830,8 @@ class Claims:
                 raise ContractError("DERIVATION_INVALID", "evidence_scope")
             if span["quote"] not in source.event["content"]:
                 raise ContractError("DERIVATION_INVALID", "evidence_quote")
-            self.require_live_source(source.ref, source.revision)
+            if not allow_historical:
+                self.require_live_source(source.ref, source.revision)
             if source.suppressed:
                 conn.execute("UPDATE claims SET suppressed=1 WHERE claim_id=?", (ref,))
             lineage.link(
@@ -831,17 +851,14 @@ class Claims:
         ):
             for evidence_ref in refs:
                 key = parse_source_ref(evidence_ref)
-                self.require_live_source(*key)
+                if not allow_historical:
+                    self.require_live_source(*key)
                 source = self._tx.source(*key)
                 if source is None:
                     raise ContractError("SOURCE_MISSING")
-                if source.scope_id != scope_id:
+                if (source.scope_id, source.project_id, source.branch_id) != (scope_id, ctx.project_id, ctx.branch_id):
                     raise ContractError("ACCESS_DENIED", "evidence_scope")
                 lineage.link(conn, "claim", ref, revision, *key, relation=relation)
-        conn.execute("UPDATE instance_meta SET memory_epoch=memory_epoch+1 WHERE singleton=1")
-        version = next(v for v in self.versions(ref) if v.revision == revision)
-        _project_claim(self._tx, version, now=recorded, advance_head=advance_head)
-        return version
 
     def require_target(self, version: ClaimVersion) -> None:
         ctx = self._tx.context
@@ -906,11 +923,25 @@ class Claims:
         if source is None:
             raise ContractError("SOURCE_MISSING")
         self.require_live_source(row[0], row[1])
+        if ctx.request_message is not None:
+            ctx.request_message.validate(ctx, source)
         if source.capture_gaps or source.event["capture_state"] != "complete":
             raise ContractError("ACCESS_DENIED", "incomplete_authorization")
         if ctx.recent_messages and source.event["content"] not in ctx.recent_messages[-1]:
             raise ContractError("ACCESS_DENIED", "current_human_evidence")
         return source
+
+    def require_request_message(self, *, proposal_refs=None) -> None:
+        """Recheck an adapter's runtime witness before looking up mutation targets.
+
+        Trusted Core callers without a native tool request retain their existing
+        contract. Public model tools require a witness before entering Core.
+        """
+        proof = self._tx.context.request_message
+        if proof is not None:
+            self.current_human((f"{proof.source_ref}@{proof.source_revision}",), proof.scope_id)
+            if proposal_refs is not None and f"{proof.source_ref}@{proof.source_revision}" not in proposal_refs:
+                raise ContractError("ACCESS_DENIED", "request_message_binding")
 
     def unresolved(
         self, source_ref: str, source_revision: int, candidates: tuple[str, ...], *, recorded_at: str

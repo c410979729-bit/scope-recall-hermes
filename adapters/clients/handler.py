@@ -27,12 +27,20 @@ from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 
 from ..host_profiles import HOSTS, agent_run
 from ..runtime_wiring import strict_hook_budget, trusted_runtime_config
+from . import native_binding
 from .boundary import (
     filter_capture_reply,
     without_lone_surrogates,
 )
 from .bounded_call import BoundedCall
-from .config import CodexConfigError, CodexInstallationConfig, SharedClientConfig, load_codex_config, load_shared_client
+from .config import (
+    CodexConfigError,
+    CodexInstallationConfig,
+    SharedClientConfig,
+    load_codex_config,
+    load_remote_client,
+    load_shared_client,
+)
 from .hook_answer import (
     HookDiagnostics,
 )
@@ -245,7 +253,7 @@ class CodexHookHandler:
         runtime config is kept elsewhere (setup's disposable check entry), in place of the two seconds of an entry
         never set up.
         """
-        config = load_shared_client(home, host)
+        config = (load_remote_client if remote_paths else load_shared_client)(home, host)
         core = _hook_core(config, clock, runtime_config_path=trusted_runtime_config_path or config.runtime_config_path)
         handler = cls(
             config, core=core, clock=event_clock if event_clock is not None else clock, hook_started_at=hook_started_at
@@ -590,6 +598,17 @@ class CodexHookHandler:
         if admitted is None:
             return {}
         session_id, audience = admitted
+        if (
+            self.host == "codex"
+            and event in {"SessionStart", "UserPromptSubmit", "Stop"}
+            and local_record
+            and record is None
+            and not self.remote_paths
+        ):
+            try:
+                native_binding.observe(self, event, session_id, audience, payload, self._hook_deadline(_TOTAL_BUDGET_S))
+            except (ContractError, OSError, ValueError, TypeError, TimeoutError):
+                self.note("request_message_binding_unavailable")
         if event == "UserPromptSubmit":
             command_result = self.events.recording_command(session_id, audience, payload)
             if command_result is not None:
@@ -610,9 +629,19 @@ class CodexHookHandler:
             # tool calls, replies and end events as well as the request that opened it.
             self.note("host_generated_thread")
             return {}
-        if event == "Interrupt":
-            return self._finish_compaction(
-                session_id, audience, deadline, self.events.interrupt(session_id, audience, payload, deadline)
+        if self.host == "codex" and event in {"PreModelRequest", "PreToolUse", "Interrupt", "SessionEnd"}:
+            if local_record and record is None and not self.remote_paths:
+                try:
+                    native_binding.observe(self, event, session_id, audience, payload, deadline)
+                except (ContractError, OSError, ValueError, TypeError, TimeoutError, sqlite3.Error):
+                    self.note("request_message_binding_unavailable")
+        if event in {"PreModelRequest", "PreToolUse", "Interrupt"}:
+            return (
+                self._finish_compaction(
+                    session_id, audience, deadline, self.events.interrupt(session_id, audience, payload, deadline)
+                )
+                if event == "Interrupt"
+                else {}
             )
         if event == "PostToolUse":
             return self._finish_compaction(

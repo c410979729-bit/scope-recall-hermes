@@ -38,7 +38,7 @@ def test_body_scan_upgrade_is_lazy_and_atomic(app, monkeypatch, version, interru
         monkeypatch.setitem(storage.SCHEMA_MIGRATIONS, 1133, step)
     core.storage.initialize()
     with core.storage.read(ctx) as tx:
-        assert tx._check().execute("PRAGMA user_version").fetchone()[0] == 1134
+        assert tx._check().execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert tx._check().execute(
             "SELECT secret_scan_version,secret_scan_names,secret_scan_input_sha256 FROM source_events"
         ).fetchone()[:] == (

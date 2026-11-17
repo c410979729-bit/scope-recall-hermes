@@ -44,6 +44,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from ...contracts import ContractError
 from ...core.capture_filters import without_private
@@ -68,6 +69,7 @@ class Said:
     prompt_id: str | None = None
     cwd: str | None = None
     private_spans_removed: int = 0
+    native_occurrence: bool = False
 
 
 def _human(origin: object) -> bool:
@@ -200,7 +202,92 @@ def codex_said(row: object) -> Said | None:
     entry = payload.get("id") or row.get("id")
     if type(entry) is not str or not entry.strip() or len(entry) > 100:
         entry = "rollout:" + hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
-    return Said(entry, role, without_lone_surrogates(text), stamp)
+    native = codex_user_occurrence(row) if role == "user" else None
+    return (
+        Said(entry, role, text, stamp, native_occurrence=True)
+        if native is not None
+        else Said(entry, role, without_lone_surrogates(text), stamp)
+    )
+
+
+def codex_user_occurrence(row) -> tuple[str, str, str, int, int, str] | None:
+    """Read the supported retained user record strictly; unknown provenance grants nothing.
+
+    The wire message id and retained revision identify an occurrence even when
+    its text repeats. Native transcript layouts are not a stable host API.
+    """
+    if not isinstance(row, dict) or row.get("type") != "response_item":
+        return None
+    payload, meta = row.get("payload"), row.get("metadata")
+    if not isinstance(payload, dict) or not isinstance(meta, dict):
+        return None
+    retained = meta.get("retained_source")
+    if (
+        not isinstance(retained, dict)
+        or retained.get("complete") is not True
+        or meta.get("client_authored") is not False
+    ):
+        return None
+    identity = retained.get("id")
+    passthrough = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(identity, dict) or not isinstance(passthrough, dict):
+        return None
+    message, revision, turn = payload.get("id"), retained.get("revision"), passthrough.get("turn_id")
+    if any(type(value) is not str or not value or len(value) > 240 for value in (message, revision, turn)):
+        return None
+    sequence, order = meta.get("history_sequence"), meta.get("user_input_order")
+    blocks, kinds, provenance = (
+        payload.get("content"),
+        passthrough.get("content_item_kinds"),
+        passthrough.get("content_item_metadata"),
+    )
+    if (
+        payload.get("type") != "message"
+        or payload.get("role") != "user"
+        or identity != dict(message_id=message, turn_id=turn, role="user")
+        or type(sequence) is not int
+        or sequence < 1
+        or type(order) is not int
+        or order < 0
+        or not isinstance(blocks, list)
+        or not blocks
+        or kinds != ["user.text"] * len(blocks)
+        or not isinstance(provenance, list)
+        or len(provenance) != len(blocks)
+        or any(not isinstance(item, dict) or item.get("provenance") != {"type": "user"} for item in provenance)
+        or meta.get("mcp_attribution") != {"status": "none"}
+        or any(
+            not isinstance(block, dict) or block.get("type") != "input_text" or type(block.get("text")) is not str
+            for block in blocks
+        )
+    ):
+        return None
+    text = "\n".join(block["text"] for block in blocks)
+    if not text or len(text) > 8192:
+        return None
+    return cast(str, message), cast(str, revision), cast(str, turn), sequence, order, text
+
+
+def codex_openers(rows):
+    """Map each turn's first native user boundary to its wire message id.
+
+    Input order is not assumed to restart at zero. An incomplete first user
+    boundary prevents a later steer from taking the opening hook's identity.
+    """
+    first = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("type") != "response_item":
+            continue
+        payload = row.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        passthrough = payload.get("internal_chat_message_metadata_passthrough", {})
+        turn = passthrough.get("turn_id") if isinstance(passthrough, dict) else None
+        if payload.get("role") != "user" or type(turn) is not str or not turn or turn in first:
+            continue
+        occurrence = codex_user_occurrence(row)
+        first[turn] = occurrence[0] if occurrence is not None else None
+    return {message: turn for turn, message in first.items() if message is not None}
 
 
 def codex_record_path(value: object, session_id: str) -> Path | None:

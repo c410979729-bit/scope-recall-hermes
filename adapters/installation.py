@@ -12,6 +12,7 @@ from typing import Any
 
 from scope_recall.contracts import InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.entry_control import account_pin, current_account_pin, require_local_account
 
 from .audiences import (
     EXACT_FIELDS,
@@ -112,6 +113,8 @@ class InstallationManifest:
     location_id: str | None = None
     #: The host profile an entry accepts; the database keeps its independent agent_id.
     agent_identity: str | None = None
+    #: Explicit local approval only; a legacy missing value never enrolls a runtime caller.
+    local_account_id: str | None = None
 
     def to_binding(self) -> InstanceBinding:
         return InstanceBinding(
@@ -318,6 +321,10 @@ def approve_local_platforms(
         )
         if not any(all(row.get(name) == grant[name] for name in EXACT_FIELDS) for row in rows):
             rows.append(grant)
+    if platforms or logins:
+        if manifest.local_account_id is not None:
+            require_local_account(manifest.local_account_id)
+        manifest = replace(manifest, local_account_id=current_account_pin())
     return replace(manifest, owner_principals=normalize_owner_principals(principals), audiences=tuple(rows))
 
 
@@ -451,6 +458,7 @@ def build_installation_manifest(
         audiences=tuple(rows),
         test_mode=bool(test_mode),
         hermes_home=home,
+        local_account_id=current_account_pin(),
         retained_scope_ids=retained,
         archive_scopes=archive,
         archive_source_map=source_map,
@@ -482,6 +490,7 @@ def manifest_payload(manifest: InstallationManifest) -> dict[str, Any]:
         "audiences": [dict(item) for item in manifest.audiences],
         "test_mode": manifest.test_mode,
         "hermes_home": str(manifest.hermes_home),
+        "local_account_id": manifest.local_account_id,
     }
     if manifest.archive_scopes:
         payload["archive_scopes"] = sorted(manifest.archive_scopes)
@@ -656,6 +665,7 @@ def _manifest_from_payload(payload: dict[str, Any], *, home: Path, data_director
         hermes_home=home,
         retained_scope_ids=normalize_retained_scope_ids(payload.get("retained_scope_ids")),
         location_id=payload.get("location_id"),
+        local_account_id=account_pin(payload.get("local_account_id")),
         **fields,
         **archive,
     )

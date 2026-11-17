@@ -1,6 +1,8 @@
 """Durable entry state and the owner-only transition boundary."""
 
 import os
+import re
+from typing import NoReturn
 
 from ..contracts import ContractError
 
@@ -81,6 +83,22 @@ def entry_changed(tx, fence):
     )
 
 
+def refuse_unbound_mutation() -> NoReturn:
+    """Refuse a model tool without a host-attested latest-message occurrence.
+
+    A conversation or turn ID, capture receipt or stored command cannot bind a
+    tool to the exact user message its model request saw. Missing or unsupported
+    native witnesses refuse before opening a target transaction,
+    including receipt replay, so stale commands cannot authorize a new call.
+    """
+    raise ContractError(
+        "ACCESS_DENIED",
+        "request_message_binding",
+        hint="This tool invocation has no verified binding to its latest complete user message. "
+        "Use the local memory management page or memory command for this operation.",
+    )
+
+
 def process_account_id():
     """Return the operating system's identity for the current process, independent of environment variables."""
     if os.name != "nt":
@@ -121,6 +139,46 @@ def process_account_id():
             kernel.LocalFree(result)
     finally:
         kernel.CloseHandle(token)
+
+
+def account_pin(value):
+    """Parse a persisted OS account without accepting names or environment aliases."""
+    if type(value) is str and re.fullmatch(r"uid:(0|[1-9][0-9]*)|sid:S-1-[0-9]+(?:-[0-9]+)+", value):
+        return value
+    return None
+
+
+def current_account_pin():
+    """Read a namespaced process identity from the OS; failure grants no authority."""
+    try:
+        account = process_account_id()
+        value = account_pin(("sid:" if os.name == "nt" else "uid:") + account) if type(account) is str else None
+    except (OSError, AttributeError, TypeError, ValueError):
+        value = None
+    if value is None:
+        raise ContractError("ACCESS_DENIED", "local_account_unavailable")
+    return value
+
+
+def local_account_matches(value):
+    """Compare an explicit approval with the current process, failing closed."""
+    expected = account_pin(value)
+    if expected is None:
+        return False
+    try:
+        return expected == current_account_pin()
+    except ContractError:
+        return False
+
+
+def require_local_account(value):
+    """Require a bound local account before granting a local owner's capability."""
+    if not local_account_matches(value):
+        raise ContractError(
+            "ACCESS_DENIED",
+            "local_account_binding",
+            hint="Run the explicit local account approval command as the installation owner.",
+        )
 
 
 def paused_since(tx, fence):

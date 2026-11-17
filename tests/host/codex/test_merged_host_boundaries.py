@@ -19,6 +19,7 @@ from scope_recall.core.events import prepare_capture
 from scope_recall.maintenance.shared_import import import_entry
 
 from tests.host.codex.test_capture_ledger import ledger_client
+from tests.host.codex.test_native_binding import native_codex  # noqa: F401
 from tests.host.codex.test_shared_client import NOW, _hermes, store
 from tests.host.hermes.test_two_entries_one_store import _old_store
 from tests.v11_support import context, source_event
@@ -83,20 +84,37 @@ def test_host_hook_and_mcp_candidates_share_screening_and_entry_owner(client, tm
         server = CodexMCPServer(hook.config, workspace=tmp_path, core=hook.core)
         request = SimpleNamespace(request_context=SimpleNamespace(meta={"threadId": str(uuid4())}))
         if host == "codex":
-            server.propose_memory(request, "1.1", ATTACK, request_id="TEST-mcp")
+            # A conversation id alone does not attest the user occurrence seen by this call.
+            with pytest.raises(ContractError, match="request_message_binding"):
+                server.propose_memory(request, "1.1", ATTACK, request_id="TEST-mcp")
         else:
             # Other hosts expose no attested conversation metadata for this mutation boundary.
             with pytest.raises(ContractError, match="codex_thread_id"):
                 server.propose_memory(request, "1.1", ATTACK, request_id="TEST-mcp")
         _assert_screened(root, ATTACK)
         with closing(sqlite3.connect(root / "memory.sqlite3")) as db:
-            assert db.execute("SELECT count(*) FROM source_events WHERE content=?", (ATTACK,)).fetchone()[0] == (
-                2 if host == "codex" else 1
-            )
+            assert db.execute("SELECT count(*) FROM source_events WHERE content=?", (ATTACK,)).fetchone()[0] == 1
         if server._host_runtime is not None:
             server._host_runtime.close()
     finally:
         hook.close()
+
+
+def test_native_mcp_proposal_keeps_screening_and_entry_owner(native_codex):
+    """An attested assistant proposal is screened without borrowing human authority."""
+    w = native_codex
+    body = dict(protocol_version="1.1", content=ATTACK, request_id="TEST-screened-proposal")
+    w.prepare("TEST explain the project", tool="propose_memory", payload=body)
+    result = w.call("propose_memory", body)["result"]
+    assert result["authority"] == "assistant_visible_only"
+    source = result["receipt"]["event_refs"][0]
+    assert w.core.source(w.context, source["ref"], source["revision"]) is None
+    with closing(sqlite3.connect(w.core.storage.path)) as db:
+        assert db.execute(
+            "SELECT origin,entry_id FROM source_events WHERE event_id=? AND source_revision=?",
+            (source["ref"], source["revision"]),
+        ).fetchone() == ("assistant_visible", w.config.entry_id)
+    _assert_screened(w.core.storage.path.parent, ATTACK)
 
 
 def _index_source_with_synthetic_vector(core, ctx, root):
@@ -298,7 +316,7 @@ def test_remote_hook_keeps_bound_entry_and_source_screening(client, tmp_path):
     with closing(sqlite3.connect(root / "memory.sqlite3")) as db:
         row = db.execute("SELECT entry_id,extra_json FROM source_events WHERE content=?", (ATTACK,)).fetchone()
         assert row[0] == "test-boundary"
-        assert '"resolution":"verified"' in row[1]
+        assert json.loads(row[1])["source_principal"] == {"kind": "human", "resolution": "unresolved"}
 
 
 def test_workbuddy_command_uses_supported_blocking_output(client, tmp_path, monkeypatch):

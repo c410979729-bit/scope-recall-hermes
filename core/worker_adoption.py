@@ -116,6 +116,12 @@ def prepare_adoptions(storage, context, sources, judge, *, clock, remaining_seco
 
 def publish_adoption(tx, adoption, *, now):
     """Publish only a supported decision after revalidating its exact live binding."""
+    current = adoption_context(tx, adoption.snapshot.confirmation)
+    if current is None or (current.assistant_ref, current.assistant_revision) != (
+        adoption.snapshot.assistant_ref,
+        adoption.snapshot.assistant_revision,
+    ):
+        return None
     fence = adoption.entry_fence or entry_fence(tx, (adoption.snapshot.confirmation, adoption.snapshot.assistant))
     if paused_since(tx, fence):
         raise ContractError("ACCESS_DENIED", "entry_paused")

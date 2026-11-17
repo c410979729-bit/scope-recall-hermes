@@ -5,6 +5,7 @@ reading resumes where the last one stopped (``transcript.Cursor``)."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
@@ -156,6 +157,7 @@ class RecordReader:
                 )
                 return
         page = lines if isinstance(lines, transcript.RecordPage) else None
+        lines = _codex_named_lines(record if self._hook.host == "codex" and remote is None else None, lines)
         if self._hook.host == "claude-code":
             # Read here or sent by a client on another machine, of any version: the record keeps the reminders
             # Claude's desktop app puts in a person's message, and they are not the person's.
@@ -188,16 +190,7 @@ class RecordReader:
                 bound = self._bind_entry(entry, audience)
                 if bound is None:
                     break
-                event = recorded_source_event(
-                    installation_id=self._hook.config.installation_id,
-                    host=self._hook.host,
-                    session_id=session_id,
-                    entry_id=entry.entry_id,
-                    role=entry.role,
-                    text=entry.text,
-                    occurred_at=entry.occurred_at,
-                    recorded_at=self._hook.clock.utc_now(),
-                )
+                event = self._recorded_event(session_id, entry, turns, replied)
                 origin = "human_direct" if entry.role == "user" else "assistant_visible"
                 if not self._captured_for_good(
                     self._hook.context(bound, session_id, origin),
@@ -213,6 +206,25 @@ class RecordReader:
             remote.through = position
         elif position != start:
             cursor.save(position, directory=page.directory_at(position) if page is not None else None)
+
+    def _recorded_event(self, session, entry, turns, replied):
+        """Use the ordinary record envelope with an exact native key when available."""
+        event = recorded_source_event(
+            installation_id=self._hook.config.installation_id,
+            host=self._hook.host,
+            session_id=session,
+            entry_id=entry.entry_id,
+            role=entry.role,
+            text=entry.text,
+            occurred_at=entry.occurred_at,
+            recorded_at=self._hook.clock.utc_now(),
+        )
+        if self._hook.host == "codex" and entry.native_occurrence:
+            key = self._key(session, entry, turns, replied)
+            if key is None:
+                raise ContractError("IDENTITY_UNBOUND", "native_source_key")
+            event["source_event_key"] = key
+        return event
 
     def _bind_entry(self, entry: transcript.Said, fallback):
         """Rebind provenance through the same audience authority used by hooks; missing provenance narrows privacy."""
@@ -258,7 +270,9 @@ class RecordReader:
         self, session_id: str, entry: transcript.Said, turns: dict[str, str], replied: tuple[str, str] | None
     ) -> str | None:
         """The key a hook stored a record message under, when the record, a kept turn or the Stop names it."""
-        if entry.role == "user" and (turns.get(entry.entry_id) or entry.prompt_id):
+        if self._hook.host == "codex" and entry.native_occurrence and not entry.prompt_id:
+            kind, event_id = "record", entry.entry_id
+        elif entry.role == "user" and (turns.get(entry.entry_id) or entry.prompt_id):
             kind, event_id = "user", turns.get(entry.entry_id) or entry.prompt_id
         elif replied is not None and entry.entry_id == replied[0]:
             kind, event_id = "assistant", replied[1]
@@ -295,3 +309,24 @@ def _person_words(entry: transcript.Said | None) -> transcript.Said | None:
     if text == entry.text:
         return entry
     return replace(entry, text=text) if text.strip() else None
+
+
+def _codex_named_lines(record, lines):
+    """Join the existing prompt key only to the turn's first actual native user id."""
+    if record is None:
+        return lines
+    try:
+        if record.stat().st_size > transcript.READ_BYTES:
+            raise ValueError("record exceeds native binding allowance")
+        openers = transcript.codex_openers(json.loads(line) for line in record.read_text(encoding="utf-8").splitlines())
+    except (OSError, ValueError, TypeError):
+        return [(end, replace(entry, native_occurrence=False) if entry is not None else None) for end, entry in lines]
+    return [
+        (
+            end,
+            replace(entry, prompt_id=openers.get(entry.entry_id))
+            if entry is not None and entry.native_occurrence
+            else entry,
+        )
+        for end, entry in lines
+    ]

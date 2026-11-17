@@ -135,6 +135,8 @@ def parser():
         "unmute",
         "forget",
         "forget-session",
+        "origin",
+        "origin-candidates",
         "export",
         "secrets",
         "recalls",
@@ -167,6 +169,7 @@ def parser():
             command.add_argument("--request-id")
             command.add_argument("--before", type=int)
         _health_arguments(command, action)
+        _origin_arguments(command, action)
         if action == "import":
             from .memory_import import add_arguments
 
@@ -190,6 +193,7 @@ def parser():
         if action in {"show", "history"}:
             command.add_argument("--revision" if action == "show" else "--before", type=int)
         if action == "revise":
+            command.add_argument("--request-id", help="reuse this ID only for an exact retry of this correction")
             command.add_argument("--expected-revision", type=int, required=True)
             value = command.add_mutually_exclusive_group(required=True)
             value.add_argument("--value")
@@ -204,6 +208,32 @@ def parser():
             command.add_argument("--out", required=True, help="new directory, or a new file ending in .zip")
             command.add_argument("--with-attachments", action="store_true", help="include retained attachments")
     return root
+
+
+def _origin_arguments(command, action):
+    """Keep provenance maintenance outside every host and model tool surface."""
+    if action == "origin":
+        command.add_argument("refs", nargs="+", help="event references, optionally suffixed with @revision")
+        command.add_argument("--origin", required=True, choices=("host_generated", "origin_unknown", "human_direct"))
+        command.add_argument("--reason", required=True)
+        command.add_argument("--yes", action="store_true", help="apply the displayed provenance preview")
+        command.add_argument("--preview-id", help="refuse if an earlier preview has changed")
+    if action == "origin-candidates":
+        command.add_argument("--limit", type=int, default=100, help="source rows to examine, at most 1000")
+        command.add_argument("--after", type=int, default=0, help="continue after this source ID")
+        command.add_argument("--snippet", action="store_true", help="include the first 120 characters")
+
+
+def _execute_origin(api, args):
+    """Preview by default; only an explicit confirmation can write provenance."""
+    if args.action == "origin-candidates":
+        from .origin_candidates import candidates
+
+        return candidates(api, limit=args.limit, after=args.after, snippet=args.snippet)
+    plan = api.preview_origin(args.refs, origin=args.origin, reason=args.reason)
+    if args.preview_id is not None and args.preview_id != plan["preview_id"]:
+        raise ContractError("VERSION_CONFLICT", "preview")
+    return dict(preview=plan, applied=args.yes, **(dict(result=api.apply_origin(plan)) if args.yes else {}))
 
 
 def _review_arguments(command, action):
@@ -310,6 +340,8 @@ def _execute_instruction_or_health(api, args):
 
 def _execute_owner(api, args):
     """Route related owner controls without growing the inventory dispatcher."""
+    if args.action in {"origin", "origin-candidates"}:
+        return _execute_origin(api, args)
     if args.action == "reviews" or args.action.startswith("review-"):
         return _execute_review(api, args)
     if args.action in {"entries", "entry", "entry-state"}:
@@ -322,7 +354,7 @@ def execute(api, args):
     entry_action = args.action in {"entries", "entry", "entry-state"}
     if (
         entry_action
-        or args.action in {"reviews", "instruction-get", "instruction-set"}
+        or args.action in {"reviews", "instruction-get", "instruction-set", "origin", "origin-candidates"}
         or args.action.startswith(("review-", "health"))
     ):
         return _execute_owner(api, args)
@@ -338,7 +370,10 @@ def execute(api, args):
         return api.history(args.ref, before=args.before, limit=args.limit)
     if args.action == "revise":
         return api.revise(
-            args.ref, expected_revision=args.expected_revision, value=None if args.retract else args.value
+            args.ref,
+            expected_revision=args.expected_revision,
+            value=None if args.retract else args.value,
+            request_id=args.request_id,
         )
     if args.action == "export":
         from .memory_export import write_export
@@ -449,6 +484,18 @@ def render(payload, *, as_json):
             print("Import permission does not confirm the content or identify its author as the local owner.")
         else:
             print(json.dumps(data["result"], ensure_ascii=False, indent=2))
+    elif "preview" in data and payload["action"] == "origin":
+        plan = data["preview"]
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        print("Applied." if data["applied"] else "Repeat with --yes --preview-id " + plan["preview_id"])
+    elif payload["action"] == "origin-candidates":
+        columns = ("ref", "revision", "entry", "time", "rule", "affected_claims", "platform_id_available")
+        table(
+            data["items"],
+            (*columns, "snippet") if any("snippet" in s for s in data["items"]) else columns,
+            max_width=None,
+        )
+        print(f"Examined {data['examined']} rows; next --after: {data['next_after']}")
     elif "preview" in data:
         plan = data["preview"]
         table(plan["affected"], ("kind", "ref", "revision", "scope_id"))
@@ -490,7 +537,9 @@ def main(argv=None):
 
             data = execute_import(args, open_store=open_management, resolve_store=store_to_restore, run=run_import)
         else:
-            api = open_management(args, initialize=args.action not in {"secrets", "recalls"})
+            api = open_management(
+                args, initialize=args.action not in {"secrets", "recalls", "origin", "origin-candidates"}
+            )
             data = execute(api, args)
         payload = dict(format=FORMAT, action=args.action, status="ok", data=data)
         code = 2 if data.get("result", {}).get("error") else 0

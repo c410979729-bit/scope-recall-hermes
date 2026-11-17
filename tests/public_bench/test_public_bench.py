@@ -1657,6 +1657,7 @@ def test_scenario_worker_port_runs_adoption_without_external_services(tmp_path, 
     try:
         session = scenes.hook("codex", "TEST 配置重启策略，请给两个方案。")["session"]
         scenes.flush_captures(session=session)
+        scenes.clock.advance(1)
         with monkeypatch.context() as capture:
             if queued_reply:
                 capture.setattr(capture_inbox, "fits", lambda *args, **kwargs: False)
@@ -1670,6 +1671,7 @@ def test_scenario_worker_port_runs_adoption_without_external_services(tmp_path, 
         if queued_reply:
             assert reply["diagnostics"]["capture_durability"] == "queued"
         scenes.flush_captures(session=session)
+        scenes.clock.advance(1)
         scenes.hook("codex", "好，就用方案二", session=session)
         scenes.flush_captures(session=session)
         model = FixtureModel()
@@ -1680,6 +1682,57 @@ def test_scenario_worker_port_runs_adoption_without_external_services(tmp_path, 
         assert "先备份配置" in payload["value_text"]
         assert len(payload["evidence_spans"]) == 2
         assert {"locate_adoption", "describe_adoption", "support"} <= set(model.calls)
+    finally:
+        scenes.close()
+
+
+@pytest.mark.parametrize("forced_queue", [False, True])
+def test_scenario_late_reply_replays_after_confirmation_consolidated(tmp_path, monkeypatch, forced_queue):
+    """A real shared hook resumes adoption when its reply leaves durable ingress late."""
+    from scenario_model import FixtureModel, drain
+    from scenario_store import ScenarioStore
+    from scope_recall.contracts import ContractError
+    from scope_recall.core import capture_inbox
+
+    scenes = ScenarioStore(tmp_path / "TEST-late-adoption")
+    try:
+        session = scenes.hook("codex", "TEST 配置重启策略，请给两个方案。")["session"]
+        scenes.flush_captures(session=session)
+        scenes.clock.advance(1)
+        persist = capture_inbox.record_event
+
+        def busy_reply(*args, **kwargs):
+            if any(event["role"] == "assistant" for event in kwargs["_prepared"].events):
+                raise ContractError("DEADLINE_EXCEEDED")
+            return persist(*args, **kwargs)
+
+        with monkeypatch.context() as capture:
+            if forced_queue:
+                capture.setattr(capture_inbox, "fits", lambda *args, **kwargs: False)
+            else:
+                capture.setattr(capture_inbox, "record_event", busy_reply)
+            reply = scenes.hook(
+                "codex",
+                "",
+                session=session,
+                event="Stop",
+                last_assistant_message="方案一：直接覆盖配置。\n\n方案二：先备份配置，再平滑重启，失败时恢复备份。",
+            )
+        assert reply["diagnostics"]["capture_durability"] == "queued"
+        scenes.clock.advance(1)
+        scenes.hook("codex", "好，就用方案二", session=session)
+        judge = FixtureModel()
+        drain(scenes, judge)
+        assert scenes.rows("SELECT state FROM work_items WHERE work_type='consolidate' AND state!='done'") == []
+        assert scenes.rows("SELECT state FROM claim_versions WHERE state='active'") == []
+        scenes.flush_captures(session=session)
+        drain(scenes, judge)
+        scenes.flush_captures(session=session)
+        drain(scenes, judge)
+        rows = scenes.rows("SELECT state,payload_json FROM claim_versions")
+        assert len(rows) == 1 and rows[0]["state"] == "active"
+        assert len(json.loads(rows[0]["payload_json"])["evidence_spans"]) == 2
+        assert judge.calls.count("locate_adoption") == 1
     finally:
         scenes.close()
 

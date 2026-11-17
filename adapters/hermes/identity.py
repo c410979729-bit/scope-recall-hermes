@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import re
-import sys
 from dataclasses import asdict, dataclass
-from functools import cache, partial
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -21,6 +19,7 @@ from scope_recall.contracts import (
     bounded_source_context,
 )
 
+from ...core.entry_control import current_account_pin, local_account_matches
 from ...core.private import normalize_project_path
 from ...runtime.remote_clock import stored_session_id as session_identity
 from ...runtime.worker_launch import RUNTIME_CONFIG_FILENAME
@@ -30,6 +29,7 @@ from ..host_identity import (
     entry_owner,
     owner_subjects,
     principal_ref,
+    resolve_granted_audience,
     resolve_runtime_audience,
     switched_scope,
 )
@@ -53,9 +53,6 @@ _UNATTESTED_HUMAN_PLATFORMS = frozenset({"a2a", "webhook", "msgraph_webhook"})
 #: ``agent:<profile>:local:dm:<chat id>``.  A profile id holds no colon (``main`` is the default profile's namespace,
 #: ``main~`` the one of a profile named ``main``).
 _TRANSPORT_SESSION_KEY = re.compile(r"agent:[^:]+:local:dm:(?P<chat>.+)")
-#: ``OpenProcessToken``'s ``TOKEN_QUERY`` right and ``GetTokenInformation``'s ``TokenUser`` class.
-_TOKEN_QUERY = 0x0008
-_TOKEN_USER = 1
 
 
 class LocalSurfaceUnapproved(HermesIdentityError):
@@ -110,68 +107,12 @@ def _normalize_user_id(
     )
 
 
-@cache
 def host_account_principal() -> str | None:
-    """How Hermes's local session transport names a peer that runs as this process's own OS account, or ``None`` when
-    the account cannot be read.
-
-    The transport takes a peer's account from the OS, never from the peer: on Windows the user SID of the named pipe
-    client's token (``sid:<SID>``), elsewhere the socket peer's uid (``uid:<uid>``).  It serves no peer of another
-    account, and a peer may name anyone else only in a dashboard login's form (``auth:v1:[...]``).  The agent, and this
-    adapter with it, runs in the gateway's process, so a session that names this account comes from the gateway's own
-    account: the person at this machine, whom the CLI takes for the owner.
-    """
-    if sys.platform != "win32":
-        return f"uid:{os.getuid()}"
-    sid = _windows_account_sid()
-    return f"sid:{sid}" if sid else None
-
-
-def _windows_account_sid() -> str | None:
-    """This process's user SID (its token's ``TokenUser``) as ``ConvertSidToStringSidW`` writes it, or ``None``."""
-    if sys.platform != "win32":
-        return None
-    import ctypes  # Windows only, and only once a conversation of the transport binds.
-    from ctypes import wintypes
-
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    advapi.OpenProcessToken.restype = wintypes.BOOL
-    advapi.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    advapi.GetTokenInformation.restype = wintypes.BOOL
-    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
-    kernel.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel.LocalFree.restype = ctypes.c_void_p
-    token = wintypes.HANDLE()
-    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)):
-        return None
+    """Return the transport's OS principal through the shared account reader."""
     try:
-        size = wintypes.DWORD()
-        advapi.GetTokenInformation(token, _TOKEN_USER, None, 0, ctypes.byref(size))
-        buffer = ctypes.create_string_buffer(size.value)
-        if not advapi.GetTokenInformation(token, _TOKEN_USER, buffer, size, ctypes.byref(size)):
-            return None
-        # A TOKEN_USER opens with its SID's address (``User.Sid``).
-        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
-        text = wintypes.LPWSTR()
-        if not advapi.ConvertSidToStringSidW(sid, ctypes.byref(text)):
-            return None
-        try:
-            return text.value
-        finally:
-            kernel.LocalFree(ctypes.cast(text, ctypes.c_void_p))
-    finally:
-        kernel.CloseHandle(token)
+        return current_account_pin()
+    except ContractError:
+        return None
 
 
 def _names_this_account(user_id: object) -> bool:
@@ -340,6 +281,10 @@ class HermesIdentity:
         stored form of a message does not change with the name the person goes by."""
 
         if origin == "human_direct":
+            if self.scope.platform in {"cli", *LOCAL_PLATFORMS} and (
+                self.local_account_principal is not None or not local_account_matches(self.manifest.local_account_id)
+            ):
+                return TrustedSourcePrincipal("human", "unresolved")
             if self.scope.platform in _UNATTESTED_HUMAN_PLATFORMS:
                 return TrustedSourcePrincipal("human", "unresolved")
             return TrustedSourcePrincipal(
@@ -537,7 +482,9 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
         agent_context=agent_context,
         entry_id=manifest.entry_id or "",
     )
-    runtime_audience = resolve_runtime_audience(manifest, scope)
+    # Authenticated forwarding delegates entry grants, not the client's OS identity.
+    # Its captures remain unresolved humans; the server account proves nothing about them.
+    runtime_audience = (resolve_granted_audience if account is not None else resolve_runtime_audience)(manifest, scope)
     binding = manifest.to_binding()
     assert_binding_matches_manifest(binding, manifest)
     parent_session_id = str(kwargs.get("parent_session_id") or "").strip()

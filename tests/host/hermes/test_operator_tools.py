@@ -14,7 +14,7 @@ from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_herme
 from scope_recall.adapters.installation import _build_audience_scope_ids
 
 
-def test_revise_original_event_returns_actionable_guidance(adapter):
+def test_revise_original_event_reports_missing_request_binding(adapter):
     provider, _clock = adapter
     provider.on_turn_start(1, "TEST Atlas beta is March 17", turn_id="TEST-correction")
     provider.observe_pre_llm(user_message="TEST Atlas beta is March 17", turn_id="TEST-correction")
@@ -33,8 +33,9 @@ def test_revise_original_event_returns_actionable_guidance(adapter):
             },
         )
     )
-    assert result["error"]["code"] == "SOURCE_MISSING"
-    assert "不能" in result["error"]["hint"] and "无需调用任何工具" in result["error"]["hint"]
+    assert result["error"]["code"] == "ACCESS_DENIED"
+    assert result["error"]["field"] == "request_message_binding"
+    assert "local memory management" in result["error"]["hint"]
 
 
 def _payload(text: str, *, key: str) -> dict:
@@ -116,7 +117,7 @@ def test_operator_tools_expose_frozen_names_and_strict_boundary(adapter):
     assert rejected["error"] == {"code": "INPUT_INVALID", "field": "unknown_field"}
 
 
-def test_cli_operator_tools_use_core_revision_and_exact_delete_receipt(adapter):
+def test_cli_mutation_tools_refuse_even_with_persisted_commands(adapter):
     provider, _clock = adapter
     core = provider._core
     identity = provider._identity
@@ -175,8 +176,7 @@ def test_cli_operator_tools_use_core_revision_and_exact_delete_receipt(adapter):
             },
         )
     )
-    assert "result" in revised, revised
-    assert revised["result"]["items"][0]["revision"] == current_before_revision.revision + 1
+    assert revised["error"]["field"] == "request_message_binding", revised
 
     inspected = json.loads(
         provider.handle_tool_call(
@@ -188,7 +188,7 @@ def test_cli_operator_tools_use_core_revision_and_exact_delete_receipt(adapter):
         )
     )
     assert inspected["result"]["kind"] == "claim"
-    assert inspected["result"]["revision"] == current_before_revision.revision + 1
+    assert inspected["result"]["revision"] == current_before_revision.revision
 
     provider.observe_pre_llm(
         session_id="TEST-session-1",
@@ -202,18 +202,16 @@ def test_cli_operator_tools_use_core_revision_and_exact_delete_receipt(adapter):
                 "protocol_version": "1.1",
                 "target_refs": [claim.ref],
                 "mode": "delete",
-                "expected_revisions": {claim.ref: revised["result"]["items"][0]["revision"]},
+                "expected_revisions": {claim.ref: current_before_revision.revision},
             },
         )
     )
-    assert forgotten["result"]["requested_refs"] == [claim.ref]
-    assert forgotten["result"]["mode"] == "delete"
-    assert forgotten["result"]["memory_epoch"] > revised["result"]["memory_epoch"]
+    assert forgotten["error"]["field"] == "request_message_binding"
+    assert core.current_claim(context, claim.ref).revision == current_before_revision.revision
 
 
-def test_a_revise_refused_for_a_denial_says_what_to_do_instead(adapter):
-    """A correction to a value that only says what TEST-project's CI service is not is refused, and the refusal tells
-    the model what it can do instead: give the value that holds, or withdraw the claim."""
+def test_unbound_revision_refuses_before_value_semantics(adapter):
+    """The host's missing request proof precedes the claim's semantic checks."""
     provider, _clock = adapter
     core = provider._core
     context = provider._identity.trusted_context()
@@ -237,9 +235,9 @@ def test_a_revise_refused_for_a_denial_says_what_to_do_instead(adapter):
     refused = json.loads(
         provider.handle_tool_call("revise", {**request, "source_evidence_refs": [provider._current_source_refs[-1]]})
     )
-    assert refused["error"]["code"] == "DERIVATION_INVALID", refused
-    assert (claim.state, refused["error"]["field"]) == ("active", "denial_of_another_value")
-    assert "give the value that holds" in refused["error"]["hint"] and "new_value null" in refused["error"]["hint"]
+    assert refused["error"]["code"] == "ACCESS_DENIED", refused
+    assert (claim.state, refused["error"]["field"]) == ("active", "request_message_binding")
+    assert "local memory management" in refused["error"]["hint"]
 
 
 def test_a2a_same_named_mutators_reject_before_private_ref_lookup(hermes_home, initialize_kwargs):

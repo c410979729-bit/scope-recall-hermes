@@ -9,13 +9,14 @@ import hashlib
 import json
 from dataclasses import replace
 from functools import partial
+from typing import cast
 
-from ..contracts import ContractError
+from ..contracts import ClaimProposal, ContractError
 from . import private
 from .candidate_lifecycle import CandidateEvaluator, candidate_identity_restored
 from .candidate_tables import UNRESOLVED_SUBJECT_REASON
 from .claim_normalization import normalize_frame
-from .claims import evidence_refs
+from .claims import evidence_refs, evidence_span_context
 from .consolidate import candidate_evidence_sources
 from .entry_control import paused_since, sources_paused
 from .evidence_question import evidence_text, rooted_verdict
@@ -23,6 +24,7 @@ from .evidence_support import SupportVerdict, positioned, support_fingerprint, u
 from .failure_policy import BUDGET_PAUSE_ERRORS
 from .failure_retry import validation_feedback
 from .mutate import apply_claim, validate_claims
+from .source_qualification import condition_supports_value
 from .worker_consolidation import decode_consolidation_result
 from .worker_outcomes import (
     budget_left,
@@ -89,7 +91,7 @@ def _candidate_obsolete(
 
 
 def _apply_verdict(tx, item, current, value, live_sources, now):
-    """Validate one decoded verdict and apply its proposal; None when it has none."""
+    """Apply a decoded proposal and report whether an added condition was dropped."""
     if len(value["claim_proposals"]) > 1:
         raise ContractError("DERIVATION_INVALID", "candidate_proposal_count")
 
@@ -120,6 +122,29 @@ def _apply_verdict(tx, item, current, value, live_sources, now):
     ]
     if not rooted_verdict(proposal, quoted):
         return None
+    original_conditions = current.candidate.payload["conditions"]
+    conditions = proposal["conditions"]
+    dropped_condition = False
+    # A replacement of an existing condition retains the evaluator's existing
+    # semantics; only pure additions can be distinguished without guessing.
+    if all(condition in conditions for condition in original_conditions):
+        roots = tx.claims.roots(evidence_refs(cast(ClaimProposal, proposal)))
+        source_text = "\n".join(
+            evidence_span_context(root.content, span)
+            for root in roots
+            if root.capture_state == "complete" and not root.capture_gaps
+            for span in proposal["evidence_spans"]
+            if (span["source_ref"], span["source_revision"]) == (root.ref, root.revision)
+        )
+        kept = [
+            condition
+            for condition in conditions
+            if condition in original_conditions
+            or condition_supports_value(source_text, condition, proposal["value_text"])
+        ]
+        dropped_condition = len(kept) != len(conditions)
+        if dropped_condition:
+            proposal = {**proposal, "conditions": kept}
     verdicts = ()
     if positioned(proposal):
         contents = {(source.ref, source.revision): source.event["content"] for source in authorized_sources}
@@ -129,7 +154,7 @@ def _apply_verdict(tx, item, current, value, live_sources, now):
     applied_version = tx.claims.version(applied.ref, applied.revision)
     if applied_version is None or applied_version.payload.get("subject") != expected_candidate.payload.get("subject"):
         raise ContractError("DERIVATION_INVALID", "candidate_subject_binding")
-    return applied
+    return applied, dropped_condition
 
 
 def _live_evidence(tx, evaluation):
@@ -173,14 +198,14 @@ def _record_verdict(tx, item, evaluation, dependencies, value, result_digest: st
         return work_result(mutation, error_code="authority_revoked")
     mark = claim_versions_mark(tx)
     try:
-        applied = _apply_verdict(tx, item, current, value, live_sources, now)
+        verdict = _apply_verdict(tx, item, current, value, live_sources, now)
     except ContractError as exc:
         # A rejection caused by a claim written during the call is
         # reported as the ``VERSION_CONFLICT`` (``memory_epoch``) of a changed dependency.
         if claims_changed(tx, dependencies, until=mark):
             raise ContractError("VERSION_CONFLICT", "memory_epoch") from exc
         raise
-    if applied is None:
+    if verdict is None:
         mutation = tx.candidates.complete(
             evaluation.evaluation_id,
             item,
@@ -190,12 +215,15 @@ def _record_verdict(tx, item, evaluation, dependencies, value, result_digest: st
             result_digest=result_digest,
         )
         return work_result(mutation)
+    applied, dropped_condition = verdict
     # Another writer's version in the slot the verdict just wrote to
     # would have the stale verdict ordered against it; discard instead.
     if claims_changed(tx, dependencies, until=mark, claim_refs={applied.ref, current.candidate.ref}):
         raise ContractError("VERSION_CONFLICT", "memory_epoch")
     lifecycle_state = "resolved" if applied.state == "active" else "waiting_evidence"
     reason = "fact_active" if lifecycle_state == "resolved" else "evaluated_waiting_evidence"
+    if dropped_condition:
+        reason = "unsupported_added_condition_dropped"
     mutation = tx.candidates.complete(
         evaluation.evaluation_id,
         item,

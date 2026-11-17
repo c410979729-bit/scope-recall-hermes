@@ -720,6 +720,9 @@ def _revalidated(storage, context, row, authorize, deadline, *, rekey):
             tx._check(write=True).execute("DELETE FROM capture_inbox WHERE token=?", (row["token"],))
         return None
     original = stored_context(context.binding, body["context"], allowed_scope_ids=allowed)
+    # Callbacks are process authority, never durable payload fields. Replayed
+    # sources retain their captured speaker and use today's ownership grants.
+    original = replace(original, owner_resolver=context.owner_resolver)
     # Revalidate the stored envelope; trust is from the captured context,
     # never inferred from a payload role or text claiming to be a user.
     capture = _capture_fingerprint(body["events"]) if rekey else ""
