@@ -163,9 +163,15 @@ def _without_answer_text(content: object) -> bool:
 
 
 #: Words a provider uses when it declines on its own account -- a spent quota, a plan
-#: limit -- rather than because of what was asked.  The provider names the reason in
-#: the message; this list only decides which family the refusal belongs to.
-_QUOTA_REFUSAL_WORDS = ("\u7528\u91cf", "\u989d\u5ea6", "\u914d\u989d", "quota", "limit", "insufficient")
+#: limit, an empty balance -- rather than because of what was asked.  The provider
+#: names the reason in the message; this pattern only decides which family the
+#: refusal belongs to.  The ASCII words are matched whole, so a provider saying
+#: ``unlimited`` is not read as a limit that was reached.
+_QUOTA_REFUSAL = re.compile(
+    "\u7528\u91cf|\u989d\u5ea6|\u914d\u989d|\u4f59\u989d"
+    "|\\bquota\\b|\\bquotas\\b|\\blimits?\\b|\\blimited\\b|\\binsufficient\\b|\\bbalance\\b",
+    re.IGNORECASE,
+)
 
 
 def _provider_refusal(payload: Mapping[str, Any]) -> tuple[str, str | None] | None:
@@ -189,16 +195,18 @@ def _provider_refusal(payload: Mapping[str, Any]) -> tuple[str, str | None] | No
     read it as an ordinary shape.
     """
     choices = payload.get("choices")
-    if choices is not None:
+    if isinstance(choices, list) and choices:
         return None
     base_resp = payload.get("base_resp")
     if not isinstance(base_resp, Mapping):
         return None
     status = base_resp.get("status_code")
     message = str(base_resp.get("status_msg") or "")
-    if not status and not message:
+    if status == 0 or (status is None and not message):
+        # A status of zero is this provider's own name for success, and a message
+        # with no status says nothing this layer can read as a refusal.
         return None
-    if any(word in message for word in _QUOTA_REFUSAL_WORDS):
+    if _QUOTA_REFUSAL.search(message):
         return ("provider_quota_exhausted", None)
     if type(status) is int and 100 <= status <= 599:
         return ("http_status", str(status))

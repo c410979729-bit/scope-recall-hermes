@@ -640,6 +640,7 @@ CORE_RELEASE_CONTRACTS = [
     "tests/contract/test_operator_retry.py",
     "tests/contract/test_recall_budget_config.py",
     "tests/contract/test_provider_quota_refusal.py",
+    "tests/contract/test_response_shape_diagnostic.py",
 ]
 # Every contract file under tests/contract must be selected by some tier
 # (tests/packaging/test_check_selection.py enforces it).  These run in both

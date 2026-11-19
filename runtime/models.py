@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import os
 import re
@@ -528,6 +529,61 @@ def _settle(
     return None
 
 
+#: How deep a refused envelope's structure is described, and how many of its
+#: members are described at each level.  A shape is a description of the
+#: envelope, not a copy of it: the answer never enters it.
+_SHAPE_DEPTH = 3
+_SHAPE_MEMBERS = 12
+
+
+def _shape_of(value: Any, depth: int = 0) -> Any:
+    """Describe a value's structure: its key names, its value types and its sizes.
+
+    Nothing the provider said is copied here.  A string is described by its
+    length and a number by its type, so a refused envelope can be told apart
+    from a truncated one without its content ever being written down.
+    """
+    if depth >= _SHAPE_DEPTH:
+        return type(value).__name__
+    if isinstance(value, Mapping):
+        members = list(value.items())[:_SHAPE_MEMBERS]
+        described = {str(key): _shape_of(member, depth + 1) for key, member in members}
+        if len(value) > len(members):
+            described["..."] = f"{len(value) - len(members)} more"
+        return described
+    if isinstance(value, (list, tuple)):
+        items = [_shape_of(item, depth + 1) for item in list(value)[:2]]
+        if len(value) > 2:
+            items.append(f"...{len(value) - 2} more")
+        return items
+    if isinstance(value, str):
+        return {"type": "str", "len": len(value)}
+    if value is None or isinstance(value, (bool, int, float)):
+        return {"type": type(value).__name__, "value": value}
+    return {"type": type(value).__name__}
+
+
+def _log_response_shape(payload: Mapping[str, Any], model: str) -> None:
+    """Note the structure of an envelope this layer did not understand.
+
+    Only the shape is written: key names, value types, sizes and the model's
+    own name.  The point is to tell "the gateway cut the answer off" apart
+    from "the model wrote something else", and that question is answerable
+    from the envelope alone.
+
+    An envelope whose member *names* read as credential-like text is described
+    by its size alone: a description is not a place to write a secret, and the
+    member names are the only part of the shape that came from the provider
+    rather than from this code.
+    """
+    described = _shape_of(payload)
+    if contains_secret_like_text(described):
+        described = {"type": type(payload).__name__, "members": len(payload)}
+    logging.getLogger(__name__).warning(
+        "scope_unsupported_response_shape:%s:%s", model, json.dumps(described, ensure_ascii=False, default=str)
+    )
+
+
 def metered_post(
     *,
     ledger: AuxiliaryBudgetLedger,
@@ -580,7 +636,12 @@ def metered_post(
             raise AuxiliaryModelError("http_status", detail=str(status_code))
         payload = _load_json_object(raw)
         usage = read_usage(payload)
-        result = read_result(payload)
+        try:
+            result = read_result(payload)
+        except AuxiliaryModelError as exc:
+            if exc.error_type == "unsupported_response_shape":
+                _log_response_shape(payload, model)
+            raise
     except (AuxiliaryModelError, ContractError) as exc:
         # ContractError subclasses ValueError; a reply's own verdict (such as a
         # truncated answer) must not be relabelled as a ledger refusal below.
