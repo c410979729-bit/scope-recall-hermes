@@ -165,11 +165,18 @@ def _without_answer_text(content: object) -> bool:
 #: Words a provider uses when it declines on its own account -- a spent quota, a plan
 #: limit, an empty balance -- rather than because of what was asked.  The provider
 #: names the reason in the message; this pattern only decides which family the
-#: refusal belongs to.  The ASCII words are matched whole, so a provider saying
-#: ``unlimited`` is not read as a limit that was reached.
+#: refusal belongs to.  The ASCII words are bounded by letters and digits rather
+#: than by word boundaries, because a provider writes them as one symbol joined
+#: with underscores -- ``insufficient_quota`` -- and a boundary would not fall
+#: there.  A word written inside another one is not a limit that was reached:
+#: ``unlimited`` says there is none.
 _QUOTA_REFUSAL = re.compile(
     "\u7528\u91cf|\u989d\u5ea6|\u914d\u989d|\u4f59\u989d"
-    "|\\bquota\\b|\\bquotas\\b|\\blimits?\\b|\\blimited\\b|\\binsufficient\\b|\\bbalance\\b",
+    "|(?<![a-z0-9])quotas?(?![a-z0-9])"
+    "|(?<![a-z0-9])limits?(?![a-z0-9])"
+    "|(?<![a-z0-9])limited(?![a-z0-9])"
+    "|(?<![a-z0-9])insufficient(?![a-z0-9])"
+    "|(?<![a-z0-9])balance(?![a-z0-9])",
     re.IGNORECASE,
 )
 

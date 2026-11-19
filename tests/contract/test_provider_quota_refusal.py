@@ -48,6 +48,7 @@ def _refusal(tmp_path, monkeypatch, status_msg: str, status_code: int = 429) -> 
         pytest.param("额度已用尽", QUOTA_CODE, id="chinese-quota"),
         pytest.param("配额不足，请稍后重试", QUOTA_CODE, id="chinese-quota-words"),
         pytest.param("insufficient_quota", QUOTA_CODE, id="english-quota"),
+        pytest.param("QUOTA_EXCEEDED", QUOTA_CODE, id="english-quota-joined"),
         pytest.param("Token Plan limit reached", QUOTA_CODE, id="plan-limit"),
         pytest.param("insufficient funds for this plan", QUOTA_CODE, id="quota-by-other-word"),
     ],
@@ -55,6 +56,18 @@ def _refusal(tmp_path, monkeypatch, status_msg: str, status_code: int = 429) -> 
 def test_a_provider_refusal_in_a_200_answer_is_named(tmp_path, monkeypatch, status_msg, expected):
     """The provider's own refusal is read as a refusal, not as a shape this layer cannot read."""
     assert _refusal(tmp_path, monkeypatch, status_msg).error_type == expected
+
+
+def test_a_provider_saying_it_has_no_limit_is_not_read_as_one(tmp_path, monkeypatch):
+    """A provider saying it is unlimited has said there is no limit: it has not hit one."""
+    config, _ledger, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "TEST-key")
+    body = json.dumps({"choices": None, "base_resp": {"status_msg": "unlimited plan"}}).encode("utf-8")
+    transport = FakeTransport(lambda **kwargs: (200, body))
+    runtime = build_auxiliary_runtime(config, transport=transport)
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "TEST bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "provider_error"
 
 
 def test_a_refusal_that_states_its_status_is_read_as_that_status(tmp_path, monkeypatch):
