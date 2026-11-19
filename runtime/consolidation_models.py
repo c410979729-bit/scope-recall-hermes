@@ -162,7 +162,54 @@ def _without_answer_text(content: object) -> bool:
     return False
 
 
+#: Words a provider uses when it declines on its own account -- a spent quota, a plan
+#: limit -- rather than because of what was asked.  The provider names the reason in
+#: the message; this list only decides which family the refusal belongs to.
+_QUOTA_REFUSAL_WORDS = ("\u7528\u91cf", "\u989d\u5ea6", "\u914d\u989d", "quota", "limit", "insufficient")
+
+
+def _provider_refusal(payload: Mapping[str, Any]) -> tuple[str, str | None] | None:
+    """The refusal a provider stated in a 200 response, if it stated one.
+
+    Some providers answer HTTP 200 with ``choices: null`` and a ``base_resp`` that
+    says why -- a spent quota, a plan limit.  The request was served and the answer
+    is the provider declining on its own account, not this payload having an
+    unfamiliar shape: read as a shape error it would burn an attempt and fail the
+    item for something that clears by itself within hours.
+
+    The refusal is reported as the code the rest of this layer already knows:
+
+    * a message naming a quota is ``provider_quota_exhausted`` -- a capacity refusal;
+    * a stated HTTP status is that status (``http_429`` and the other capacity
+      refusals recover; ``http_401`` and the other account refusals do not);
+    * anything else the provider declined for is ``provider_error`` -- the provider
+      ran out of road, which this layer cannot name.
+
+    ``None`` means the envelope says nothing about a refusal and the caller should
+    read it as an ordinary shape.
+    """
+    choices = payload.get("choices")
+    if choices is not None:
+        return None
+    base_resp = payload.get("base_resp")
+    if not isinstance(base_resp, Mapping):
+        return None
+    status = base_resp.get("status_code")
+    message = str(base_resp.get("status_msg") or "")
+    if not status and not message:
+        return None
+    if any(word in message for word in _QUOTA_REFUSAL_WORDS):
+        return ("provider_quota_exhausted", None)
+    if type(status) is int and 100 <= status <= 599:
+        return ("http_status", str(status))
+    return ("provider_error", None)
+
+
 def _extract_chat_content(payload: Mapping[str, Any]) -> str:
+    refusal = _provider_refusal(payload)
+    if refusal is not None:
+        error_type, detail = refusal
+        raise AuxiliaryModelError(error_type, detail=detail)
     choices = payload.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise AuxiliaryModelError("unsupported_response_shape")

@@ -24,7 +24,25 @@ ACCOUNT_REFUSALS = frozenset({"http_401", "http_402", "http_403"})
 #: the attempt is refunded.  Without the refund one four-hour provider outage pushes hundreds of items into ``failed``
 #: at ``attempt=3`` apiece, each needing an operator.  529 is a provider saying it is overloaded (MiniMax, Anthropic):
 #: without it here one such answer fails a candidate evaluation for good.
-CAPACITY_REFUSALS = frozenset({"http_429", "rate_limited", "http_502", "http_503", "http_504", "http_529"})
+CAPACITY_REFUSALS = frozenset(
+    {
+        "http_429",
+        "rate_limited",
+        "http_502",
+        "http_503",
+        "http_504",
+        "http_529",
+        # A provider that refuses on its own account -- a spent quota, a plan limit --
+        # answers HTTP 200 with ``choices: null`` and a ``base_resp`` saying why.  The
+        # payload is fine and the refusal clears by itself, so it is a capacity refusal
+        # like the ones above: the attempt is refunded and the item is asked later.
+        "provider_quota_exhausted",
+        # The same envelope without a quota reading: the provider declined for a reason
+        # of its own that this layer cannot name.  It is still the provider's capacity
+        # to serve, not this payload's shape, so it recovers the same way.
+        "provider_error",
+    }
+)
 #: Provider answers that mean "send less traffic".  The recoverable set says whether an item may be retried; this one
 #: decides whether the rest of the pass should even ask.  Every capacity refusal is one, taken from
 #: ``CAPACITY_REFUSALS`` rather than copied.  So is a generation the provider interrupted, for lack of capacity or at
