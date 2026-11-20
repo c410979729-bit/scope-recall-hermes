@@ -57,7 +57,7 @@ READ_VIEW_BUDGET_GUIDANCE = (
     "default. A budget too small to hold even the minimal truthful empty or "
     "unavailable envelope is rejected with INPUT_INVALID on budget_tokens; that "
     "error wrapper is not a view result. "
-    "If gaps include budget_token_cap, retry once with budget_tokens=4096."
+    "If a smaller budget hits budget_token_cap, retry once with budget_tokens=4096."
 )
 #: What the two write tools do to a memory, and what the core asks of the user's
 #: own message before it allows either.  A model reads a tool's description

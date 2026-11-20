@@ -958,6 +958,33 @@ def test_mcp_recall_budget_default_tiny_clip_and_invalid_types(tmp_path: Path) -
     asyncio.run(run())
 
 
+def test_full_budget_clip_does_not_suggest_the_same_mcp_request(tmp_path: Path) -> None:
+    """A full packet can still clip after the explicit request has reached the advertised ceiling."""
+    from scope_recall.adapters.clients.mcp_server import BUDGET_RETRY_HINT, build_server
+
+    from tests.v11_support import source_event
+
+    project = tmp_path / "project"
+    project.mkdir()
+    config, core = install_codex_scope_recall(tmp_path / "install", project_root=project)
+    audience = resolve_runtime_audience(config, str(project))
+    human = trusted_context(config, audience, session_id=str(uuid4()), actor_origin="human_direct")
+    for index in range(16):
+        core.record_event(
+            human,
+            source_event(source_event_key=f"TEST-packet/{index}", content=f"TEST archive {index} " + "清单事项" * 90),
+            scope_id=audience.capture_scope_id,
+        )
+    tool = build_server(config, workspace=project, core=core).server._tool_manager.get_tool("recall")
+    ctx = SimpleNamespace(request_context=SimpleNamespace(meta={}))
+    for budget in ({}, {"budget_tokens": 4096}):
+        packet = tool.fn(
+            ctx, protocol_version="1.1", query="TEST archive 清单事项", mode="current", max_items=15, **budget
+        )["result"]
+        assert {"budget_token_cap", "budget_packet_cap"} & set(packet["gaps"])
+        assert BUDGET_RETRY_HINT not in packet["unmet_needs"]
+
+
 def test_mcp_illegal_protocol_values_rejected_and_legal_strict_path_kept(tmp_path: Path) -> None:
     """Aliases and non-strings stay rejected; legal 1.1 and extra=forbid stay."""
     _assert_candidate_mcp_server_import()

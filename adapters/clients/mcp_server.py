@@ -64,7 +64,7 @@ _RECALL_BUDGET_GUIDANCE = (
     "packet, including packet and source metadata; it is neither UTF-8 bytes nor an exact tokenizer count. "
     "Recommended 4096 for explicit retrieval; omit the field to use that default. "
     "Explicit smaller values are honored and may clip every item. "
-    "If gaps include budget_token_cap or budget_packet_cap, retry once with budget_tokens=4096."
+    "If a smaller budget hits budget_token_cap or budget_packet_cap, retry once with budget_tokens=4096."
 )
 _BUDGET_CAP_GAPS = ("budget_token_cap", "budget_packet_cap")
 #: The request metadata a client binds a tool call to its conversation with.
@@ -158,9 +158,9 @@ def _refusals_said(method):
     return tool
 
 
-def _budget_retry_hint(packet: object) -> None:
+def _budget_retry_hint(packet: object, budget_tokens: int) -> None:
     """Tell the caller to retry once at 4096 when a small explicit budget clipped."""
-    if type(packet) is not dict:
+    if budget_tokens >= RECOMMENDED_EXPLICIT_BUDGET_TOKENS or type(packet) is not dict:
         return
     gaps = packet.get("gaps")
     if type(gaps) is not list:
@@ -468,7 +468,7 @@ class CodexMCPServer:
             retracted=lambda since: self.core.memory_retracted_since(context, since),
         )
         packet = self.core.release_recall_packet(context, packet, original=original_packet)
-        _budget_retry_hint(packet)
+        _budget_retry_hint(packet, budget_tokens)
         return self._reply(ctx, call_id, packet)
 
     def inspect(
