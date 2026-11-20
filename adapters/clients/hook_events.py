@@ -129,6 +129,9 @@ class HookEvents:
         eligible = not self._hook.remote_paths or payload.get("scope_recall_direct_command") is True or legacy
         if command and self._hook.remote_paths and not eligible and not _inline_gaps(payload):
             return command_block(self._hook.host, "Scope Recall remote command unavailable.")
+        if self._hook.host == "antigravity":
+            # PreInvocation can repeat an old input; it is not a fresh owner command.
+            return None
         if self._hook.host == "dsh" and payload.get("scope_recall_command_eligible") is False:
             eligible = False
         if command and eligible and payload.get("attachments") in (None, []):
@@ -172,6 +175,23 @@ class HookEvents:
             return command_block(self._hook.host, message)
         return None
 
+    def _prompt_event(self, session_id, turn_id, prompt, gaps, payload, attachment_refs):
+        """Assemble a source event with native time and authorized attachments."""
+        event = user_prompt_source_event(
+            installation_id=self._hook.config.installation_id,
+            host=self._hook.host,
+            session_id=session_id,
+            turn_id=turn_id,
+            prompt=prompt,
+            recorded_at=self._hook.clock.utc_now(),
+            gaps=gaps,
+        )
+        if event is not None and self._hook.host == "antigravity":
+            event["occurred_at"] = payload.get("occurred_at", event["occurred_at"])
+        if event is not None and attachment_refs:
+            event["artifact_refs"] = attachment_refs
+        return event
+
     def prompt(self, session_id: str, audience, payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         taken = self._prompt_turn(session_id, payload)
         if taken is None:
@@ -182,17 +202,7 @@ class HookEvents:
         gaps = (*gaps, *attachment_gaps)
         if attachment_gaps:
             self._hook.note("attachment_gap", gaps=attachment_gaps)
-        event = user_prompt_source_event(
-            installation_id=self._hook.config.installation_id,
-            host=self._hook.host,
-            session_id=session_id,
-            turn_id=turn_id,
-            prompt=prompt,
-            recorded_at=self._hook.clock.utc_now(),
-            gaps=gaps,
-        )
-        if event is not None and attachment_refs:
-            event["artifact_refs"] = attachment_refs
+        event = self._prompt_event(session_id, turn_id, prompt, gaps, payload, attachment_refs)
         context = self._hook.context(audience, session_id, "human_direct")
         wait = min(PROMPT_CAPTURE_TIMEOUT_S, max(CAPTURE_TIMEOUT_S, self._hook.remaining(deadline) / 2))
         if context.compaction_seq is not None:
@@ -343,6 +353,9 @@ class HookEvents:
         self, session_id: str, audience, payload: dict[str, Any], deadline: float, *, record: RecordLines | None = None
     ) -> dict[str, Any]:
         """Store the turn's reply; ``record`` holds the lines the Stop carries (``record_reader.RecordLines``)."""
+        if self._hook.host == "antigravity":
+            # Native steps are the sole authority for visible replies, not lastUserInput or termination metadata.
+            return {}
         if self._hook.host == "dsh" and type(payload.get("last_assistant_message")) is not str:
             # A turn that ended without a reply (aborted, failed), or dsh's plugin sending what it kept of earlier
             # turns: the record lines carry whatever was said.

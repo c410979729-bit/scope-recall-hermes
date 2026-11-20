@@ -118,17 +118,7 @@ class RecordReader:
         if remote is not None:
             start, lines = remote.start, remote.lines
         else:
-            record = (
-                transcript.workbuddy_record_path(
-                    payload.get("transcript_path"), session_id, record_id=payload.get("agent_id")
-                )
-                if workbuddy
-                else (
-                    transcript.codex_record_path(payload.get("transcript_path"), session_id)
-                    if self._hook.host == "codex"
-                    else transcript.record_path(payload.get("transcript_path"), session_id)
-                )
-            )
+            record = transcript.host_record_path(self._hook.host, payload, session_id)
             if record is None:
                 self._hook.note(
                     self._hook.diagnostics.last_reason or "session_record_unavailable",
@@ -219,7 +209,7 @@ class RecordReader:
             occurred_at=entry.occurred_at,
             recorded_at=self._hook.clock.utc_now(),
         )
-        if self._hook.host == "codex" and entry.native_occurrence:
+        if self._hook.host == "antigravity" or (self._hook.host == "codex" and entry.native_occurrence):
             key = self._key(session, entry, turns, replied)
             if key is None:
                 raise ContractError("IDENTITY_UNBOUND", "native_source_key")
@@ -270,7 +260,9 @@ class RecordReader:
         self, session_id: str, entry: transcript.Said, turns: dict[str, str], replied: tuple[str, str] | None
     ) -> str | None:
         """The key a hook stored a record message under, when the record, a kept turn or the Stop names it."""
-        if self._hook.host == "codex" and entry.native_occurrence and not entry.prompt_id:
+        if self._hook.host == "antigravity":
+            kind, event_id = ("user" if entry.role == "user" else "record"), entry.entry_id
+        elif self._hook.host == "codex" and entry.native_occurrence and not entry.prompt_id:
             kind, event_id = "record", entry.entry_id
         elif entry.role == "user" and (turns.get(entry.entry_id) or entry.prompt_id):
             kind, event_id = "user", turns.get(entry.entry_id) or entry.prompt_id

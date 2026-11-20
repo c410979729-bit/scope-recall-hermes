@@ -640,9 +640,9 @@ def test_the_plugin_sends_hooks_and_tools_to_the_server(tmp_path, host):
         assert "register_memory_provider" in files[home / "plugins" / "scope-recall" / "__init__.py"]
         assert not (home / "memory.sqlite3").exists()
         return
-    if host in ("workbuddy", "dsh"):
+    if host in ("workbuddy", "dsh", "antigravity"):
         # Native home installs must never fall through to a Codex plugin.
-        with pytest.raises(remote_client.RemoteClientError, match="no plugin"):
+        with pytest.raises(remote_client.RemoteClientError, match="no plugin|native settings"):
             install_remote.plugin_files(config, tmp_path / "TEST-plugin" / "scope-recall")
         return
     files = install_remote.plugin_files(config, tmp_path / "TEST-plugin" / "scope-recall")

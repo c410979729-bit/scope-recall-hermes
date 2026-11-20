@@ -53,7 +53,7 @@ SKILLS: dict[str, Path] = {
     "scope-recall-memory": Path(__file__).with_name("skills") / "scope-recall-memory" / "SKILL.md",
 }
 PACKAGE_VERSION = __version__
-HostChoice = Literal["hermes", "codex", "claude-code", "workbuddy", "dsh"]
+HostChoice = Literal["hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"]
 
 BACKUP_DIRNAME = ".scope-recall-backups"
 #: What a store's runtime-config.json may weigh, for the shared commands that write it and the doctor that
@@ -373,7 +373,9 @@ def validate_host(host: str) -> HostChoice:
         return "workbuddy"
     if host == "dsh":
         return "dsh"
-    raise InstallError("host must be 'hermes', 'codex', 'claude-code', 'workbuddy' or 'dsh'")
+    if host == "antigravity":
+        return "antigravity"
+    raise InstallError("host must be 'hermes', 'codex', 'claude-code', 'workbuddy', 'dsh' or 'antigravity'")
 
 
 def manifest_version(version: str = PACKAGE_VERSION) -> str:

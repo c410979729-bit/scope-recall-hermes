@@ -420,14 +420,28 @@ def _check_running_code(report: DoctorReport, data_directory: Path) -> None:
 
 
 def check_host_registration(host: str, instance: Path, python_executable: Path | None = None) -> str:
-    """Whether the host can actually reach this provider.
-
-    For Hermes, registration means the package exposes its memory-provider entry
-    point (in the target interpreter when one is given) and the instance selects
-    that provider in config.yaml. Codex registration is not verified yet.
-    """
-    if host != "hermes":
+    """Check the installed host registration, returning pending when the host has no probe."""
+    if host == "hermes":
+        return _hermes_registration(instance, python_executable)
+    if host != "antigravity":
         return "pending"
+    from . import install_antigravity
+    from .install_common import InstallError
+    from .install_receipt import load_receipt, validate_receipt_binding
+
+    try:
+        receipt = load_receipt(instance)
+        if receipt is None:
+            return "pending"
+        target = Path(receipt["target_plugin_dir"])
+        validate_receipt_binding(receipt, host=host, instance_root=instance, target_plugin_dir=target)
+        return install_antigravity.registration(target, instance)
+    except (InstallError, OSError, KeyError, TypeError, ValueError):
+        return "unknown"
+
+
+def _hermes_registration(instance: Path, python_executable: Path | None) -> str:
+    """Check the provider entry point in the target interpreter and its selection in the instance."""
     if python_executable is not None:
         script = "import importlib.metadata as m,json; print(json.dumps(any(e.name=='scope-recall' for e in m.entry_points(group='hermes_agent.memory_providers'))))"
         try:
@@ -910,8 +924,8 @@ def run_doctor(
     recall_request_id: str | None = None,
     project_root: Path | str | None = None,
 ) -> DoctorReport:
-    if host not in ("hermes", "codex", "claude-code", "workbuddy", "dsh"):
-        raise ValueError("host must be 'hermes', 'codex', 'claude-code', 'workbuddy' or 'dsh'")
+    if host not in ("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"):
+        raise ValueError("host must be 'hermes', 'codex', 'claude-code', 'workbuddy', 'dsh' or 'antigravity'")
     instance = _require_absolute(Path(instance_root), "instance_root")
     python = Path(python_executable) if python_executable is not None else None
     # Imported here: both read sibling packages (runtime budgets, the Codex adapter's config), and

@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
-from . import install_claude_code, install_codex, install_dsh, install_hermes, install_workbuddy
+from . import install_antigravity, install_claude_code, install_codex, install_dsh, install_hermes, install_workbuddy
 from .backup import adjacent_backup, atomic_write, sha256, write_private_configuration
 from .doctor import check_host_registration
 from .install_common import (
@@ -58,6 +58,7 @@ _HOSTS: dict[str, ModuleType] = {
     "hermes": install_hermes,
     "workbuddy": install_workbuddy,
     "dsh": install_dsh,
+    "antigravity": install_antigravity,
 }
 
 
@@ -371,7 +372,7 @@ def _stop_residents(host: str, instance_root: Path) -> None:
     """Stop the entry's resident recall servers, for a client that may keep one (``adapters/clients/resident_entry``).
     They write nothing.  One that cannot be stopped (its identity not proven, as on macOS, or this account may not end
     it) is said on stderr and left to its own end; nothing here fails the install."""
-    if host not in ("codex", "claude-code", "workbuddy", "dsh"):
+    if host not in ("codex", "claude-code", "workbuddy", "dsh", "antigravity"):
         return
     import sys
 

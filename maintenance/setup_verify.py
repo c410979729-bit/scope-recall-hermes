@@ -9,9 +9,10 @@ import os
 import sqlite3
 import uuid
 from contextlib import closing, contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
-from ..adapters.clients import CodexHookHandler
+from ..adapters.clients import CodexHookHandler, antigravity
 from ..adapters.hermes.audiences import LOCAL_USER_ID
 from ..adapters.hermes.provider import ScopeRecallHermesAdapter
 from ..contracts import ContractError
@@ -74,13 +75,43 @@ def _host_answer(answer, *reasons):
     return answer
 
 
+def _antigravity_probe(home: Path, session: str, prompt: str) -> dict:
+    """Build a synthetic full transcript only under the disposable setup probe home."""
+    native_id = str(uuid.uuid5(uuid.NAMESPACE_OID, session))
+    # The exact native suffix matters; the disposable store parent keeps Windows paths short.
+    path = home.parent / native_id / ".system_generated" / "logs" / "transcript_full.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = dict(
+        step_index=0,
+        type="USER_INPUT",
+        source="USER_EXPLICIT",
+        status="DONE",
+        created_at=datetime.now(UTC).isoformat(),
+        content=f"<USER_REQUEST>\n{prompt}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>setup check</ADDITIONAL_METADATA>",
+    )
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    return antigravity.normalize(
+        dict(
+            conversationId=native_id,
+            workspacePaths=[str(home.parent)],
+            transcriptPath=str(path),
+            lastUserInput=prompt,
+            invocationNum=0,
+            initialNumSteps=1,
+        ),
+        "PreInvocation",
+    )
+
+
 def _client(home: Path, host: str, session: str, prompt: str) -> dict:
     # The check entry's runtime config is kept outside its home, so that no hook starts a worker for it; its
     # prompts get the allowance of an installed entry all the same.
     budget = RuntimeInstanceConfig.hook_processing_seconds
     with closing(CodexHookHandler.from_home(str(home), host, prompt_budget=budget)) as handler:
-        answer = handler.handle_payload(
-            dict(
+        payload = (
+            _antigravity_probe(home, session, prompt)
+            if host == "antigravity"
+            else dict(
                 hook_event_name="UserPromptSubmit",
                 session_id=session,
                 turn_id=session + "-turn",
@@ -90,6 +121,9 @@ def _client(home: Path, host: str, session: str, prompt: str) -> dict:
                 prompt=prompt,
             )
         )
+        answer = handler.handle_payload(payload)
+        if host == "antigravity":
+            answer = antigravity.answer(answer, "PreInvocation")
         return _host_answer(answer, handler.diagnostics.delivery_reason, handler.diagnostics.last_reason)
 
 

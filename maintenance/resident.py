@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="scope-recall resident")
     parser.add_argument("action", choices=("status", "stop"))
     parser.add_argument("--home", required=True, help="absolute home of a client attached to a shared store")
-    parser.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh"))
+    parser.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh", "antigravity"))
     args = parser.parse_args(argv)
     try:
         home = Path(args.home).expanduser()

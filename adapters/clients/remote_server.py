@@ -58,7 +58,7 @@ from .handler import CodexHookHandler, SystemHookClock
 from .identity import resolve_runtime_audience, trusted_context
 from .local_endpoint import KeptRecaller, entry_files, file_stamp
 from .record_reader import RecordLines
-from .remote_client import direct_owner_command, eligible_body, owner_prompt
+from .remote_client import _private_drop, direct_owner_command, eligible_body, owner_prompt
 
 CONFIG_NAME = "remote-server.json"
 LOG_NAME = "remote-server.log"
@@ -571,7 +571,7 @@ def handle_request(
 
 def _checked_body(config, body):
     """Recheck each retained calibration at ingress before a hook can reconstruct content."""
-    metadata = private_metadata(body)
+    metadata = private_metadata(body, host=config.host)
     moments = metadata["times"] or [None]
     clocks = metadata["clocks"] or [None]
     decisions, full_decisions, state = {}, {}, {}
@@ -589,7 +589,9 @@ def _checked_body(config, body):
         state["private_rules"] = answer.get("private_rules", False)
     state["event_decisions"] = decisions
     state["full_event_decisions"] = full_decisions
-    filtered, state = eligible_body(body, state)
+    filtered, state = eligible_body(body, state, config.host)
+    if config.host == "antigravity":
+        return filtered, _private_drop(state, body["payload"].get("hook_event_name")), state["private_rules"]
     refused = state["recall_blocked"] or (
         state["capture_blocked"] and body["payload"].get("hook_event_name") != "UserPromptSubmit"
     )
@@ -831,7 +833,9 @@ def main(argv: list[str] | None = None, *, app_factory=build_app) -> int:
     run = sub.add_parser("serve", help="serve an entry to its client on another machine")
     for command in (setup, run):
         command.add_argument("--home", required=True, help="absolute home of the client's entry, on this machine")
-        command.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh", "hermes"))
+        command.add_argument(
+            "--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh", "antigravity", "hermes")
+        )
     setup.add_argument("--listen", required=True, help="this machine's private (tailnet) address")
     setup.add_argument("--port", required=True, type=int)
     setup.add_argument("--token-sha256", required=True, help="what remote_client token printed on the client")

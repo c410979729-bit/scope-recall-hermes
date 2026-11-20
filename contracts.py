@@ -637,7 +637,7 @@ INSTALLATION_KINDS = frozenset({"local", "shared"})
 ENTRY_ID = re.compile(r"[a-z][a-z0-9-]{1,31}")
 
 # Shared manifests and runtime configurations use these same host identifiers. Only hook clients may capture.
-HOOK_CLIENT_HOSTS = ("codex", "claude-code", "workbuddy", "dsh")
+HOOK_CLIENT_HOSTS = ("codex", "claude-code", "workbuddy", "dsh", "antigravity")
 READ_ONLY_CLIENT_HOSTS = ("cherry-studio",)
 CLIENT_HOSTS = (*HOOK_CLIENT_HOSTS, *READ_ONLY_CLIENT_HOSTS)
 ENTRY_HOSTS = ("hermes", *CLIENT_HOSTS)

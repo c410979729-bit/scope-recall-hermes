@@ -20,10 +20,18 @@ from pathlib import Path
 
 from ...contracts import HOOK_CLIENT_HOSTS
 from ...runtime.worker_entry import host_process_credential_environment
+from . import antigravity
 from .boundary import EMPTY_ANSWER
 from .config import load_codex_config, load_shared_client
 from .handler import CodexHookHandler
 from .hook_answer import emit_result
+
+
+def _handle(handler, raw: bytes, host: str, event: str | None):
+    """Adapt native wire data outside the shared entry's process lifecycle."""
+    if host == "antigravity":
+        return antigravity.answer(handler.handle_bytes(antigravity.normalize_bytes(raw, event or "")), event or "")
+    return handler.handle_bytes(raw)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Absolute file holding the credential names the runtime config declares; "
         "Codex does not pass them in the hook's environment",
     )
+    parser.add_argument("--event", choices=tuple(antigravity.EVENTS), help="native Antigravity event")
     args = parser.parse_args(argv)
     # Start the trusted wall-clock budget before configuration/runtime loading;
     # model or hook payload fields never participate in this timestamp.
@@ -115,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             request_recall(location, args.host)
             recaller = Recaller(location, args.host)
             handler.resident_recall = recaller
-        result = handler.handle_bytes(raw)
+        result = _handle(handler, raw, args.host, args.event)
         emit_result(result, diagnostics=handler.diagnostics, empty=empty)
         if recaller is not None:
             outcome = getattr(handler, "resident_outcome", None) or recaller.outcome

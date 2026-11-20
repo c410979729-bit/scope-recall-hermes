@@ -383,7 +383,9 @@ def _respace_embeddings(args: argparse.Namespace) -> int:
 
 
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh"))
+    parser.add_argument(
+        "--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity")
+    )
     parser.add_argument(
         "--target-plugin-dir",
         default=None,
@@ -445,6 +447,10 @@ def _install_target(args: argparse.Namespace) -> Path:
         return default_home()
     if args.host == "dsh":
         return dsh_home()
+    if args.host == "antigravity":
+        from .install_antigravity import default_home as antigravity_home
+
+        return antigravity_home()
     raise SystemExit(f"--target-plugin-dir is required for --host {args.host}")
 
 
@@ -476,7 +482,9 @@ def _apply_install(args: argparse.Namespace) -> int:
 
 
 def _add_doctor_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh"))
+    parser.add_argument(
+        "--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity")
+    )
     parser.add_argument("--instance-root", required=True)
     parser.add_argument("--python")
     parser.add_argument("--recall-request-id")

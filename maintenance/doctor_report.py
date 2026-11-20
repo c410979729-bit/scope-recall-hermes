@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from scope_recall._version import __version__
 
-HostChoice = Literal["hermes", "codex", "claude-code", "workbuddy", "dsh"]
+HostChoice = Literal["hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"]
 
 
 @dataclass

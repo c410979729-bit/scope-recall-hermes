@@ -134,7 +134,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _target(host: str, home: Path) -> Path:
-    if host in {"workbuddy", "dsh"}:
+    if host in {"workbuddy", "dsh", "antigravity"}:
         return home
     if host == "hermes":
         return home / "plugins" / "scope-recall"
@@ -273,7 +273,7 @@ def build_plan(args: argparse.Namespace, *, environment=None) -> SetupPlan:
                 target=str(target),
                 state=state,
                 action="repair missing configuration" if receipt else "install",
-                memory_skill=True,
+                memory_skill=host != "antigravity",
                 host_memory=inspect_host_memory(host, host_home, project=project, environment=env),
             )
         )
@@ -348,7 +348,7 @@ def print_plan(plan: SetupPlan, *, machine: bool = False) -> None:
         if row.get("package_command"):
             print(f"    Install core in host venv: {row['package_command']}")
     print(f"  Store: {plan.store}; scopes: preserve existing grants, or owner's private scope for new entries")
-    print(f"  Models: {value['models']}; worker: {plan.worker}; memory skill: all selected hosts")
+    print(f"  Models: {value['models']}; worker: {plan.worker}")
     for item in value["recommendations_per_100_turns"]:
         print(
             f"  Per 100 turns: {item['task']}: {item['calls']} calls, "

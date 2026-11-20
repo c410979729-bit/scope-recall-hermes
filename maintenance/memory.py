@@ -76,7 +76,7 @@ def open_management(args, *, initialize: bool = True):
 
 def _common(parser):
     parser.add_argument("--root", help="shared store root")
-    parser.add_argument("--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh"))
+    parser.add_argument("--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"))
     parser.add_argument("--instance-root", help="host installation home for a store of its own")
     parser.add_argument("--json", action="store_true", help="emit the versioned JSON contract")
 

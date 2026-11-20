@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.clients.remote_client import HOOK_TIMEOUTS, RemoteClientError, absolute_path, load_client_config
+from . import install_antigravity as antigravity
 from . import install_dsh as dsh
 from . import install_workbuddy as workbuddy
 from .install_claude_code import SHELL_WORD
@@ -77,6 +78,8 @@ def plugin_files(config: dict[str, Any], plugin_dir: Path) -> dict[Path, str]:
     host = config["host"]
     if host == "hermes":
         return hermes_files(config, plugin_dir)
+    if host == "antigravity":
+        raise RemoteClientError("Antigravity uses native settings, not a plugin directory")
     if host == "dsh":
         raise RemoteClientError("a dsh client has no plugin directory: install merges its native rows into dsh's home")
     if host == "workbuddy":
@@ -256,13 +259,15 @@ def _hermes_backups(config: dict, home: Path, files: dict[Path, str] | dict[Path
     return backups
 
 
-def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
+def install(config: dict[str, Any], plugin_dir: Path, *, remove: bool = False) -> dict[str, list[str]]:
     """Write the plugin, or merge WorkBuddy/dsh's native files after copying changed files to ``backups``."""
-    if not config["token_file"].exists():
+    if remove and config["host"] != "antigravity":
+        raise RemoteClientError("native remote uninstall is supported for Antigravity only")
+    if not remove and not config["token_file"].exists():
         raise RemoteClientError("no token yet: run remote_client token first")
     files: dict[Path, str] | dict[Path, bytes]
     backups = []
-    if config["host"] in ("workbuddy", "dsh"):
+    if config["host"] in ("workbuddy", "dsh", "antigravity"):
         if not plugin_dir.is_dir():
             raise RemoteClientError(
                 f"{plugin_dir} does not exist: name {config['host']}'s home, or start that host once"
@@ -271,6 +276,8 @@ def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
             files = (
                 dsh.remote_files(config, plugin_dir, Path(sys.executable))
                 if config["host"] == "dsh"
+                else antigravity.files(plugin_dir, config["config"], Path(sys.executable), remote=True, remove=remove)
+                if config["host"] == "antigravity"
                 else workbuddy_files(config, plugin_dir)
             )
         except InstallError as exc:
@@ -289,7 +296,7 @@ def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
     written = []
     for path, content in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        if config["host"] in ("workbuddy", "dsh"):
+        if config["host"] in ("workbuddy", "dsh", "antigravity"):
             _write_private(path, content)
         else:
             pending = path.with_name(path.name + ".tmp")
@@ -310,10 +317,16 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="scope-recall-remote-client")
     parser.add_argument("--config", required=True)
     parser.add_argument("--plugin-dir", required=True)
+    parser.add_argument("--remove", action="store_true", help="remove only this remote Antigravity entry's settings")
     parsed = parser.parse_args(argv)
     try:
         config = load_client_config(absolute_path(parsed.config, "config"))
-        print(json.dumps(install(config, absolute_path(parsed.plugin_dir, "plugin_dir")), ensure_ascii=False))
+        print(
+            json.dumps(
+                install(config, absolute_path(parsed.plugin_dir, "plugin_dir"), remove=parsed.remove),
+                ensure_ascii=False,
+            )
+        )
         return 0
     except RemoteClientError as exc:
         raise SystemExit(str(exc)) from None

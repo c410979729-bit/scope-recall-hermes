@@ -72,7 +72,9 @@ def main(argv: list[str]) -> int:
         parser.add_argument("--output", type=Path, required=True, help="output zip bundle destination")
         parser.add_argument("--root", type=Path, help="shared store root directory")
         parser.add_argument("--instance-root", type=Path, help="local instance root directory")
-        parser.add_argument("--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh"), help="host type")
+        parser.add_argument(
+            "--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"), help="host type"
+        )
         parser.add_argument("--with-vectors", action="store_true", help="include vector files in backup")
         parser.add_argument(
             "--client-config",

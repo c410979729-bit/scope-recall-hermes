@@ -43,20 +43,31 @@ def _record_clocks(body):
         yield moment, row.get("clock")
 
 
-def event_times(body: dict[str, Any], observed_at: str | None) -> list:
+def prompt_times(body: dict[str, Any], observed_at: str | None, host: str | None = None) -> list[str | None]:
+    """Check a replayed native input at its own time as well as at hook receipt."""
+    moments: list[str | None] = [observed_at] if isinstance(observed_at, str) else []
+    payload = _payload(body)
+    if host == "antigravity" and payload.get("hook_event_name") == "UserPromptSubmit" and payload.get("prompt"):
+        original = payload.get("occurred_at")
+        # None is an unknown event time. Core evaluates it against private history.
+        moments.append(original if isinstance(original, str) else None)
+    return moments
+
+
+def event_times(body: dict[str, Any], observed_at: str | None, host: str | None = None) -> list:
     """Distinct event timestamps without copying any message body."""
     payload = _payload(body)
     if payload.get("hook_event_name") == "PrivateCheck":
         return payload.get("times") or []
-    moments = [observed_at] if isinstance(observed_at, str) else []
+    moments = prompt_times(body, observed_at, host)
     moments.extend(moment for moment, _clock in _record_clocks(body) if isinstance(moment, str))
     return list(dict.fromkeys(moments))
 
 
-def private_metadata(body: dict[str, Any], times: list | None = None) -> dict[str, Any]:
+def private_metadata(body: dict[str, Any], times: list | None = None, *, host: str | None = None) -> dict[str, Any]:
     """Bind each event to its original clock; ambiguous duplicates stay uncalibrated."""
     payload = _payload(body)
-    moments = event_times(body, body.get("observed_at")) if times is None else times
+    moments = event_times(body, body.get("observed_at"), host) if times is None else times
     clocks = {body.get("observed_at"): body.get("clock")}
 
     def remember(moment, clock):

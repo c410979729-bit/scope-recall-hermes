@@ -85,8 +85,9 @@ def existing_entry_home(host: str, home: Path, target: Path, *, user_root: Path)
         if not isinstance(declared, str):
             raise InstallError("existing Scope Recall plugin has no local entry home; preserve its configuration")
         bound = require_absolute(Path(declared), "registered entry home")
-    elif host in {"codex", "claude-code", "workbuddy"}:
-        value = _read(target / ("mcp.json" if host == "workbuddy" else ".mcp.json")) or {}
+    elif host in {"codex", "claude-code", "workbuddy", "antigravity"}:
+        filename = {"workbuddy": "mcp.json", "antigravity": "config/mcp_config.json"}.get(host, ".mcp.json")
+        value = _read(target / filename) or {}
         if not isinstance(value, dict) or not isinstance(value.get("mcpServers", {}), dict):
             raise InstallError("existing host MCP configuration is not a server mapping")
         server = (value.get("mcpServers") or {}).get("scope-recall")

@@ -637,7 +637,87 @@ def record_path(value: object, session_id: str) -> Path | None:
     return path
 
 
-PARSERS = {"claude-code": said, "workbuddy": workbuddy_said, "codex": codex_said}
+_ANTIGRAVITY_ROLES = {("USER_INPUT", "USER_EXPLICIT"): "user", ("PLANNER_RESPONSE", "MODEL"): "assistant"}
+_AGY_USER_OPEN = "<USER_REQUEST>\n"
+_AGY_USER_END = "\n</USER_REQUEST>\n<ADDITIONAL_METADATA>"
+_AGY_RECORD_FILES = {"transcript_full.jsonl", "transcript.jsonl"}
+
+
+def _antigravity_role(row: dict) -> str | None:
+    event_type, source = row.get("type"), row.get("source")
+    if isinstance(event_type, str) and isinstance(source, str):
+        return _ANTIGRAVITY_ROLES.get((event_type, source))
+    return None
+
+
+def _antigravity_person_text(text: str) -> str | None:
+    # The full transcript's envelope is a host serialization, not general XML.
+    # Keep the user's whitespace; refuse ambiguous boundaries rather than strip arbitrary tags.
+    if not text.startswith("<USER_REQUEST>"):
+        return text
+    if not text.startswith(_AGY_USER_OPEN) or text.count(_AGY_USER_END) != 1:
+        return None
+    return text[len(_AGY_USER_OPEN) :].partition(_AGY_USER_END)[0]
+
+
+def antigravity_said(row: object) -> Said | None:
+    """Accept complete native visible steps; a step index identifies an occurrence, not its words."""
+    if not isinstance(row, dict) or row.get("status") != "DONE":
+        return None
+    index, text, stamp = row.get("step_index"), row.get("content"), _stamp(row.get("created_at"))
+    truncated = row.get("truncated_fields", [])
+    if (
+        type(index) is not int
+        or not 0 <= index < 2**63
+        or type(text) is not str
+        or not text.strip()
+        or stamp is None
+        or not isinstance(truncated, list)
+        or "content" in truncated
+    ):
+        return None
+    role = _antigravity_role(row)
+    if role is None:
+        return None
+    if role == "user":
+        text = _antigravity_person_text(text)
+        if text is None or not text.strip():
+            return None
+    identity = f"step:{index}"
+    return Said(identity, role, without_lone_surrogates(text), stamp, identity if role == "user" else None)
+
+
+def antigravity_record_path(value: object, session_id: str) -> Path | None:
+    """Require the native conversation directory; no last-record or filename-only fallback."""
+    from uuid import UUID
+
+    try:
+        if str(UUID(session_id)) != session_id:
+            return None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if type(value) is not str:
+        return None
+    path = Path(value)
+    if path.name not in _AGY_RECORD_FILES:
+        return None
+    suffix = (session_id, ".system_generated", "logs", path.name)
+    if not path.is_absolute() or path.parts[-4:] != suffix or not path.is_file():
+        return None
+    # A link to another conversation must not inherit the claimed directory's identity.
+    return path if path.resolve().parts[-4:] == suffix else None
+
+
+PARSERS = {"claude-code": said, "workbuddy": workbuddy_said, "codex": codex_said, "antigravity": antigravity_said}
+
+
+def host_record_path(host: str, payload: dict, session_id: str) -> Path | None:
+    """Resolve the host's own record identically for local and remote capture."""
+    value = payload.get("transcript_path")
+    if host == "workbuddy":
+        return workbuddy_record_path(value, session_id, record_id=payload.get("agent_id"))
+    resolver = {"codex": codex_record_path, "antigravity": antigravity_record_path}.get(host, record_path)
+    return resolver(value, session_id)
 
 
 class RecordPage(list[tuple[int, Said | None]]):
@@ -712,6 +792,11 @@ def read(
                 and row.get("sessionId") != session_id
             ):
                 raise ValueError("record_session_mismatch")
+            # Antigravity rewrites running steps in place. Acknowledge these
+            # bytes only after the native client has finished the visible step.
+            if rows is antigravity_said and isinstance(row, dict) and row.get("status") == "RUNNING":
+                if _antigravity_role(row) is not None:
+                    break
             entry = rows(row)
             lines.observe_directory(position, row, profile, visible=entry is not None)
             if entry is not None:
@@ -739,6 +824,10 @@ class Cursor:
         """The saved offset, or 0 when there is none or the record is no longer the one it was taken on."""
         try:
             saved = json.loads(self.path.read_text(encoding="utf-8"))
+            if self.record.name in _AGY_RECORD_FILES and (
+                not isinstance(saved, dict) or saved.get("agy_record") != self.record.name
+            ):
+                return 0  # Full and abridged logs can have identical prefixes but different offsets.
             offset, head = saved["offset"], saved["head"]
             if type(offset) is not int or not 0 <= offset <= self.record.stat().st_size:
                 return 0
@@ -761,12 +850,10 @@ class Cursor:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             pending = self.path.with_name(f"{self.path.stem}.{os.getpid()}.tmp")
-            pending.write_text(
-                json.dumps(
-                    {"offset": offset, "head": _head(self.record, min(offset, _HEAD_BYTES)), "directory": directory}
-                ),
-                encoding="utf-8",
-            )
+            state = {"offset": offset, "head": _head(self.record, min(offset, _HEAD_BYTES)), "directory": directory}
+            if self.record.name in _AGY_RECORD_FILES:
+                state["agy_record"] = self.record.name
+            pending.write_text(json.dumps(state), encoding="utf-8")
             os.replace(pending, self.path)
         except OSError:
             pass

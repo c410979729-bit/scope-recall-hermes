@@ -75,7 +75,7 @@ _TOTAL_BUDGET_S = 2.0
 _SUPPORTED_EVENTS = frozenset({"SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "Interrupt", "SessionEnd"})
 #: Attached prompt hooks may use the entry's bounded processing allowance. The installed command timeout also
 #: leaves room for loading, serialization and shutdown outside the recall operation.
-_CONFIGURED_PROMPT_BUDGET = frozenset({"claude-code", "codex", "workbuddy", "dsh"})
+_CONFIGURED_PROMPT_BUDGET = frozenset(HOOK_CLIENT_HOSTS)
 _HOST_EVENTS = {host: profile.events for host, profile in HOSTS.items()}
 
 

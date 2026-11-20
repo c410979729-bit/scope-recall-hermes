@@ -60,7 +60,7 @@ from scope_recall.core.private import normalize_project_path, notice_for_mode, p
 
 from ...contracts import ContractError
 from ...runtime.remote_clock import event_times as _private_times
-from ...runtime.remote_clock import private_metadata
+from ...runtime.remote_clock import private_metadata, prompt_times
 from ..host_profiles import HERMES_MAX_FACT_BYTES, HERMES_MAX_WIRE_BYTES, agent_run
 from . import hermes_privacy, hermes_queue, transcript
 from .boundary import (
@@ -73,9 +73,9 @@ from .boundary import (
 from .hook_answer import command_block
 from .session_marks import clear_compaction, compaction_marker, mark_compaction, rebase_compaction
 
-HOSTS = ("claude-code", "codex", "workbuddy", "dsh", "hermes")
+HOSTS = ("claude-code", "codex", "workbuddy", "dsh", "hermes", "antigravity")
 #: Hosts whose Stop and SessionEnd send the lines of their own session record (``transcript``).
-_RECORD_HOSTS = frozenset({"claude-code", "workbuddy", "codex"})
+_RECORD_HOSTS = frozenset({"claude-code", "workbuddy", "codex", "antigravity"})
 #: How long the client's host waits for each hook (the plugin's hooks.json): the local installers' ceilings
 #: (``maintenance/install_claude_code.py``, ``maintenance/install_codex.py``), for the events forwarded.  A hook
 #: answers as soon as the server does; the server's work is bounded by the entry's budget.  WorkBuddy's hooks are
@@ -83,6 +83,7 @@ _RECORD_HOSTS = frozenset({"claude-code", "workbuddy", "codex"})
 HOOK_TIMEOUTS = {
     "claude-code": {"SessionStart": 5, "UserPromptSubmit": 15, "Stop": 10, "SessionEnd": 10},
     "codex": {"SessionStart": 5, "UserPromptSubmit": 15, "Stop": 10, "Interrupt": 3, "SessionEnd": 3},
+    "antigravity": {"SessionStart": 10, "UserPromptSubmit": 15, "Stop": 10},
     "workbuddy": {"UserPromptSubmit": 15, "Stop": 10, "SessionEnd": 10},
     "dsh": {"UserPromptSubmit": 9, "Stop": 20},
 }
@@ -219,7 +220,7 @@ def _post(
     The connection is opened to the server itself, never through a proxy: HTTP_PROXY and the system proxy
     are for the internet, and one on 127.0.0.1 would take the request away from the private network.
     """
-    event = (body.get("payload") or {}).get("hook_event_name")
+    event = "mcp" if endpoint == "/mcp" else (body.get("payload") or {}).get("hook_event_name")
     try:
         token = config["token_file"].read_text(encoding="utf-8").strip()
     except OSError as exc:
@@ -237,15 +238,20 @@ def _post(
             _connection_failed(config, event, exc)
             return None
         connection.sock.settimeout(max(0.2, until - time.monotonic()))
-        if config["host"] != "hermes" and _private_rules(config) and not direct_owner_command(body, config["host"]):
+        if (
+            endpoint == "/hook"
+            and config["host"] != "hermes"
+            and _private_rules(config)
+            and not direct_owner_command(body, config["host"])
+        ):
             state = _private_check(config, body, until - time.monotonic())
             if state is None:
                 return None
-            body, state = eligible_body(body, state)
+            body, state = eligible_body(body, state, config.get("host"))
             if _private_drop(state, event):
                 return None
             if state["capture_blocked"]:
-                body = _recall_only(body)
+                body = _recall_only(body, config.get("host"))
         encoded, encoding_headers = _encoded_request(config, body, endpoint)
         connection.request(
             "POST",
@@ -263,7 +269,10 @@ def _post(
         if response.status in _REFUSED_FOR_GOOD:
             return _refused_response(config, event, response.status)
         if response.status != 200:
-            _log(config, f"{event}: HTTP {response.status}")
+            # Streamable HTTP acknowledges notifications with an empty 202 response.
+            acknowledged = endpoint == "/mcp" and "id" not in body and response.status == 202 and not raw
+            if not acknowledged:
+                _log(config, f"{event}: HTTP {response.status}")
             return None
         decoded = raw.decode("utf-8")
         data = [line[5:].strip() for line in decoded.splitlines() if line.startswith("data:")]
@@ -435,6 +444,8 @@ def owner_prompt(host: str, payload: dict[str, Any]) -> bool:
         return False
     if payload.get("attachments") not in (None, []) or payload.get("record") is not None:
         return False
+    if host == "antigravity":
+        return False
     if host == "dsh" and payload.get("scope_recall_command_eligible") is False:
         return False
     role = payload.get("role")
@@ -496,7 +507,7 @@ def _private_drop(state: dict[str, Any], event: object) -> bool:
 
 def _private_check(config: dict[str, Any], body: dict[str, Any], timeout: float) -> dict[str, Any] | None:
     """Check all record instants in bounded metadata requests before sending any content."""
-    times = _private_times(body, body.get("observed_at"))
+    times = _private_times(body, body.get("observed_at"), config.get("host"))
     until = time.monotonic() + timeout
     fresh = body.get("fresh_observation") is True or body["payload"].get("fresh_observation") is True
     if fresh and not isinstance(body.get("clock"), dict):
@@ -537,11 +548,13 @@ def _private_check(config: dict[str, Any], body: dict[str, Any], timeout: float)
     if state is not None:
         state["event_decisions"] = decisions
         state["full_event_decisions"] = full_decisions
-        state["clocks"] = private_metadata(body, times)["clocks"]
+        state["clocks"] = private_metadata(body, times, host=config.get("host"))["clocks"]
     return state
 
 
-def eligible_body(body: dict[str, Any], state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def eligible_body(
+    body: dict[str, Any], state: dict[str, Any], host: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Translate per-event Core decisions to content-free record lines, preserving cursor progress."""
     decisions = state.get("event_decisions") or {}
     body, state = dict(body), dict(state)
@@ -584,9 +597,11 @@ def eligible_body(body: dict[str, Any], state: dict[str, Any]) -> tuple[dict[str
         payload.pop("last_assistant_message", None)
         payload.pop("reply_id", None)
     body["payload"] = payload
+    moments = prompt_times(body, body.get("observed_at"), host) or [None]
     if decisions:
-        state["capture_blocked"] = state.get("mode") != "none" or decisions.get(body.get("observed_at"), True)
-    if (state.get("full_event_decisions") or {}).get(body.get("observed_at"), False):
+        state["capture_blocked"] = state.get("mode") != "none" or any(decisions.get(t, True) for t in moments)
+    full = state.get("full_event_decisions") or {}
+    if any(full.get(t, False) for t in moments):
         # Read-only permits ordinary questions, never the replay of words from
         # a full interval or an undated question that could belong to one.
         state["recall_blocked"] = True
@@ -609,7 +624,7 @@ def _private_batch(
     if type(session) is not str or not session.strip():
         return None
     request = {
-        **private_metadata(body, times),
+        **private_metadata(body, times, host=config.get("host")),
         "sent_at": body.get("observed_at") or payload.get("calibration_started_at") or _now(),
     }
     try:
@@ -818,18 +833,7 @@ def _record_part(
     session_id = payload.get("session_id")
     if type(session_id) is not str or not session_id.strip():
         return None
-    workbuddy = config["host"] == "workbuddy"
-    record = (
-        transcript.workbuddy_record_path(
-            payload.get("transcript_path"), session_id.strip(), record_id=payload.get("agent_id")
-        )
-        if workbuddy
-        else (
-            transcript.codex_record_path(payload.get("transcript_path"), session_id.strip())
-            if config["host"] == "codex"
-            else transcript.record_path(payload.get("transcript_path"), session_id.strip())
-        )
-    )
+    record = transcript.host_record_path(config["host"], payload, session_id.strip())
     if record is None:
         return None
     cursor = transcript.Cursor(config["state_dir"], session_id.strip(), record)
@@ -933,8 +937,14 @@ def _visible_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _hook_input(raw: bytes) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any] | None]:
+def _hook_input(
+    raw: bytes, *, host: str | None = None, event: str | None = None
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any] | None]:
     """Decode one event and resolve local text filtering before any transport access."""
+    if host == "antigravity" and event is not None:
+        from .antigravity import normalize_bytes
+
+        raw = normalize_bytes(raw, event)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeError, ValueError, RecursionError):
@@ -983,9 +993,11 @@ def _normalize_hook_project(payload):
             payload["project_unverified"] = True
 
 
-def run_hook(config: dict[str, Any], raw: bytes, *, started: float | None = None) -> dict[str, Any]:
+def run_hook(
+    config: dict[str, Any], raw: bytes, *, started: float | None = None, event: str | None = None
+) -> dict[str, Any]:
     started = time.monotonic() if started is None else started
-    payload, local, original = _hook_input(raw)
+    payload, local, original = _hook_input(raw, host=config.get("host"), event=event)
     if payload is None:
         return local
     event = payload.get("hook_event_name")
@@ -1029,6 +1041,10 @@ def run_hook(config: dict[str, Any], raw: bytes, *, started: float | None = None
             # The record is here, not on the server: this side says whether the reply is an error WorkBuddy showed.
             body["error_reply"] = True
 
+    if host == "antigravity":
+        from .antigravity import scrub_remote
+
+        scrub_remote(body)
     answer = _post(config, body, until - time.monotonic()) if direct_command else _send_checked(config, body, until)
     if answer is None:
         return command_block(host, "Scope Recall could not change recording mode.") if direct_command else {}
@@ -1065,7 +1081,7 @@ def _send_ordinary(config: dict[str, Any], body: dict[str, Any], until: float, c
 def _send_checked(config: dict[str, Any], body: dict[str, Any], until: float) -> dict[str, Any] | None:
     """Send ordinary hooks directly; verify before keeping or sending once private history is known."""
     with ExitStack() as claims:
-        if not _private_rules(config):
+        if config["host"] != "antigravity" and not _private_rules(config):
             return _send_ordinary(config, body, until, claims)
         return _send_private(config, body, until, claims)
 
@@ -1083,7 +1099,7 @@ def _send_private(config, body, until, claims):
     if state is None:
         _log(config, f"{event}: private state unverified, not sent")
         return None
-    body, state = eligible_body(body, state)
+    body, state = eligible_body(body, state, config.get("host"))
     payload = body["payload"]
     if _private_drop(state, event):
         _log(config, f"{event}: private mode {state.get('mode')}, not sent")
@@ -1095,7 +1111,7 @@ def _send_private(config, body, until, claims):
         return None
     if state["capture_blocked"]:
         # Read-only prompts travel only as recall questions, without attachments or a durable spool copy.
-        body = _recall_only(body)
+        body = _recall_only(body, config.get("host"))
         spooled = None
     else:
         spooled = (
@@ -1107,13 +1123,13 @@ def _send_private(config, body, until, claims):
     # the last boundary before content is transmitted, using the original clock.
     fresh = _private_check(config, body, until - time.monotonic())
     if fresh is not None:
-        body, fresh = eligible_body(body, fresh)
+        body, fresh = eligible_body(body, fresh, config.get("host"))
     if fresh is None or _private_drop(fresh, event):
         if spooled is not None:
             spooled.unlink(missing_ok=True)
         return None
     if fresh["capture_blocked"]:
-        body = _recall_only(body)
+        body = _recall_only(body, config.get("host"))
         if spooled is not None:
             spooled.unlink(missing_ok=True)
             spooled = None
@@ -1125,7 +1141,7 @@ def _send_private(config, body, until, claims):
     return answer
 
 
-def _recall_only(body):
+def _recall_only(body, host=None):
     """Read-only prompts carry only the question and its routing metadata."""
     fields = {
         "hook_event_name",
@@ -1137,6 +1153,8 @@ def _recall_only(body):
         "prompt",
         IN_CONTEXT_FIELD,
     }
+    if host == "antigravity":
+        fields.add("occurred_at")
     return {**body, "payload": {key: value for key, value in body["payload"].items() if key in fields}}
 
 
@@ -1184,12 +1202,17 @@ def _queue_report(config: dict, command: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     args = list(sys.argv[1:] if argv is None else argv)
-    command = args.pop(0) if args and args[0] in ("token", "flush", "status") else "hook"
+    command = args.pop(0) if args and args[0] in ("token", "flush", "status", "mcp") else "hook"
     parser = argparse.ArgumentParser(prog="scope-recall-remote-client")
     parser.add_argument("--config", required=True)
+    parser.add_argument("--event", choices=("SessionStart", "PreInvocation", "PostInvocation", "Stop"))
     parsed = parser.parse_args(args)
     try:
         config = load_client_config(absolute_path(parsed.config, "config"))
+        if command == "mcp":
+            from .remote_mcp import serve
+
+            return serve(config, _post)
         if command == "token":
             print(json.dumps({"token_sha256": make_token(config)}))
             return 0
@@ -1203,7 +1226,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         raise SystemExit(str(exc)) from None
     raw = sys.stdin.buffer.read(_MAX_STDIN + 1)
-    result = run_hook(config, raw, started=started) if len(raw) <= _MAX_STDIN else {}
+    result = run_hook(config, raw, started=started, event=parsed.event) if len(raw) <= _MAX_STDIN else {}
+    if config["host"] == "antigravity":
+        from .antigravity import answer
+
+        result = answer(result, parsed.event or "")
     # ASCII only, as the local hook writes it: a pipe on Windows carries the system code page (GBK on a Chinese
     # Windows, under -I whatever PYTHONUTF8 says), and the host reads UTF-8, so recalled Chinese text arrived
     # garbled or not at all.  Nothing to add is written as the local hook writes it for this client (EMPTY_ANSWER).

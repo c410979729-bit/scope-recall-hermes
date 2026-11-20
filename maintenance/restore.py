@@ -417,7 +417,9 @@ def main(argv: list[str]) -> int:
     store.add_argument("--instance-root", type=Path, help="with --host: a Hermes or Codex home with a store of its own")
     store.add_argument("--root", type=Path, help="a shared store's directory")
     parser.add_argument(
-        "--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh"), help="the host of --instance-root"
+        "--host",
+        choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"),
+        help="the host of --instance-root",
     )
     parser.add_argument("--snapshot", type=Path, required=True, help="a snapshot of this store that backup took")
     parser.add_argument(

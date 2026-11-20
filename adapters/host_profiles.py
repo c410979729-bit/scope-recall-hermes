@@ -109,6 +109,11 @@ HOSTS = {
         subagent_prefix="agent-",
         subagent_path=r"[\\/]subagents[\\/]",
     ),
+    "antigravity": HostProfile(
+        events=frozenset({"SessionStart", "UserPromptSubmit", "Stop"}),
+        record_format="antigravity",
+        record_uses_hook_directory=True,
+    ),
     "dsh": HostProfile(
         events=frozenset({"UserPromptSubmit", "Stop"}), record_format="dsh", record_uses_hook_directory=True
     ),

@@ -14,6 +14,7 @@ HOST_DIRECTORIES = {
     "hermes": ("HERMES_HOME", ".hermes"),
     "workbuddy": ("CODEBUDDY_CONFIG_DIR", ".workbuddy"),
     "dsh": ("DSH_HOME", ".dsh"),
+    "antigravity": ("SCOPE_RECALL_ANTIGRAVITY_HOME", ".gemini"),
 }
 
 
