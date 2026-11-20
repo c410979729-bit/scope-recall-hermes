@@ -15,13 +15,14 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
 from ..contracts import ContractError
 from ..core.endpoint_policy import endpoint_scheme_allowed
 from ..core.private import require_outbound
-from ..core.secret_patterns import contains_secret_like_text
+from ..core.secret_patterns import contains_secret_like_text, is_sensitive_mapping_key
 from .model_budget import UNBILLED_HTTP_STATUSES, AuxiliaryBudgetLedger
 
 MAX_CHAT_RESPONSE_BYTES = 1_048_576
@@ -534,31 +535,71 @@ def _settle(
 #: envelope, not a copy of it: the answer never enters it.
 _SHAPE_DEPTH = 3
 _SHAPE_MEMBERS = 12
+_SHAPE_FIELDS: dict[tuple[str, ...], set[str]] = {
+    (): {
+        "choices",
+        "base_resp",
+        "error",
+        "code",
+        "status",
+        "status_code",
+        "output",
+        "incomplete_details",
+        "data",
+        "embeddings",
+        "usage",
+        "usageMetadata",
+    },
+    ("base_resp",): {"status_code", "status_msg"},
+    ("error",): {"code", "status", "type", "message"},
+    ("choices", "[]"): {"index", "message", "finish_reason"},
+    ("output", "[]"): {"type", "status", "role", "content"},
+    ("incomplete_details",): {"reason"},
+    ("data", "[]"): {"index", "embedding"},
+    ("embeddings", "[]"): {"values"},
+    ("usage",): {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"},
+    ("usageMetadata",): {"promptTokenCount"},
+}
+_NUMERIC_STATUS_PATHS = {
+    ("status_code",),
+    ("code",),
+    ("status",),
+    ("base_resp", "status_code"),
+    ("error", "code"),
+    ("error", "status"),
+}
 
 
-def _shape_of(value: Any, depth: int = 0) -> Any:
-    """Describe a value's structure: its key names, its value types and its sizes.
+class _SensitiveShapeKey(Exception):
+    """A sampled member name requires reducing the whole diagnostic to its size."""
 
-    Nothing the provider said is copied here.  A string is described by its
-    length and a number by its type, so a refused envelope can be told apart
-    from a truncated one without its content ever being written down.
-    """
-    if depth >= _SHAPE_DEPTH:
+
+def _shape_of(value: Any, path: tuple[str, ...] = ()) -> Any:
+    """Describe a bounded sample, naming only known protocol members at their expected paths."""
+    if len(path) >= _SHAPE_DEPTH:
         return type(value).__name__
     if isinstance(value, Mapping):
-        members = list(value.items())[:_SHAPE_MEMBERS]
-        described = {str(key): _shape_of(member, depth + 1) for key, member in members}
-        if len(value) > len(members):
-            described["..."] = f"{len(value) - len(members)} more"
+        described = {}
+        known = _SHAPE_FIELDS.get(path, ())
+        for index, (key, member) in enumerate(islice(value.items(), _SHAPE_MEMBERS), start=1):
+            if key in known:
+                label = key
+            else:
+                if is_sensitive_mapping_key(key) or contains_secret_like_text(key):
+                    raise _SensitiveShapeKey
+                label = f"field_{index}"
+            described[label] = _shape_of(member, (*path, label))
+        if len(value) > len(described):
+            described["..."] = f"{len(value) - len(described)} more"
         return described
     if isinstance(value, (list, tuple)):
-        items = [_shape_of(item, depth + 1) for item in list(value)[:2]]
+        items = [_shape_of(item, (*path, "[]")) for item in value[:2]]
         if len(value) > 2:
             items.append(f"...{len(value) - 2} more")
         return items
     if isinstance(value, str):
         return {"type": "str", "len": len(value)}
-    if value is None or isinstance(value, (bool, int, float)):
+    if path in _NUMERIC_STATUS_PATHS and type(value) in (int, float):
         return {"type": type(value).__name__, "value": value}
     return {"type": type(value).__name__}
 
@@ -566,18 +607,13 @@ def _shape_of(value: Any, depth: int = 0) -> Any:
 def _log_response_shape(payload: Mapping[str, Any], model: str) -> None:
     """Note the structure of an envelope this layer did not understand.
 
-    Only the shape is written: key names, value types, sizes and the model's
-    own name.  The point is to tell "the gateway cut the answer off" apart
-    from "the model wrote something else", and that question is answerable
-    from the envelope alone.
-
-    An envelope whose member *names* read as credential-like text is described
-    by its size alone: a description is not a place to write a secret, and the
-    member names are the only part of the shape that came from the provider
-    rather than from this code.
+    The shape and numeric protocol statuses distinguish a truncated envelope from
+    a provider refusal. If a sampled member name resembles a credential, record only the
+    number of top-level members.
     """
-    described = _shape_of(payload)
-    if contains_secret_like_text(described):
+    try:
+        described = _shape_of(payload)
+    except _SensitiveShapeKey:
         described = {"type": type(payload).__name__, "members": len(payload)}
     logging.getLogger(__name__).warning(
         "scope_unsupported_response_shape:%s:%s", model, json.dumps(described, ensure_ascii=False, default=str)

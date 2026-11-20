@@ -162,62 +162,95 @@ def _without_answer_text(content: object) -> bool:
     return False
 
 
-#: Words a provider uses when it declines on its own account -- a spent quota, a plan
-#: limit, an empty balance -- rather than because of what was asked.  The provider
-#: names the reason in the message; this pattern only decides which family the
-#: refusal belongs to.  The ASCII words are bounded by letters and digits rather
-#: than by word boundaries, because a provider writes them as one symbol joined
-#: with underscores -- ``insufficient_quota`` -- and a boundary would not fall
-#: there.  A word written inside another one is not a limit that was reached:
-#: ``unlimited`` says there is none.
-_QUOTA_REFUSAL = re.compile(
-    "\u7528\u91cf|\u989d\u5ea6|\u914d\u989d|\u4f59\u989d"
-    "|(?<![a-z0-9])quotas?(?![a-z0-9])"
-    "|(?<![a-z0-9])limits?(?![a-z0-9])"
-    "|(?<![a-z0-9])limited(?![a-z0-9])"
-    "|(?<![a-z0-9])insufficient(?![a-z0-9])"
-    "|(?<![a-z0-9])balance(?![a-z0-9])",
-    re.IGNORECASE,
+# Native base_resp business codes are distinct from HTTP statuses. Only explicit
+# capacity refusals can refund the work item's attempt.
+_BUSINESS_REFUSALS = {
+    1002: ("provider_quota_exhausted", None),
+    1004: ("http_status", "401"),
+    1008: ("http_status", "402"),
+    1026: ("model_refused", None),
+    1027: ("model_refused", None),
+    2013: ("input_invalid", None),
+    2056: ("provider_quota_exhausted", None),
+    2062: ("provider_quota_exhausted", None),
+}
+_LIMIT_REACHED = r"\s+(?:(?:is|was|has been) )?(?:exceeded|exhausted|reached|depleted)\b"
+_QUOTA = r"(?:quotas?|(?:usage|(?:token )?plan) limits?)"
+_MESSAGE_REFUSALS = (
+    (
+        re.compile(
+            r"\b(?:invalid api key|api key (?:provided )?is invalid|unauthorized|authentication failed)\b"
+            r"|鉴权失败|认证失败"
+        ),
+        ("http_status", "401"),
+    ),
+    (
+        re.compile(r"\binsufficient (?:balance|funds|credits)\b|\bbalance is insufficient\b|余额不足|欠费"),
+        ("http_status", "402"),
+    ),
+    (re.compile(r"\b(?:content filter|sensitive content)\b|内容.{0,4}敏感"), ("model_refused", None)),
+    (
+        re.compile(
+            r"\b(?:context|input|prompt|max tokens)\b.{0,48}\b(?:limit|length|too long|exceed\w*)\b|上下文.{0,8}超"
+        ),
+        ("request_too_large", None),
+    ),
+    (
+        re.compile(
+            rf"\b(?:rate|rpm|tpm|concurrency) limits?{_LIMIT_REACHED}"
+            r"|\b(?:rate limited|too many (?:concurrent )?requests)\b|请求过于频繁|(?:已|触发)限流"
+        ),
+        ("rate_limited", None),
+    ),
+    (
+        re.compile(
+            rf"\b(?:insufficient quota|over quota|{_QUOTA}{_LIMIT_REACHED})\b"
+            rf"|\b(?:exceeded|exhausted|reached) (?:your |the )?(?:current |daily |monthly )?{_QUOTA}\b"
+            r"|(?:配额|额度|用量)(?:已经|已)?(?:不足|用尽|用完|耗尽|满|超限|达上限)"
+        ),
+        ("provider_quota_exhausted", None),
+    ),
 )
+
+# Keep a negation with the reason it qualifies, including lists joined by "nor".
+_MESSAGE_CLAUSE_BREAK = re.compile(
+    r"[,.;，。；\r\n]+|\b(?:but|however|instead)\b|\band (?=(?:the|your|this) )|而是|但是|但"
+)
+_NEGATED_CLAUSE = re.compile(
+    r"\b(?:not|no|never|neither|nor|false|unlimited|ruled out)\b|n['’]t\b|未|没有|并非|不是|并不|不限|无限|排除|误报"
+)
+_RETRACTED_REASON = re.compile(r"\s+(?:is|was)\s+(?:incorrect|wrong)\b")
+
+
+def _message_refusal(message: str) -> tuple[str, str | None]:
+    """Classify a stated reason, preserving the ordinary attempt charge when it is ambiguous."""
+    normalized = message.casefold().replace("_", " ").replace("-", " ")
+    clauses = [clause for clause in _MESSAGE_CLAUSE_BREAK.split(normalized) if not _NEGATED_CLAUSE.search(clause)]
+    # Account and request failures take precedence even if an earlier clause also mentions capacity.
+    for pattern, refusal in _MESSAGE_REFUSALS:
+        for clause in clauses:
+            match = pattern.search(clause)
+            if match and not _RETRACTED_REASON.match(clause, match.end()):
+                return refusal
+    return "provider_error", None
 
 
 def _provider_refusal(payload: Mapping[str, Any]) -> tuple[str, str | None] | None:
-    """The refusal a provider stated in a 200 response, if it stated one.
-
-    Some providers answer HTTP 200 with ``choices: null`` and a ``base_resp`` that
-    says why -- a spent quota, a plan limit.  The request was served and the answer
-    is the provider declining on its own account, not this payload having an
-    unfamiliar shape: read as a shape error it would burn an attempt and fail the
-    item for something that clears by itself within hours.
-
-    The refusal is reported as the code the rest of this layer already knows:
-
-    * a message naming a quota is ``provider_quota_exhausted`` -- a capacity refusal;
-    * a stated HTTP status is that status (``http_429`` and the other capacity
-      refusals recover; ``http_401`` and the other account refusals do not);
-    * anything else the provider declined for is ``provider_error`` -- the provider
-      ran out of road, which this layer cannot name.
-
-    ``None`` means the envelope says nothing about a refusal and the caller should
-    read it as an ordinary shape.
-    """
+    """Read an explicit refusal from an empty chat response without guessing that an unknown error is capacity."""
     choices = payload.get("choices")
-    if isinstance(choices, list) and choices:
-        return None
     base_resp = payload.get("base_resp")
-    if not isinstance(base_resp, Mapping):
+    if (isinstance(choices, list) and choices) or not isinstance(base_resp, Mapping):
         return None
     status = base_resp.get("status_code")
-    message = str(base_resp.get("status_msg") or "")
+    message = base_resp.get("status_msg")
     if status == 0 or (status is None and not message):
-        # A status of zero is this provider's own name for success, and a message
-        # with no status says nothing this layer can read as a refusal.
         return None
-    if _QUOTA_REFUSAL.search(message):
-        return ("provider_quota_exhausted", None)
-    if type(status) is int and 100 <= status <= 599:
-        return ("http_status", str(status))
-    return ("provider_error", None)
+    if type(status) is int:
+        if 100 <= status <= 599:
+            return "http_status", str(status)
+        if status in _BUSINESS_REFUSALS:
+            return _BUSINESS_REFUSALS[status]
+    return _message_refusal(message) if isinstance(message, str) else ("provider_error", None)
 
 
 def _extract_chat_content(payload: Mapping[str, Any]) -> str:

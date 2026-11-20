@@ -37,10 +37,6 @@ CAPACITY_REFUSALS = frozenset(
         # payload is fine and the refusal clears by itself, so it is a capacity refusal
         # like the ones above: the attempt is refunded and the item is asked later.
         "provider_quota_exhausted",
-        # The same envelope without a quota reading: the provider declined for a reason
-        # of its own that this layer cannot name.  It is still the provider's capacity
-        # to serve, not this payload's shape, so it recovers the same way.
-        "provider_error",
     }
 )
 #: Provider answers that mean "send less traffic".  The recoverable set says whether an item may be retried; this one
@@ -115,7 +111,7 @@ _PORT_REJECTIONS = frozenset({"DERIVATION_INVALID", "INPUT_INVALID"})
 #: Provider failures that keep the ordinary retry limit for a candidate evaluation already asked.  Invalid output and
 #: an uncertain timeout or crash do not: the at-most-once fence must not be cleared by a failure whose effect is
 #: unknown.
-_CANDIDATE_REJECTIONS = CAPACITY_REFUSALS | {"http_500"}
+_CANDIDATE_REJECTIONS = CAPACITY_REFUSALS | {"http_500", "provider_error"}
 #: Inbox rows a replay still stores, besides those never tried: a passing failure (``INGRESS_PASSING_ERRORS``), a row
 #: from before the missing source was named, or a key another message already took (``resolve_conflicted_ingress``
 #: stores it under a new key).  Any other code is terminal; the row stays for inspection only.

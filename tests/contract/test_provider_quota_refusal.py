@@ -1,4 +1,4 @@
-"""A provider that refuses on its own account is a capacity refusal, not an unfamiliar shape."""
+"""Provider refusals in successful HTTP envelopes follow the same policy as transport-level refusals."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from scope_recall.core.failure_policy import (
     RATE_LIMITED_ERRORS,
     retryable,
 )
+from scope_recall.core.work_storage import MAX_RECOVERABLE_ATTEMPTS
 from scope_recall.core.worker_outcomes import model_exception_outcome
 from scope_recall.runtime.auxiliary import build_auxiliary_runtime
 from scope_recall.runtime.models import AuxiliaryModelError
@@ -23,7 +24,7 @@ QUOTA_CODE = "provider_quota_exhausted"
 ERROR_CODE = "provider_error"
 
 
-def _envelope(status_msg: str, status_code: int = 429) -> bytes:
+def _envelope(status_msg: str, status_code: int) -> bytes:
     """A 200 answer in which the provider declines and says why."""
     return json.dumps(
         {"choices": None, "base_resp": {"status_code": status_code, "status_msg": status_msg}},
@@ -31,7 +32,7 @@ def _envelope(status_msg: str, status_code: int = 429) -> bytes:
     ).encode("utf-8")
 
 
-def _refusal(tmp_path, monkeypatch, status_msg: str, status_code: int = 429) -> AuxiliaryModelError:
+def _refusal(tmp_path, monkeypatch, status_msg: str, status_code: int = 9999) -> AuxiliaryModelError:
     config, _ledger, _ = _runtime_config(tmp_path)
     monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "TEST-key")
     transport = FakeTransport(lambda **kwargs: (200, _envelope(status_msg, status_code)))
@@ -50,7 +51,6 @@ def _refusal(tmp_path, monkeypatch, status_msg: str, status_code: int = 429) -> 
         pytest.param("insufficient_quota", QUOTA_CODE, id="english-quota"),
         pytest.param("QUOTA_EXCEEDED", QUOTA_CODE, id="english-quota-joined"),
         pytest.param("Token Plan limit reached", QUOTA_CODE, id="plan-limit"),
-        pytest.param("insufficient funds for this plan", QUOTA_CODE, id="quota-by-other-word"),
     ],
 )
 def test_a_provider_refusal_in_a_200_answer_is_named(tmp_path, monkeypatch, status_msg, expected):
@@ -83,6 +83,50 @@ def test_an_account_refusal_keeps_its_own_meaning(tmp_path, monkeypatch):
     refusal = _refusal(tmp_path, monkeypatch, "invalid api key", 401)
     assert refusal.error_type == "http_status"
     assert model_exception_outcome(refusal) == ("failed", "http_401")
+
+
+@pytest.mark.parametrize(
+    "status,message,outcome",
+    [
+        (402, "quota exceeded", ("failed", "http_402")),
+        (400, "context limit exceeded", ("failed", "http_400")),
+        (1004, "access denied", ("failed", "http_401")),
+        (1008, "insufficient balance", ("failed", "http_402")),
+        (9999, "insufficient funds for this plan", ("failed", "http_402")),
+        (1027, "output content flagged", ("failed", "model_refused")),
+        (2013, "invalid parameters", ("failed", "input_invalid")),
+        (9999, "input exceeds context length limit", ("failed", "request_too_large")),
+        (1002, "busy", ("retry", QUOTA_CODE)),
+        (2056, "usage limit exceeded", ("retry", QUOTA_CODE)),
+        (9999, "You exceeded your current quota, please check your plan and billing details.", ("retry", QUOTA_CODE)),
+        (9999, "今日额度已用完，请明天再试", ("retry", QUOTA_CODE)),
+        (9999, "API rate limit exceeded for this organization", ("retry", "rate_limited")),
+        (9999, "RPM rate limit exceeded", ("retry", "rate_limited")),
+        (9999, "请求过于频繁，触发限流", ("retry", "rate_limited")),
+        (9999, "Your account balance is insufficient", ("failed", "http_402")),
+        (9999, "The API key provided is invalid", ("failed", "http_401")),
+        (9999, "unexpected provider refusal", ("retry", ERROR_CODE)),
+        (9999, "quota metadata unavailable", ("retry", ERROR_CODE)),
+        (9999, "unsupported rate limit option", ("retry", ERROR_CODE)),
+        (9999, "invalid parameter; the account is not rate limited", ("retry", ERROR_CODE)),
+        (9999, "rate limited: false", ("retry", ERROR_CODE)),
+        (9999, "No quota exceeded for this account", ("retry", ERROR_CODE)),
+        (9999, "Quota exhausted = false", ("retry", ERROR_CODE)),
+        (9999, "Quota exceeded is incorrect", ("retry", ERROR_CODE)),
+        (9999, "已排除额度不足", ("retry", ERROR_CODE)),
+        (9999, "今日额度未用完", ("retry", ERROR_CODE)),
+        (9999, "不是额度不足，是认证失败", ("failed", "http_401")),
+        (9999, "不是额度不足而是认证失败", ("failed", "http_401")),
+        (9999, "Not rate limited but the API key provided is invalid", ("failed", "http_401")),
+        (9999, "Not rate limited and the API key provided is invalid", ("failed", "http_401")),
+        (9999, "Authentication failed was incorrect; quota exhausted", ("retry", QUOTA_CODE)),
+        (9999, "Neither rate limited nor quota exhausted", ("retry", ERROR_CODE)),
+        (9999, "Neither rate limited, nor quota exhausted; authentication failed", ("failed", "http_401")),
+        (9999, "并非触发限流，但是今日额度已用完", ("retry", QUOTA_CODE)),
+    ],
+)
+def test_provider_refusals_keep_their_queue_policy(tmp_path, monkeypatch, status, message, outcome):
+    assert model_exception_outcome(_refusal(tmp_path, monkeypatch, message, status)) == outcome
 
 
 def test_a_declining_provider_that_names_no_status_is_a_provider_error(tmp_path, monkeypatch):
@@ -146,3 +190,40 @@ def test_a_quota_refusal_clears_the_candidate_attempt_fence(app):
     assert port.calls == 2
     _, evaluations, _work = _candidate_rows(core)
     assert evaluations[0]["failure_code"] == QUOTA_CODE
+
+
+@pytest.mark.parametrize(
+    "message,code,expected_work",
+    [
+        ("cannot serve", ERROR_CODE, (MAX_RECOVERABLE_ATTEMPTS, "failed", MAX_RECOVERABLE_ATTEMPTS)),
+        ("已排除额度不足，实际是认证失败", "http_401", (1, "pending", 0)),
+        ("Quota exceeded is incorrect; authentication failed", "http_401", (1, "pending", 0)),
+        ("Quota exceeded; the API key provided is invalid", "http_401", (1, "pending", 0)),
+    ],
+)
+def test_unknown_and_account_refusals_stay_out_of_capacity_retries(
+    app, tmp_path, monkeypatch, message, code, expected_work
+):
+    """Account refusals park for account recovery; unknown refusals spend the ordinary retry budget."""
+    core, ctx = app
+    _candidate(core, ctx)
+    _finish_source_work(core)
+    refusal = _refusal(tmp_path, monkeypatch, message)
+
+    class Declined:
+        calls = 0
+
+        def evaluate_candidate(self, candidate, sources, *, remaining_seconds):
+            self.calls += 1
+            raise refusal
+
+    port = Declined()
+    for _ in range(MAX_RECOVERABLE_ATTEMPTS + 2):
+        core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=port)
+        moment = datetime.fromisoformat(core.clock.now.replace("Z", "+00:00")) + timedelta(minutes=10)
+        core.clock.now = moment.isoformat().replace("+00:00", "Z")
+    _, evaluations, work = _candidate_rows(core)
+    assert evaluations[0]["failure_code"] == code
+    assert (port.calls, work[0]["state"], work[0]["attempt"]) == expected_work
+    assert "capacity:" not in work[0]["last_error_code"]
+    assert code not in RATE_LIMITED_ERRORS
