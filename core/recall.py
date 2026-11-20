@@ -12,7 +12,7 @@ from typing import Protocol, cast
 from ..contracts import ContractError, utc_timestamp
 from . import private
 from .adoption_storage import adopted_source
-from .auto_recall import automatic_recall_skip_reason
+from .auto_recall import automatic_recall_route
 from .background_context import background_candidates, current_task_candidate
 from .claim_storage import parse_source_ref
 from .claims import canonical_time
@@ -743,7 +743,9 @@ class RetrievalPipeline:
         # aside in ``aside.echoes`` to lead to its turn's replies, never delivered.
         question = context.query if original_query is None else original_query
         if context.mode == "auto" and obj.kind == "event":
-            if same_message(obj.content, question):
+            if same_message(obj.content, question) or (
+                context.original_prompt is not None and same_message(obj.content, context.original_prompt)
+            ):
                 if aside is not None:
                     aside.echoes.append(candidate)
                 note_candidate(candidate, "current_prompt")
@@ -1106,7 +1108,7 @@ class RetrievalPipeline:
                 snapshot(tx, working)
                 epoch = self.storage_reader.epoch(tx)
                 if working.automatic_injection and not working.focus_refs:
-                    reason = automatic_recall_skip_reason(
+                    route = automatic_recall_route(
                         working.query,
                         tx=tx,
                         context=working.trusted_context,
@@ -1114,8 +1116,21 @@ class RetrievalPipeline:
                         deadline=working.deadline,
                         clock=self.clock,
                     )
-                    if reason is not None:
-                        return _empty_result(working, f"auto_recall_skipped:{reason}")
+                    if route == "current_task_only":
+                        task = current_task_candidate(tx, working, self.storage_reader, self.clock, project_only=True)
+                        if task is None:
+                            # The host can ask which task to resume without sending a broad vector query.
+                            empty = _empty_result(working, "auto_recall_skipped:unanchored_followup")
+                            return replace(empty, unmet_needs=unmet_needs(working.query, ()))
+                        # A unique grounded task is the only evidence the prompt identifies.
+                        # It still passes ordinary privacy, budget and final release checks.
+                        candidate, obj = task
+                        ranked, items, _ = self._select(
+                            tx, working, [(replace(candidate, source="relation"), obj)], gaps, include_background=False
+                        )
+                        return self._result(working, epoch, ranked, items, gaps, 1, 1, working.query)
+                    if route is not None:
+                        return _empty_result(working, f"auto_recall_skipped:{route}")
                 with timings.measure("prefetch"):
                     prefetched = self._prefetch_query(working)
                 working = self._scoped(tx, working, gaps)
@@ -1409,7 +1424,13 @@ class RetrievalPipeline:
         ]
 
     def _select(
-        self, tx, working: SearchContext, hydrated: list[tuple[CandidateRef, RetrievedObject]], gaps: list[str]
+        self,
+        tx,
+        working: SearchContext,
+        hydrated: list[tuple[CandidateRef, RetrievedObject]],
+        gaps: list[str],
+        *,
+        include_background: bool = True,
     ):
         """Rank, fold duplicate bodies, fit the item budget, then add background."""
         # Distinct *content*, not distinct rows: candidates are already unique
@@ -1447,7 +1468,7 @@ class RetrievalPipeline:
         )
         note_removed(pool, ranked, "budget")
         query_items = tuple(obj for _candidate, obj in ranked)
-        if working.mode == "auto" and self._remaining(working) > 0:
+        if include_background and working.mode == "auto" and self._remaining(working) > 0:
             if ranked and all(estimate_tokens(obj.content) > working.limits.budget_tokens for _c, obj in ranked):
                 # Nothing that fits answered (as when the only hit that fits is a message the model still holds): one
                 # hit too large for any packet stays as an expansion hint. The

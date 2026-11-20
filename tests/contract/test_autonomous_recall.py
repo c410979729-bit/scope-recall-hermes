@@ -35,9 +35,16 @@ def test_resume_has_no_cross_task_guess_or_extra_rounds(app):
     core.recall_pipeline = RetrievalPipeline(
         core.storage, vector_port=vectors, clock=core.clock, storage_reader=LexicalBlockedStorage(clock=core.clock)
     )
-    result = core.recall(replace(ctx, session_id="TEST-fresh-resume"), recall_request(query="继续"))
+    fresh = replace(ctx, session_id="TEST-fresh-resume")
+    result = core.recall(fresh, recall_request(query="继续"))
     assert result.items == ()
     assert "resume_state" in result.unmet_needs
+    assert not vectors.calls
+
+    # An explicit lookup still gets the ordinary query and its single directed follow-up.
+    explicit = core.recall(fresh, recall_request(query="继续"), background_without_evidence=False)
+    assert explicit.items == ()
+    assert "resume_state" in explicit.unmet_needs
     assert len(vectors.calls) == 2
 
 

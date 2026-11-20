@@ -176,6 +176,9 @@ class SearchContext:
     packet_selection: bool = False
     #: Host text attested by the trusted adapter, never supplied by a model request.
     host_memory_entries: tuple[str, ...] | frozenset[str] = ()
+    #: The full sanitized prompt when an ambient search uses just its topic.
+    #: A previous copy of either wording must still be recognized as an echo.
+    original_prompt: str | None = None
 
     @property
     def automatic_injection(self) -> bool:

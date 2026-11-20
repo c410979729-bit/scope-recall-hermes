@@ -6,7 +6,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from scope_recall.core.auto_recall import automatic_recall_skip_reason
+from scope_recall.core.auto_recall import automatic_query_topic, automatic_recall_skip_reason
 from scope_recall.core.recall_policy import RecallPolicy, numbered_link_conflict, numbered_links, rrf_score
 from scope_recall.core.retrieval import CandidateRef, SearchContext
 
@@ -235,16 +235,133 @@ def test_mid_session_conversation_starts_no_embedding_or_search(tmp_path, monkey
     assert vectors.calls == []
 
 
-def test_first_prompt_continues_grounded_task_after_current_prompt_capture(app):
+@pytest.mark.parametrize("query", ["继续", "还有什么没做完的吗？", "这个如何修"])
+def test_first_prompt_continues_grounded_task_after_current_prompt_capture(app, query):
     core, ctx = app
     ctx = replace(ctx, task_anchor="TEST-active-task")
     episode = task(core, ctx, "TEST 海报排版还未完成")
     fresh = replace(ctx, session_id="TEST-new-session", task_anchor=None)
     _capture(core, fresh, "notice", "A synthetic assistant notice.", origin="assistant_visible")
-    current = _capture(core, fresh, "first", "继续")
-    result = core.recall_packet(fresh, recall_request(query="继续"), current_source_refs=(f"{current.ref}@1",))
+    current = _capture(core, fresh, "first", query)
+    result = core.recall_packet(fresh, recall_request(query=query), current_source_refs=(f"{current.ref}@1",))
     assert episode.ref in {item["ref"] for item in result["items"]}
     assert not any(gap.startswith("auto_recall_skipped:") for gap in result["gaps"])
+
+
+def test_first_unfinished_question_requires_one_grounded_task_in_its_project(app):
+    core, ctx = app
+    query = "还有什么没做完的吗？"
+    reader = replace(ctx, session_id="TEST-new-session")
+    for project in (None, "TEST-other-project"):
+        task(core, replace(ctx, project_id=project, task_anchor="TEST-foreign"), "TEST unrelated translation")
+    assert not core.recall_packet(reader, recall_request(query=query))["items"]
+    first = task(core, replace(ctx, task_anchor="TEST-layout"), "TEST layout still needs approval")
+    packet = core.recall_packet(reader, recall_request(query=query))
+    assert [item["ref"] for item in packet["items"]] == [first.ref]
+    assert not core.recall_packet(reader, recall_request(query="测试，在吗？"))["items"]
+    task(core, replace(ctx, task_anchor="TEST-colour"), "TEST colour still needs approval")
+    assert not core.recall_packet(reader, recall_request(query=query))["items"]
+
+
+def test_exact_task_anchor_survives_a_crowded_project(app):
+    core, ctx = app
+    target = replace(ctx, task_anchor="TEST-layout")
+    episode = task(core, target, "TEST verify the poster layout")
+    for index in range(24):
+        task(core, replace(ctx, task_anchor=f"TEST-other-{index}"), f"TEST inspect pump {index}")
+    reader = replace(target, session_id="TEST-new-session")
+    query = recall_request(query="还有什么没做完的吗？")
+    assert [item["ref"] for item in core.recall_packet(reader, query)["items"]] == [episode.ref]
+    assert not core.recall_packet(replace(reader, task_anchor="TEST-new-anchor"), query)["items"]
+
+
+def test_two_grounded_segments_for_the_same_anchor_are_ambiguous(app, monkeypatch):
+    from scope_recall.core.episode_storage import Episodes
+
+    core, ctx = app
+    anchored = replace(ctx, task_anchor="TEST-layout")
+    task(core, anchored, "TEST verify the poster dimensions")
+    # Advance to the next real segment without capturing 200 unrelated events.
+    monkeypatch.setattr(Episodes, "_segment_index", lambda self, series: 1)
+    task(core, anchored, "TEST prepare the print proof")
+    reader = replace(anchored, session_id="TEST-new-session")
+    assert not core.recall_packet(reader, recall_request(query="继续"))["items"]
+
+
+@pytest.mark.parametrize("prompt", ["还有什么没做完的吗？", "继续"])
+def test_first_followup_uses_the_host_directory_when_each_session_has_its_own_task_anchor(app, prompt):
+    core, ctx = app
+    old = replace(ctx, project_id=None, task_anchor="TEST-old-session-task", project_root="/test/orchard")
+    reader = replace(old, session_id="TEST-new-session", task_anchor="TEST-new-session-task")
+    episode = task(core, old, "TEST verify the poster dimensions")
+    task(core, replace(old, project_root="/test/orchard-two", task_anchor="TEST-other"), "TEST replace pump")
+    query = recall_request(query=prompt)
+    assert [item["ref"] for item in core.recall_packet(reader, query)["items"]] == [episode.ref]
+    assert not core.recall_packet(replace(reader, project_identity="unverified"), query)["items"]
+    assert not core.recall_packet(replace(reader, project_identity="remote"), query)["items"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "这个如何修",
+        "那怎么修这个问题？",
+        "How do we fix this?",
+        "还有什么没做完的吗？",
+        "测试，在吗？",
+        "全部停止！然后升级",
+    ],
+)
+def test_unanchored_prompt_does_not_inject_another_tasks_strong_match(tmp_path, query):
+    core, ctx, vectors = _app(tmp_path)
+    unrelated = _capture(core, ctx, "past-task", "旧任务：修理水泵以后，升级温室控制器。")
+    vectors.candidates = (_candidate(unrelated, score=0.99),)
+    for reader in (ctx, replace(ctx, session_id="fresh")):
+        packet = core.recall_packet(reader, recall_request(query=query))
+        assert not packet["items"], packet["items"]
+        assert "auto_recall_skipped:unanchored_followup" in packet["gaps"]
+    assert not vectors.calls
+    explicit = core.recall_packet(ctx, recall_request(query=query), background_without_evidence=False)
+    assert unrelated.ref in {item["ref"] for item in explicit["items"]}
+
+
+@pytest.mark.parametrize("status_first", [True, False])
+def test_mixed_prompt_searches_its_topic_and_keeps_a_cross_session_answer(tmp_path, status_first):
+    core, ctx, vectors = _app(tmp_path)
+    status, topic = "还有什么没做完的吗？", "白鹭温室的喷头压力是多少？"
+    query = status + topic if status_first else topic + status
+    wrong = _capture(core, ctx, "unrelated-status", "还有什么没做完的吗？旧画册的插图没做完。")
+    echo = _capture(core, ctx, "old-question", query)
+    answer = _capture(core, ctx, "greenhouse", "白鹭温室的喷头压力是四十千帕。")
+    packet = core.recall_packet(replace(ctx, session_id="new-reader"), recall_request(query=query))
+    assert vectors.calls[0]["query"] == "白鹭温室的喷头压力是多少？"
+    refs = {item["ref"] for item in packet["items"]}
+    assert answer.ref in refs
+    assert refs.isdisjoint({wrong.ref, echo.ref})
+    vectors.calls.clear()
+    core.recall_packet(ctx, recall_request(query=query), background_without_evidence=False)
+    assert vectors.calls[0]["query"] == query
+
+
+@pytest.mark.parametrize(
+    "query,topic",
+    [
+        ("这个如何修复 Atlas？", "这个如何修复 Atlas？"),
+        ("怎么修这个问题，别动 core/recall.py？", "怎么修这个问题，别动 core/recall.py？"),
+        ("这个怎么修？只看 https://board.example/tickets/17", "这个怎么修？只看 https://board.example/tickets/17"),
+        ("白鹭温室用什么系统？然后升级。", "白鹭温室用什么系统？然后升级。"),
+        ("上次温室排水是怎么修的？", "上次温室排水是怎么修的？"),
+        ("测试环境的端口是多少？", "测试环境的端口是多少？"),
+        ("白鹭温室漏水了。怎么修这个问题？", "白鹭温室漏水了。怎么修这个问题？"),
+        ("Great.Basin is the project name", "Great.Basin is the project name"),
+        ("Thanks. .env.example is missing", ".env.example is missing"),
+        ("好的。/opt/orchard 如何安装？", "好的。/opt/orchard 如何安装？"),
+        ("OK, see https://board.example/t/17?a=1&b=2#Here", "see https://board.example/t/17?a=1&b=2#Here"),
+    ],
+)
+def test_conversational_prefix_preserves_the_literal_topic(query, topic):
+    assert automatic_query_topic(query) == topic
+    assert automatic_recall_skip_reason(query) is None
 
 
 @pytest.mark.parametrize("ending", ["", "!"])
@@ -351,16 +468,24 @@ def test_input_only_skips_need_no_session(query, reason):
     assert automatic_recall_skip_reason(query) == reason
 
 
-def test_a_fresh_session_checks_only_a_bounded_indexed_scope_window(tmp_path):
+@pytest.mark.parametrize("indexed", [True, False], ids=["session-index", "before-index-initialization"])
+def test_session_probe_finds_the_prior_turn_despite_another_sessions_traffic(tmp_path, indexed):
+    from scope_recall.core.schema import SOURCE_SESSION_INDEX
+
     _, ctx, _ = _app(tmp_path)
     with sqlite3.connect(":memory:") as conn:
         conn.execute("""CREATE TABLE source_events(scope_id, occurred_at, event_id, source_revision,
                      session_id, entry_id, role, source_original_origin, origin,
-                     project_id, branch_id, read_blocked)""")
+                     project_id, branch_id, read_blocked, content_sha256)""")
         conn.execute("""CREATE INDEX source_scope_time
                      ON source_events(scope_id,occurred_at,event_id,source_revision)""")
+        if indexed:
+            conn.execute(SOURCE_SESSION_INDEX)
+        conn.execute("CREATE INDEX source_content ON source_events(scope_id,role,content_sha256)")
+        insert = """INSERT INTO source_events(scope_id,occurred_at,event_id,source_revision,session_id,entry_id,
+            role,source_original_origin,origin,project_id,branch_id,read_blocked) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"""
         conn.executemany(
-            "INSERT INTO source_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            insert,
             (
                 (
                     "TEST-scope",
@@ -383,7 +508,16 @@ def test_a_fresh_session_checks_only_a_bounded_indexed_scope_window(tmp_path):
         conn.set_progress_handler(lambda: steps.append(1) or 0, 100)
         tx = SimpleNamespace(_check=lambda: conn)
         assert automatic_recall_skip_reason("继续", tx=tx, context=ctx) is None
-        assert len(steps) < 150, "a first prompt must not scan every earlier human message in its scope"
+        if indexed:
+            assert len(steps) < 150, "a first prompt must not scan every earlier human message in its scope"
+        conn.execute(
+            insert,
+            ("TEST-scope", "", "TEST-earlier", 1, ctx.session_id, "local", "user", None, "human_direct", None, None, 0),
+        )
+        steps.clear()
+        assert automatic_recall_skip_reason("还有什么没做完的吗？", tx=tx, context=ctx) == "unanchored_followup"
+        if indexed:
+            assert len(steps) < 150
 
 
 def test_session_probe_obeys_the_deadline_and_releases_its_handler(tmp_path):

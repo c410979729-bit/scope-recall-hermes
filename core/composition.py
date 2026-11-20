@@ -825,6 +825,12 @@ class MemoryCore:
         trace = CURRENT_TRACE.get()
         if trace is not None:
             trace.context = search_context
+        if search_context.automatic_injection and not search_context.focus_refs:
+            from .auto_recall import automatic_query_topic
+
+            topic = automatic_query_topic(search_context.query)
+            if topic != search_context.query:
+                search_context = replace(search_context, query=topic, original_prompt=search_context.query)
         return search_context, effective_deadline
 
     @logged_recall
