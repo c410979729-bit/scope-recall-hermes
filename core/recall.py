@@ -44,7 +44,7 @@ from .recall_policy import (
     rrf_score,
     same_message,
 )
-from .recall_restatement import has_conversation_summaries, prefer_originals
+from .recall_restatement import has_conversation_summaries, prefer_originals, repeated_report_claims
 from .recall_scope import asks_what_held_before, asks_what_was_said, query_scope, query_time
 from .recall_trace import note_candidate, note_removed, snapshot
 from .retrieval import (
@@ -978,11 +978,17 @@ class RetrievalPipeline:
         # Diversity rescoring visits a candidate repeatedly; its immutable
         # evidence roots need parsing only once for this admitted pool.
         roots_by_key = {candidate.key: evidence_roots(obj) for candidate, obj in ranked}
+        copies = repeated_report_claims(tx, ranked, context, matched)
+        # Multiple channels can nominate the same report under several labels. A
+        # later copy keeps its best channel rank, without counting their votes again.
+        fusion_caps = {
+            c.key: min(c.fusion_score, rrf_score((c.rank,), k=self.policy.rrf_k)) for c, _ in ranked if c.key in copies
+        }
         selected: list[tuple[CandidateRef, RetrievedObject]] = []
         covered: set[str] = set()
         selected_roots: set[str] = set()
 
-        def score(pair):
+        def score(pair: tuple[CandidateRef, RetrievedObject]) -> tuple[bool, float]:
             candidate, obj = pair
             hits = matched[candidate.key]
             roots = roots_by_key[candidate.key]
@@ -996,7 +1002,9 @@ class RetrievalPipeline:
             weight = CONTEXT_ONLY_WEIGHT if candidate.key in context_only else 1.0
             return (
                 candidate.source == "exact_ref",
-                candidate.fusion_score + weight * (0.008 * relevance + 0.008 * additional) - 0.006 * repeated,
+                fusion_caps.get(candidate.key, candidate.fusion_score)
+                + weight * (0.008 * relevance + 0.008 * additional)
+                - 0.006 * repeated,
             )
 
         while ranked:

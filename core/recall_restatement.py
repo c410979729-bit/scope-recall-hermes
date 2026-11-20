@@ -8,13 +8,15 @@ from dataclasses import dataclass, replace
 
 from ..contracts import ContractError
 from . import lineage
+from .background_context import is_background
 from .claim_storage import parse_source_ref
 from .claims import canonical_time
 from .deadline import RequestDeadline
 from .events import lexical_terms
-from .recall_needs import statement_text
-from .retrieval import CandidateRef, RetrievedObject, optional_json
-from .retrieval_hydration import RetrievalHydration, replacements
+from .recall_needs import asks_to_resume, statement_text
+from .recall_scope import asks_what_held_before
+from .retrieval import CandidateRef, RetrievedObject, SearchContext, optional_json
+from .retrieval_hydration import RetrievalHydration, readable_sources, replacements
 from .source_records import StoredSource
 from .summary_validity import CONVERSATION_SUMMARY_REASONS
 from .visibility import allowed
@@ -37,6 +39,83 @@ def same_statement(first: str, second: str) -> bool:
     """Compare two complete statements without ignoring negation or conditions."""
     body = normalized_statement(first)
     return bool(body) and body == normalized_statement(second)
+
+
+def _report_witnesses(tx, obj: RetrievedObject, context: SearchContext, owner_snapshot: dict):
+    """Yield identities under which two entries can attest the same complete, readable human report."""
+    sources = readable_sources(tx, obj, context)
+    if len(sources) != 1:
+        return
+    source = sources[0]
+    principal = source.event.get("source_principal", {})
+    if not (
+        source.event["capture_state"] == "complete"
+        and "segment" not in source.event
+        and source.event["role"] == "user"
+        and source.event["origin"] == "human_direct"
+        and principal.get("resolution") == "verified"
+        and principal.get("kind") == "human"
+        and principal.get("principal_ref")
+    ):
+        return
+    # Two sources may quote the same words in different messages. Only the complete
+    # witnessed body, speaker and project can establish that both entries saw the same report.
+    report = (
+        source.scope_id,
+        source.project_id,
+        source.branch_id,
+        source.project_root,
+        source.project_identity,
+        source.content_sha256,
+    )
+    yield (report, "principal", principal["principal_ref"]), source.entry_id
+    resolve = context.trusted_context.owner_resolver
+    if resolve and (owner := resolve(source.entry_id, principal, owner_snapshot)):
+        yield (report, "owner", owner), source.entry_id
+
+
+def repeated_report_claims(tx, ranked: list[Pair], context: SearchContext, matched: dict) -> set:
+    """Find later captures of a single report that add no query terms to a better-ranked claim."""
+    if (
+        tx is None
+        or context.trusted_context.binding.installation_kind != "shared"
+        or context.mode not in {"auto", "current"}
+        or context.time
+        or context.scope
+        or context.focus_refs
+        or asks_to_resume(context.query)
+        or asks_what_held_before(context.query)
+    ):
+        return set()
+    if any(candidate.source == "exact_ref" for candidate, _obj in ranked):
+        return set()
+    groups = defaultdict(list)
+    owner_snapshot = {}
+    query = context.query.casefold()
+    for candidate, obj in ranked:
+        if obj.kind != "claim" or obj.origin != "human_direct" or is_background(obj) or len(obj.evidence_refs) != 1:
+            continue
+        metadata = dict(obj.metadata)
+        if metadata.get("state") not in {"active", "proposed"}:
+            continue
+        # Hydration admits only the effective version or the unpromoted head.
+        # A proposal can quote different words of the same report and keeps its qualification.
+        payload = optional_json(metadata.get("payload_json"))
+        predicate = payload.get("predicate") if isinstance(payload, dict) else None
+        if not isinstance(predicate, str) or not predicate:
+            continue
+        for witness, entry in _report_witnesses(tx, obj, context, owner_snapshot):
+            groups[witness].append((candidate.key, entry, predicate.casefold() in query))
+    repeated = set()
+    for members in groups.values():
+        if len({entry for _, entry, _ in members}) < 2:
+            continue
+        covered = set(matched[members[0][0]])
+        for key, _, named in members[1:]:
+            if not named and matched[key] <= covered:
+                repeated.add(key)
+            covered.update(matched[key])
+    return repeated
 
 
 def host_memory_duplicate(obj: RetrievedObject, entries: frozenset[str] | tuple[str, ...]) -> bool:

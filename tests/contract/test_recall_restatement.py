@@ -11,16 +11,123 @@ from scope_recall.adapters.clients.identity import resolve_runtime_audience, tru
 from scope_recall.adapters.hermes.shared_entries import attach_shared_record, client_entry_record, read_shared_payload
 from scope_recall.adapters.runtime_wiring import render_host_recall_context
 from scope_recall.contracts import TrustedSourcePrincipal
-from scope_recall.core import recall_restatement
+from scope_recall.core import events, recall_restatement
 from scope_recall.core.deadline import RequestDeadline, using_request_deadline
+from scope_recall.core.events import lexical_terms
+from scope_recall.core.recall_needs import statement_text
 from scope_recall.core.recall_packet import RecallPacketCompiler, packet_item, render_recall_packet_context
-from scope_recall.core.recall_restatement import mark_restatement, prefer_originals
+from scope_recall.core.recall_policy import meaningful_query_terms
+from scope_recall.core.recall_restatement import mark_restatement, prefer_originals, repeated_report_claims
 from scope_recall.core.retrieval import CandidateRef, SearchContext
 
-from tests.contract.test_claims import draft
-from tests.contract.test_recall_selection import restatement_store
+from tests.contract.test_claims import accept, capture, draft, revise_request
+from tests.contract.test_recall_admission import DeterministicVectors, _candidate, _claim_candidate
+from tests.contract.test_recall_selection import restatement_assistant, restatement_store
 from tests.host.codex.test_shared_client import store as client_store
 from tests.v11_support import recall_request, replay_capture_inbox, source_event
+
+
+@pytest.mark.parametrize("vector_hints", [False, True], ids=["lexical", "hybrid"])
+@pytest.mark.parametrize("per_host", [False, True], ids=["shared-id", "host-ids"])
+def test_repository_link_survives_five_entries_announcing_the_same_plan(restatement_store, vector_hints, per_host):
+    """One active decision and sixteen proposals share a report; the separate address fits the first five."""
+    core, contexts = restatement_store
+    entries = ("entry-a", "entry-b", "entry-c", "entry-d", "entry-e")
+    principals = {
+        entry: TrustedSourcePrincipal("human", "verified", f"principal:human:TEST-{entry}") for entry in entries
+    }
+
+    def owner(entry, principal, memo):
+        if entry in principals and (principal is None or principal == principals[entry].to_payload()):
+            return "TEST-installation-owner"
+        return None
+
+    reader = (
+        replace(contexts[0], owner_resolver=owner, source_principal=principals[entries[0]]) if per_host else contexts[0]
+    )
+    with core.storage.write(reader) as tx:
+        for entry in entries[3:]:
+            tx.registry.register_entry(entry, entry, "hermes", now=core.clock.utc_now())
+    notice = (
+        "TEST-project 的新仓库将在新账号下创建，仓库建好后再提供地址。"
+        "各入口收到的是同一份迁移通知。已有讨论和待处理事项都在现有工作区里，通知中的项目名称也保持一致。"
+        "新账号准备完成后会另发一条带完整链接的确认消息，届时以那条确认消息中的地址为准。"
+        "当前这份说明只记录迁移的决定、登记顺序和通知范围。"
+    )
+    predicates = ("新仓库建仓计划", "新仓库计划", "仓库迁移计划", "仓库归属", "新仓库安排")
+    hints = []
+    notices = []
+    for index, (entry, predicate) in enumerate(zip(entries, predicates, strict=True)):
+        actor = replace(
+            reader,
+            entry_id=entry,
+            session_id=f"{entry}-session",
+            source_principal=principals[entry] if per_host else reader.source_principal,
+        )
+        source = capture(core, actor, notice, when=f"2026-09-01T12:00:0{index}Z")
+        quote = ("将在新账号下创建", "同一份迁移通知", "现有工作区", "新账号准备完成", "通知范围")[index]
+        proposal = draft(
+            source,
+            ("将在新账号下创建", "迁往新账户", "筹建迁移仓", "归入新账号", "另设仓库")[index],
+            predicate=predicate,
+            quote_override=quote,
+            conditions=[f"入口{index}收到通知时"] if index else [],
+        )
+        start = notice.index(quote)
+        proposal["evidence_spans"][0].update(start=start, end=start + len(quote))
+        decision = accept(core, actor, proposal).items[0]
+        assert decision.state == ("proposed" if index else "active")
+        notices.append(_claim_candidate(decision))
+        for variant in range(3 if index < 2 else 2):
+            alternate = dict(proposal, value_text=f"迁移安排第{variant}项", conditions=[f"第{index}入口第{variant}项"])
+            item = accept(core, actor, alternate).items[0]
+            assert item.state == "proposed"
+            notices.append(_claim_candidate(item))
+        saved = core.record_event(
+            restatement_assistant(actor),
+            source_event(
+                source_event_key=f"TEST-repository-echo/{entry}",
+                content=f"我理解的{predicate}是：{notice}",
+                role="assistant",
+                origin="assistant_visible",
+                occurred_at="2026-09-01T12:05:00Z",
+            ),
+            scope_id="TEST-scope",
+        )
+        echo = core.source(actor, saved.event_refs[0].ref, 1)
+        pending = accept(core, actor, draft(echo, "将在新账号下创建", predicate=f"{predicate}转述")).items[0]
+        assert pending.state == "proposed"
+        hints.extend((_claim_candidate(pending), _candidate(source)))
+    former = capture(core, reader, "TEST-project 仓库账号是 TEST-old。")
+    old = accept(core, reader, draft(former, "TEST-old", predicate="仓库账号", kind="fact")).items[0]
+    updated = capture(core, reader, "Please correct TEST-project 仓库账号: TEST-new。", when="2026-09-02T10:00:00Z")
+    current = core.revise(reader, revise_request(old, updated, "TEST-new"), remaining_seconds=10).items[0]
+    assert current.revision > old.revision
+    url = "https://code.example.invalid/atlas/orbit"
+    link = capture(core, reader, f"TEST-project 的新仓库地址已经确认：{url}", when="2026-09-02T12:00:00Z")
+    search = replace(_search(restatement_store), trusted_context=reader, query="TEST-project 的新仓库信息")
+    with core.storage.read(reader) as tx:
+        pool = [
+            (candidate, core.recall_pipeline.storage_reader.hydrate(tx, candidate, search)) for candidate in notices
+        ]
+        terms = set(meaningful_query_terms(search.query))
+        matched = {c.key: terms.intersection(lexical_terms(statement_text(obj))) for c, obj in pool}
+        assert repeated_report_claims(tx, pool, search, matched) == {c.key for c in notices[1:]}
+    # Only the lexical channel finds the link. The optional vector channel
+    # nominates the competing notices and their revisions.
+    vectors = DeterministicVectors((*notices, *hints, _claim_candidate(old), _claim_candidate(current)))
+    if vector_hints:
+        core.recall_pipeline.vector_port = vectors
+    for query in ("TEST-project 的新仓库信息", "TEST-project 新仓库地址在哪"):
+        packet = core.recall_packet(
+            reader, recall_request(query=query, mode="current", max_items=15, budget_tokens=4096)
+        )
+        assert {"duplicates_collapsed:4", "budget_token_cap"} <= set(packet["gaps"])
+        assert any(item["ref"] == current.ref and item["revision"] == current.revision for item in packet["items"])
+        assert all("TEST-old" not in item["content"] for item in packet["items"])
+        assert any(url in item["content"] and f"{link.ref}@1" in item["evidence_refs"] for item in packet["items"][:5])
+    if vector_hints:
+        assert vectors.calls
 
 
 def _record(store, text, *, entry=0, scope="TEST-scope", principal="owner", refs=(), when=None, **context_fields):
@@ -57,6 +164,69 @@ def _search(store, **changes):
         now=core.clock.utc_now(),
         deadline=core.clock.monotonic() + 5,
     )
+
+
+def test_only_another_entrys_label_for_the_same_report_loses_repeated_votes(restatement_store, monkeypatch):
+    core, (reader, peer, _third) = restatement_store
+    notice = "TEST-project 的主开关设为开启。备用开关设为开启。"
+    quote = "主开关设为开启"
+    first = capture(core, reader, notice)
+    copy = capture(core, peer, notice)
+    independent = capture(core, reader, "TEST-project 的交接编号是 TEST-42。")
+    other_body = capture(core, peer, notice + "只在测试环境启用。")
+    partial = capture(core, peer, notice, capture_state="partial")
+    with monkeypatch.context() as patch:
+        patch.setattr(events, "MAX_SEGMENT_CHARS", len(notice))
+        segment = capture(core, peer, notice + "测试环境另有规定。")
+    assert "segment" in segment.event and segment.content_sha256 == first.content_sha256
+    other_person = replace(peer, source_principal=TrustedSourcePrincipal("human", "verified", "principal:human:TEST-2"))
+    other_speaker = capture(core, other_person, notice)
+    reversal = capture(core, peer, "TEST-project 的主开关设为停用。")
+    later = capture(core, peer, notice, when="2026-09-02T12:00:00Z")
+
+    def claim(actor, source, predicate, *, words=quote, value="开启"):
+        proposal = draft(source, value, predicate=predicate, quote_override=words)
+        accepted = accept(core, actor, proposal).items[0]
+        assert accepted.state == "active"
+        return _claim_candidate(accepted)
+
+    first_label = claim(reader, first, "主开关")
+    other_label = claim(peer, copy, "开关状态")
+    primary = claim(reader, first, "主开关状态", words=notice)
+    backup = claim(peer, copy, "备用开关状态", words=notice)
+    alternate_span = claim(peer, copy, "备用开关", words="备用开关设为开启")
+    later_copy = claim(peer, later, "随后生效的开关")
+    guards = [
+        claim(peer, other_body, "测试开关"),
+        claim(other_person, other_speaker, "另一人的开关"),
+        claim(peer, reversal, "相反的决定", words="主开关设为停用", value="停用"),
+    ]
+    search = replace(_search(restatement_store), query="TEST-project 的信息")
+    with core.storage.read(search.trusted_context) as tx:
+        candidates = [first_label, other_label, alternate_span, later_copy, *guards, _candidate(independent)]
+        pairs = [(c, core.recall_pipeline.storage_reader.hydrate(tx, c, search)) for c in candidates]
+        assert all(obj is not None for _, obj in pairs)
+
+        def copies(context, pool=pairs):
+            terms = set(meaningful_query_terms(context.query))
+            matched = {c.key: terms.intersection(lexical_terms(statement_text(obj))) for c, obj in pool}
+            return repeated_report_claims(tx, pool, context, matched)
+
+        assert copies(search) == {other_label.key, alternate_span.key, later_copy.key}
+        for source in (partial, segment):
+            event = core.recall_pipeline.storage_reader.hydrate(tx, _candidate(source), search)
+            assert event is not None and not list(recall_restatement._report_witnesses(tx, event, search, {}))
+        assert other_label.key not in copies(replace(search, query="TEST-project 的开关状态"))
+        both = [(c, core.recall_pipeline.storage_reader.hydrate(tx, c, search)) for c in (primary, backup)]
+        assert not copies(replace(search, query="备用的开关打开了吗"), both)
+        for special in (
+            replace(search, mode="history"),
+            replace(search, mode="as_of", as_of=search.now),
+            replace(search, mode="method"),
+        ):
+            assert not copies(special)
+        exact = [(replace(pairs[0][0], source="exact_ref"), pairs[0][1]), *pairs[1:]]
+        assert not copies(search, exact)
 
 
 def _pairs(core, tx, search, original, echo):
