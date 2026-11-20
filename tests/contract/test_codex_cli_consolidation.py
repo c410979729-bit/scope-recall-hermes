@@ -362,11 +362,17 @@ def test_bounded_diagnostics_keep_stage_without_body_or_retry(tmp_path, monkeypa
     monkeypatch.setattr(cli, "_run", run)
     account = ledger(tmp_path)
     adapter = cli.CodexCliConsolidationAdapter(route(), ledger=account)
+
+    # The adapter reserves four seconds for cleanup. Give the real child time to start
+    # and write both diagnostic streams before the process-wait deadline on Windows.
+    def propose():
+        return adapter.propose([dict(role="user", content=sentinel)], remaining_seconds=9)
+
     if mode == "success":
-        assert adapter.propose([dict(role="user", content=sentinel)], remaining_seconds=5) == sentinel
+        assert propose() == sentinel
     else:
         with pytest.raises(AuxiliaryModelError, match="timeout" if mode == "timeout" else "codex_turn_failed"):
-            adapter.propose([dict(role="user", content=sentinel)], remaining_seconds=5)
+            propose()
     diag = adapter.last_diagnostics["model"]
     assert sentinel not in json.dumps(adapter.last_diagnostics)
     assert "turn.started" in diag["event_types"]
@@ -381,7 +387,7 @@ def test_bounded_diagnostics_keep_stage_without_body_or_retry(tmp_path, monkeypa
         assert diag["http_statuses"] == []
     assert len(calls) == 1 and account.status()["daily_calls"] == 1
     with pytest.raises(AuxiliaryModelError, match="budget_exhausted"):
-        adapter.propose([dict(role="user", content=sentinel)], remaining_seconds=5)
+        propose()
     assert len(calls) == 1
 
 
