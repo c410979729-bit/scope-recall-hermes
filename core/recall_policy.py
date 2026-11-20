@@ -10,6 +10,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
+from urllib.parse import urlsplit
 
 from ..contracts import ContractError
 from .embedding_budget import bounded_embedding_text, kept_length
@@ -62,6 +63,12 @@ _HARD_IDENTIFIER = re.compile(
 _CJK_TEXT = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _IDENTIFIER_JOINT = re.compile(r"(?<=[A-Za-z])[ \t_-](?=\d)")
 _CLAUSE_BOUNDARY = re.compile(r"[，,；;。！？!?\n]+")
+# Stop at adjacent non-ASCII prose and common Markdown delimiters. Percent
+# escapes stay in the URL, so an encoded path segment retains its identity.
+_HTTP_LINK = re.compile(r"https?://[a-z0-9._~:/?#\[\]@!$&*+;=%-]+", re.ASCII | re.I)
+_RECORD_PATH = re.compile(r"(?P<parent>.*)/(?P<number>[0-9]+)(?:/(?:files|diff|changes|commits|checks))?/?")
+_POST_PATH = re.compile(r"/(?:[^/]+|i/web)/status/(?P<number>[0-9]+)(?:/(?:photo|video)/[0-9]+)?/?")
+_POST_SITES = frozenset({"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"})
 
 
 def canonical_embedding_space(value: dict) -> dict:
@@ -815,7 +822,7 @@ def _spelled_out_forms(text: str) -> frozenset[str]:
     return _written_forms(text) | _written_forms(_IDENTIFIER_JOINT.sub("", text))
 
 
-def identifiers_compatible(query: str, content: str) -> bool:
+def identifiers_compatible(query: str, content: str, *, numbered_urls: bool = False) -> bool:
     """Keep distinct hard identifiers separate while supporting comparisons.
 
     A query naming H100 may only admit content that carries H100.  A query
@@ -823,10 +830,57 @@ def identifiers_compatible(query: str, content: str) -> bool:
     at a time, with the evidence identity preserved for each side.
     """
 
+    # Account handles and tracking parameters inside a record's URL do not
+    # name additional objects. Identifiers in the surrounding question still do.
+    if numbered_urls and "://" in query:
+        query = _HTTP_LINK.sub(lambda match: " " if _numbered_link(match[0]) else match[0], query)
     requested = _written_forms(query)
     if not requested:
         return True
     return bool(requested.intersection(_spelled_out_forms(content)))
+
+
+def _numbered_link(link: str) -> tuple[str, str, str] | None:
+    """Read a record's identity from its permalink, including views of the same record."""
+    try:
+        url = urlsplit(link.partition("?")[0].partition("#")[0].rstrip(".;:]!"))
+    except ValueError:
+        return None
+    site = url.netloc.rpartition("@")[2].casefold()
+    if site in _POST_SITES and (post := _POST_PATH.fullmatch(url.path.casefold())):
+        return "x.com", "/status", post["number"]
+    path = url.path.casefold() if site in {"github.com", "www.github.com"} else url.path
+    if site and (record := _RECORD_PATH.fullmatch(path)):
+        return site, record["parent"], record["number"]
+    return None
+
+
+def numbered_links(text: str) -> set[tuple[str, str, str]]:
+    """Return canonical (site, collection path, record number) identities for absolute links."""
+    return {record for match in _HTTP_LINK.finditer(text) if (record := _numbered_link(match[0])) is not None}
+
+
+def numbered_link_conflict(requested: set[tuple[str, str, str]], content: str) -> bool:
+    """Veto an automatic match naming a different record in the same collection.
+
+    Replies may omit a link or cite another site. Only an explicit competing
+    identity is negative evidence. A comparison may find either requested record.
+    """
+    if not requested or "://" not in content:
+        return False
+    families: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for site, parent, number in requested:
+        families.setdefault((site, parent.casefold()), set()).add((parent, number))
+    conflict = False
+    for site, parent, number in numbered_links(content):
+        targets = families.get((site, parent.casefold()), ())
+        if any(other_number == number for _, other_number in targets):
+            return False
+        # GitHub normalizes repository names. On a generic site, only the
+        # same spelling proves that different numbers compete in one collection.
+        if any(other_parent == parent for other_parent, _ in targets):
+            conflict = True
+    return conflict
 
 
 def applicability(context: SearchContext, project_id: str | None, branch_id: str | None) -> str:

@@ -58,7 +58,7 @@ from .retrieval import (
     effective_limits,
     optional_json,
 )
-from .retrieval_hydration import note_superseded_evidence, replacements
+from .retrieval_hydration import conflicting_record, note_superseded_evidence, replacements
 from .retrieval_storage import CollectionPage, RetrievalStorage
 from .vector_failure import note_embedding_failure, vector_failure_label
 
@@ -232,16 +232,18 @@ def _said_after(obj: RetrievedObject, moment: str) -> bool:
         return False
 
 
-def _identifiers_asked(candidate: CandidateRef, context: SearchContext) -> str:
-    """The question whose hard identifiers a candidate has to hold (``identifiers_compatible``).  A message of the day
-    a question named was chosen by its day and entry, and a source of the time it named by that time: neither the
-    entry's name ("pc2") nor the identifier the time is written with ("on the 18th") is one it has to repeat.  Every
-    other candidate still has to."""
+def _identifiers_match(
+    tx, candidate: CandidateRef, context: SearchContext, obj: RetrievedObject, question: str
+) -> bool:
+    """A scoped hit need not repeat the entry or date. Narrower follow-ups still target the original link."""
+    query = context.query
     if candidate.source == "scoped" and context.scope is not None:
-        return context.scope.rest
-    if candidate.source == "dated" and context.time is not None:
-        return context.time.rest
-    return context.query
+        query = context.scope.rest
+    elif candidate.source == "dated" and context.time is not None:
+        query = context.time.rest
+    return identifiers_compatible(
+        query, obj.content, numbered_urls=context.automatic_injection and not context.focus_refs
+    ) and not conflicting_record(tx, context, obj, query=question)
 
 
 def _said_within(obj: RetrievedObject, windows: tuple[tuple[str, str], ...]) -> bool:
@@ -739,16 +741,14 @@ class RetrievalPipeline:
         # information to automatic context and can crowd out its actual evidence.
         # What such a copy was told in its turn still answers it: the copy is set
         # aside in ``aside.echoes`` to lead to its turn's replies, never delivered.
+        question = context.query if original_query is None else original_query
         if context.mode == "auto" and obj.kind == "event":
-            query = context.query if original_query is None else original_query
-            if same_message(obj.content, query):
+            if same_message(obj.content, question):
                 if aside is not None:
                     aside.echoes.append(candidate)
                 note_candidate(candidate, "current_prompt")
                 return None
-        if candidate.source != "exact_ref" and not identifiers_compatible(
-            _identifiers_asked(candidate, context), obj.content
-        ):
+        if candidate.source != "exact_ref" and not _identifiers_match(tx, candidate, context, obj, question):
             note_candidate(candidate, "identifier_mismatch")
             return None
         # An episode whose resume was never consolidated carries nothing but its
@@ -1458,6 +1458,7 @@ class RetrievalPipeline:
                 pair
                 for pair in background
                 if pair[0].key not in present
+                and not conflicting_record(tx, working, pair[1])
                 and distinct.admits(pair[1])
                 and not (working.in_context_since is not None and _in_context(tx, pair[1], working))
             )

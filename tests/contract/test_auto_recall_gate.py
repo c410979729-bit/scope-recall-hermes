@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from scope_recall.core.auto_recall import automatic_recall_skip_reason
-from scope_recall.core.recall_policy import RecallPolicy, rrf_score
+from scope_recall.core.recall_policy import RecallPolicy, numbered_link_conflict, numbered_links, rrf_score
 from scope_recall.core.retrieval import CandidateRef, SearchContext
 
 from tests.contract.test_autonomous_context import app, task
@@ -245,6 +245,81 @@ def test_first_prompt_continues_grounded_task_after_current_prompt_capture(app):
     result = core.recall_packet(fresh, recall_request(query="继续"), current_source_refs=(f"{current.ref}@1",))
     assert episode.ref in {item["ref"] for item in result["items"]}
     assert not any(gap.startswith("auto_recall_skipped:") for gap in result["gaps"])
+
+
+@pytest.mark.parametrize("ending", ["", "!"])
+def test_numbered_links_do_not_cross_to_another_record_in_the_same_collection(tmp_path, ending):
+    core, ctx, vectors = _app(tmp_path)
+    wanted = "https://board.example/orchard/tickets/42017"
+    other = "https://board.example/orchard/tickets/42018"
+    query = f"查一下这个工单的解决办法 {wanted}{ending}"
+    wrong = _capture(core, ctx, "wrong-ticket", f"这个工单的解决办法是换皮带。{other}")
+    right = _capture(core, replace(ctx, session_id="right"), "right-ticket", f"这个工单要换轴承。{wanted}?view=full")
+    answer = _capture(core, replace(ctx, session_id="notes"), "maintenance", "换轴承后，喷头的压力恢复到四十千帕。")
+    vectors.candidates = (_candidate(wrong, score=0.99), _candidate(right, score=0.95), _candidate(answer))
+    packet = core.recall_packet(replace(ctx, session_id="reader"), recall_request(query=query))
+    assert {right.ref, answer.ref} <= {item["ref"] for item in packet["items"]}
+    assert all(other not in item["content"] for item in packet["items"]), packet["items"]
+    explicit = core.recall_packet(ctx, recall_request(query=query), background_without_evidence=False)
+    assert wrong.ref in {item["ref"] for item in explicit["items"]}
+
+
+def test_numbered_link_veto_accepts_either_comparison_target_and_supporting_prose():
+    first, second = "https://board.example/Atlas/issues/17", "https://board.example/Atlas/issues/18"
+    search = numbered_links(f"Compare {first} and {second}")
+    assert not numbered_link_conflict(search, second + "#reply")
+    assert not numbered_link_conflict(search, "The pump bearing needs replacement.")
+    assert not numbered_link_conflict(search, "See the manual at https://docs.example/chapters/42")
+    assert not numbered_link_conflict(search, "https://board.example/atlas/issues/17")
+    assert not numbered_link_conflict(search, "https://board.example/atlas/issues/19")
+    assert numbered_link_conflict(
+        numbered_links("https://board.example/Atlas!/issues/17!"), "https://board.example/Atlas!/issues/19"
+    )
+    assert numbered_link_conflict(search, "https://board.example/Atlas/issues/19的维修记录。")
+    assert numbered_link_conflict(search, "https://board.example/Atlas/issues/19/files")
+
+
+@pytest.mark.parametrize(
+    "candidate,conflicts",
+    [
+        ("https://github.com/CherryHQ/cherry-studio/issues/14250", False),
+        ("https://github.com/orchard/another-repo/issues/6", False),
+        ("https://github.com/another-owner/scope-recall/issues/6", False),
+        ("https://mirror.example/orchard/scope-recall/issues/6", False),
+        ("issues/6", False),
+        ("https://github.com/Orchard/Scope-Recall/issues/6/files", True),
+    ],
+)
+def test_issue_conflict_requires_the_same_host_owner_and_repository(candidate, conflicts):
+    search = numbered_links("https://github.com/orchard/scope-recall/issues/5")
+    assert numbered_link_conflict(search, candidate) is conflicts
+
+
+def test_repository_case_does_not_change_a_records_identity():
+    mixed = "https://github.com/CherryHQ/cherry-studio/issues/14250"
+    alias = "https://github.com/cherryhq/Cherry-Studio/issues/14250#reply"
+    assert numbered_links(mixed) == numbered_links(alias)
+    assert not numbered_link_conflict(numbered_links(mixed), alias)
+
+
+def test_chinese_text_ends_numbered_links_without_a_space():
+    first = "https://github.com/orchard/scope-recall/issues/5"
+    second = "https://github.com/CherryHQ/cherry-studio/issues/14250"
+    assert numbered_links(f"{first}和{second}里的讨论") == numbered_links(first) | numbered_links(second)
+    assert numbered_links(f"{first}more") == set()
+
+
+@pytest.mark.parametrize("nominate", [True, False])
+def test_status_links_bind_the_post_across_handles_hosts_and_media_views(tmp_path, nominate):
+    core, ctx, vectors = _app(tmp_path)
+    query = "https://x.com/orchard42/status/42017里说的是什么？"
+    wrong = _capture(core, ctx, "wrong-post", "旧帖说要换皮带 https://twitter.com/pump/status/42018/photo/1")
+    right = _capture(core, ctx, "right-post", "帖子说要换轴承 https://twitter.com/i/web/status/42017")
+    if nominate:
+        vectors.candidates = (_candidate(wrong, score=0.99), _candidate(right, score=0.95))
+    packet = core.recall_packet(replace(ctx, session_id="reader"), recall_request(query=query))
+    assert right.ref in {item["ref"] for item in packet["items"]}
+    assert all("42018" not in item["content"] for item in packet["items"])
 
 
 @pytest.mark.parametrize(

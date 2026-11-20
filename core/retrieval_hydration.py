@@ -22,13 +22,13 @@ from ..contracts import (
     SourceContext,
     bounded_source_context,
 )
-from . import lineage
+from . import lineage, private
 from .candidate_tables import awaits_first_judgement
 from .claim_storage import parse_source_ref
 from .claims import canonical_time, dated_after, holds_instead, select_effective, select_proposal, states_a_value
 from .episodes import source_origin
 from .events import withheld_tool_output
-from .recall_policy import applicability, in_time_window, parse_time
+from .recall_policy import applicability, in_time_window, numbered_link_conflict, numbered_links, parse_time
 from .reflection_validity import reflection_live
 from .resume_compaction import resume_evidence_refs
 from .retrieval import STALE_RESUME_GAPS, CandidateRef, RetrievedObject, SearchContext
@@ -117,6 +117,33 @@ def _source_live(tx, ref: str, revision: int) -> bool:
     except ContractError:
         return False
     return True
+
+
+def readable_sources(tx, obj, context):
+    """Resolve raw evidence under the same current private and suppression policy."""
+    sources = tuple(tx.source(*parse_source_ref(ref)) for ref in obj.evidence_refs)
+    if not sources or any(source is None or source.suppressed for source in sources):
+        return ()
+    intervals = tx.remembered(("recall_private", context.now), lambda: private.active_intervals(tx, context.now))
+    return () if any(private.source_blocked(intervals, source) for source in sources) else sources
+
+
+def conflicting_record(tx, context, obj, *, query: str | None = None) -> bool:
+    """Check an ambient hit against the requested record and the claim's readable original evidence."""
+    question = context.query if query is None else query
+    if not context.automatic_injection or context.focus_refs or "://" not in question:
+        return False
+    targets = tx.remembered(("numbered_links", question), lambda: numbered_links(question))
+    if not targets:
+        return False
+    if numbered_link_conflict(targets, obj.content):
+        return True
+    if obj.kind != "claim":
+        return False
+    # A normalized fact can omit its source's URL. A linkless source stays
+    # eligible; reject when every readable original names a competing record.
+    sources = readable_sources(tx, obj, context)
+    return bool(sources) and all(numbered_link_conflict(targets, source.event["content"]) for source in sources)
 
 
 def _deliverable_source(tx, ref: str, revision: int, mode: str) -> bool:

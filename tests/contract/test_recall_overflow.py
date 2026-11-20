@@ -600,6 +600,30 @@ def test_real_pending_tail_returns_after_owner_release_and_background_rescan(app
     assert f"{target.ref}@1" in {ref for item in overflow(packet) for ref in item["evidence_refs"]}
 
 
+def test_fact_and_its_original_keep_the_ticket_identity_in_the_packet(app):
+    from tests.contract.test_claims import accept, draft
+
+    core, ctx = app
+    wanted = "https://board.example/orchard/tickets/42017"
+    source = capture(
+        core, ctx, "Orchard bearing repair requires a new belt. https://board.example/orchard/tickets/42018"
+    )
+    fact = accept(
+        core,
+        ctx,
+        draft(
+            source, "new belt", subject="Orchard", predicate="bearing repair", kind="fact", statement_kind="assertion"
+        ),
+    ).items[0]
+    assert fact.state == "active"
+    right = capture(core, replace(ctx, session_id="orchard"), f"Orchard bearing repair requires a new seal. {wanted}")
+    request = recall_request(query=f"Orchard bearing repair {wanted}", budget_tokens=4096)
+    packet = core.recall_packet(replace(ctx, session_id="reader"), request)
+    assert right.ref in {item["ref"] for item in packet["items"]}
+    assert fact.ref not in {item["ref"] for item in packet["items"]}
+    assert all(f"{source.ref}@1" not in item["evidence_refs"] for item in packet["items"])
+
+
 def test_indexed_fact_nomination_expands_originals_into_overflow(app):
     core, ctx = app
     originals, facts = indexed_fact_sources(app)

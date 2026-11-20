@@ -13,7 +13,6 @@ from typing import cast
 from ..contracts import RecallPacket
 from . import private
 from .adoption_storage import is_adopted_assistant
-from .claim_storage import parse_source_ref
 from .model_content import withhold_secret_items
 from .recall_budget import canonical_render_json, estimate_tokens
 from .recall_items import packet_item
@@ -21,22 +20,13 @@ from .recall_policy import meaningful_query_terms
 from .recall_restatement import host_memory_duplicate, prefer_originals
 from .recall_trace import note_candidate
 from .retrieval import MAX_PACKET_ITEMS, SearchContext
-from .retrieval_hydration import note_superseded_evidence
+from .retrieval_hydration import conflicting_record, note_superseded_evidence, readable_sources
 from .summary_validity import CONVERSATION_SUMMARY_REASONS
 
 LABEL = "Other-session matches"
 MAX_ROWS = 12
 MAX_UNITS = 1024
 EXCERPT_CHARS = 160
-
-
-def readable_sources(tx, obj, context):
-    """Resolve raw evidence under the same current private and suppression policy."""
-    sources = tuple(tx.source(*parse_source_ref(ref)) for ref in obj.evidence_refs)
-    if not sources or any(source is None or source.suppressed for source in sources):
-        return ()
-    intervals = tx.remembered(("recall_private", context.now), lambda: private.active_intervals(tx, context.now))
-    return () if any(private.source_blocked(intervals, source) for source in sources) else sources
 
 
 def visible_query_pairs(tx, ranked, context, *, now):
@@ -70,7 +60,9 @@ def _qualified(obj):
 def _hydrate(tx, reader, candidates, context):
     reader.prefetch(tx, candidates, context)
     pairs = [
-        (candidate, obj) for candidate in candidates if (obj := reader.hydrate(tx, candidate, context)) is not None
+        (candidate, obj)
+        for candidate in candidates
+        if (obj := reader.hydrate(tx, candidate, context)) is not None and not conflicting_record(tx, context, obj)
     ]
     return withhold_secret_items(pairs, [], content=lambda pair: pair[1])
 
