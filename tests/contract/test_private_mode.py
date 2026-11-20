@@ -127,6 +127,23 @@ def test_capture_is_decided_at_event_time_and_survives_turning_the_rule_off(app)
     assert after.disposition == "inserted"
 
 
+def test_remote_clock_windows_intersect_both_private_boundaries(app):
+    """Legacy instant formats and uncertain intervals share the same inclusive start and exclusive end."""
+    core, ctx, clock, owner = app
+    start = clock.now
+    owner.private_on(target="session", session=ctx.session_id)
+    clock.advance(60)
+    end = clock.now
+    owner.private_off(target="session", session=ctx.session_id)
+    tick = timedelta(microseconds=15625)
+
+    def window(at):
+        return {"earliest": (at - tick).isoformat(), "latest": (at + tick).isoformat()}
+
+    times = [start.isoformat(), end.isoformat(), window(start), window(end), window(end + 2 * tick)]
+    assert core.private_check(ctx, times)["decisions"] == [True, False, True, True, False]
+
+
 def test_a_retry_given_back_its_queued_copy_is_checked_at_the_copy_s_moment(app):
     """A retry dated before a private interval meets its queued copy, dated inside it: the copy's moment decides."""
     from scope_recall.core import capture_inbox

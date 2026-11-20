@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from time import get_clock_info
 
+from ...contracts import ContractError, utc_timestamp
 from ..host_profiles import HERMES_BINDING_FIELDS
 from .hermes_queue import encode
 
@@ -26,6 +28,27 @@ _ROUTE = HERMES_BINDING_FIELDS | {
     "turn_id",
     "turn_number",
 }
+_HISTORY_TICK = timedelta(seconds=get_clock_info("time").resolution)
+
+
+def _observation_time(at: str | None, *, historical: bool) -> str | dict[str, str] | None:
+    """Compare coarse history with privacy switches conservatively on both edges of an interval."""
+    if at is None:
+        return None
+    try:
+        point = utc_timestamp(at)
+        moment = datetime.fromisoformat(point)
+        # A copied whole-second observation has no finer precision witness,
+        # even if the replay clock is newer or the callback has the same timestamp.
+        tick = max(_HISTORY_TICK, timedelta(seconds=1)) if historical and not moment.microsecond else _HISTORY_TICK
+        if tick <= timedelta(microseconds=1):
+            return point
+        return {
+            "earliest": (moment - tick).isoformat(timespec="microseconds"),
+            "latest": (moment + tick).isoformat(timespec="microseconds"),
+        }
+    except (ContractError, OverflowError):
+        return None
 
 
 def _times(rows: list) -> list:
@@ -40,7 +63,7 @@ def _times(rows: list) -> list:
             )
         except (OverflowError, OSError, ValueError):
             moment = None
-        moments.append(moment)
+        moments.append(_observation_time(moment, historical=True))
     return moments
 
 
@@ -66,7 +89,10 @@ def metadata(payload: dict) -> dict:
     histories = {"history": _times(payload.get("history", []))}
     for i, event in enumerate(payload.get("events", [])):
         fields = sorted(_CONTENT & event["values"].keys())
-        histories[f"{i}:content"] = [event.get("content_times", {}).get(field, event["at"]) for field in fields]
+        original = event.get("content_times", {})
+        histories[f"{i}:content"] = [
+            _observation_time(original.get(field, event["at"]), historical=field in original) for field in fields
+        ]
         for field in ("messages", "conversation_history"):
             if isinstance(event["values"].get(field), list):
                 moments = _times(event["values"][field])
@@ -79,7 +105,7 @@ def metadata(payload: dict) -> dict:
                     and rows[-1].get("content") == event["values"].get("user_message")
                 ):
                     if moments[-1] is None:
-                        moments[-1] = event["at"]
+                        moments[-1] = _observation_time(event["at"], historical=False)
                 histories[f"{i}:{field}"] = moments
     value["history_times"] = histories
     return {"hermes": value}

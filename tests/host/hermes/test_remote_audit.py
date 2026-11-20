@@ -7,8 +7,9 @@ import json
 import threading
 import time
 from contextvars import copy_context
+from datetime import UTC, datetime, timedelta
 
-from scope_recall.adapters.clients import remote_client
+from scope_recall.adapters.clients import hermes_privacy, remote_client
 from scope_recall.adapters.hermes import hooks
 from scope_recall.adapters.hermes.boundary import _shown_text
 from scope_recall.adapters.hermes.provider import ScopeRecallHermesAdapter
@@ -16,6 +17,52 @@ from scope_recall.adapters.hermes.remote_wire import visible
 from scope_recall.core.file_lock import advisory_file_lock
 
 from .test_remote_entry import AGENT, WORDS, WORKSPACE, entry, say, sources
+
+
+def test_original_history_clock_preserves_the_precision_used_by_privacy_checks(monkeypatch):
+    """A coarse observation and a private-mode switch in the same clock tick cannot be ordered."""
+    at = datetime(2026, 1, 1, microsecond=500000, tzinfo=UTC)
+    tick = timedelta(microseconds=15625)
+    payload = {
+        "events": [{"method": "sync_turn", "at": at.isoformat(), "values": {"assistant_content": "TEST"}}],
+        "history": [{"timestamp": at.timestamp()}, {"timestamp": None}],
+    }
+    monkeypatch.setattr(hermes_privacy, "_HISTORY_TICK", tick)
+    window = {
+        key: moment.isoformat(timespec="microseconds")
+        for key, moment in (("earliest", at - tick), ("latest", at + tick))
+    }
+    observed = hermes_privacy.metadata(payload)["hermes"]["history_times"]
+    assert observed == {"history": [window, None], "0:content": [window]}
+    monkeypatch.setattr(hermes_privacy, "_HISTORY_TICK", timedelta(microseconds=1))
+    assert hermes_privacy.metadata(payload)["hermes"]["history_times"]["history"] == [
+        at.isoformat(timespec="microseconds"),
+        None,
+    ]
+
+
+def test_whole_second_history_keeps_its_uncertainty_when_replayed_on_a_finer_clock(monkeypatch):
+    """An integral host timestamp cannot establish which part of that second an old observation occupied."""
+    at = datetime(2026, 1, 1, tzinfo=UTC)
+    later = at + timedelta(seconds=3)
+    payload = {
+        "history": [{"timestamp": int(at.timestamp())}, {"timestamp": at.timestamp()}],
+        "events": [
+            {
+                "method": "sync_turn",
+                "at": later.isoformat(),
+                "values": {"assistant_content": "TEST", "user_content": "TEST"},
+                "content_times": {"assistant_content": at.isoformat()},
+            }
+        ],
+    }
+    monkeypatch.setattr(hermes_privacy, "_HISTORY_TICK", timedelta(microseconds=1))
+    times = hermes_privacy.metadata(payload)["hermes"]["history_times"]
+    window = times["history"][0]
+    assert isinstance(window, dict) and window["earliest"] <= at.isoformat(timespec="microseconds")
+    assert window["latest"] >= (at + timedelta(microseconds=999999)).isoformat(timespec="microseconds")
+    assert times["history"][1] == window
+    assert times["0:content"] == [window, later.isoformat(timespec="microseconds")]
 
 
 def test_prefetch_filters_private_query_before_transport(entry, monkeypatch):
