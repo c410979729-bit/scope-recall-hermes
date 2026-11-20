@@ -13,7 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from scope_recall.contracts import ENTRY_ID, InstanceBinding, TrustedContext
+from scope_recall.contracts import CLIENT_HOSTS as CLIENT_HOSTS
+from scope_recall.contracts import ENTRY_HOSTS as ENTRY_HOSTS
+from scope_recall.contracts import (
+    ENTRY_ID,
+    READ_ONLY_CLIENT_HOSTS,
+    InstanceBinding,
+    TrustedContext,
+)
 from scope_recall.core.entry_control import account_pin, current_account_pin
 from scope_recall.core.storage import SQLiteStorage
 
@@ -53,15 +60,6 @@ _MAX_ATTACHMENT_BYTES = 4096
 
 
 _MAX_DISPLAY_NAME = 32
-
-
-#: The local coding assistants a shared store takes as entries beside Hermes homes.  Such an
-#: entry has no installation of its own to carry grants over from: it is the owner at this
-#: machine, with one owner row on the platform named after the client (``client_entry_record``).
-CLIENT_HOSTS = ("codex", "claude-code", "workbuddy", "dsh")
-
-
-ENTRY_HOSTS = ("hermes", *CLIENT_HOSTS)
 
 
 @dataclass(frozen=True)
@@ -211,6 +209,8 @@ def _entry_view(store: Path, payload: dict[str, Any], record: Mapping[str, Any])
     if not home.is_absolute():
         raise HermesIdentityError("shared store entry home must be absolute")
     fields = {name: check(record.get(name)) for name, check in REQUIRED_FIELDS}
+    if record["host"] in READ_ONLY_CLIENT_HOSTS and any(row["writable_scope_ids"] for row in fields["audiences"]):
+        raise HermesIdentityError("a read-only MCP entry cannot hold writable scopes")
     manifest = InstallationManifest(
         schema_version=SCHEMA_VERSION,
         installation_id=payload["installation_id"],
@@ -353,6 +353,8 @@ def client_entry_record(
     already registers (``maintenance/shared.py`` takes them from the owner rows of the
     entries already attached), so no other entry's binding changes; the store's first
     client brings the owner scope of a fresh installation, as a Hermes home does its own.
+    For a read-only client, ``capture_scope_id`` identifies the donor's owner scope
+    in the manifest. Its own audience has no capture target or write grants.
     """
     if host not in CLIENT_HOSTS:
         raise HermesIdentityError(f"a client entry's host is one of {', '.join(CLIENT_HOSTS)}")
@@ -366,7 +368,7 @@ def client_entry_record(
         agent_workspace="default",
         allowed_scope_ids=sorted(set(allowed_scope_ids)),
         writable_scope_ids=sorted(set(writable_scope_ids)),
-        capture_scope_id=capture_scope_id,
+        capture_scope_id="" if host in READ_ONLY_CLIENT_HOSTS else capture_scope_id,
         kind="owner_private",
     )
     record: dict[str, Any] = {

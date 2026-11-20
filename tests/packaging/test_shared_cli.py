@@ -24,7 +24,8 @@ from scope_recall.adapters import shared_entries
 from scope_recall.adapters.clients import remote_client
 from scope_recall.adapters.clients.config import load_shared_client
 from scope_recall.adapters.hermes import HermesIdentityError, bind_hermes_identity
-from scope_recall.adapters.shared_entries import CLIENT_HOSTS, read_attachment, read_shared_payload
+from scope_recall.adapters.shared_entries import read_attachment, read_shared_payload
+from scope_recall.contracts import HOOK_CLIENT_HOSTS
 from scope_recall.maintenance import cli, install_codex, install_dsh, install_workbuddy, shared, shared_run
 from scope_recall.maintenance.doctor import run_doctor
 from scope_recall.maintenance.install import apply_install, apply_uninstall, plan_install, plan_uninstall
@@ -1278,13 +1279,13 @@ def _written_routes(tmp_path):
     return path
 
 
-@pytest.mark.parametrize("host", CLIENT_HOSTS)
+@pytest.mark.parametrize("host", HOOK_CLIENT_HOSTS)
 def test_each_client_attaches_first_to_a_new_store_and_another_client_names_it(tmp_path, capsys, root, host):
     """With no other entry attached, a client takes no grants like another's: it gets a fresh installation's owner
     grants and brings that owner scope into the store, and its routes give the shared worker its own.  A client of
     another host attached after it names it, and both bind as the owner, reading, writing and capturing in that one
     scope, their runtime configs bound to the store whatever the written one named."""
-    later = CLIENT_HOSTS[(CLIENT_HOSTS.index(host) + 1) % len(CLIENT_HOSTS)]
+    later = HOOK_CLIENT_HOSTS[(HOOK_CLIENT_HOSTS.index(host) + 1) % len(HOOK_CLIENT_HOSTS)]
     homes, routes = _client_homes(tmp_path, host, later), _written_routes(tmp_path)
     code, result = _attach_client(capsys, root, homes[host], host=host, like=None, capture=None, routes=routes)
     assert (code, result.get("new_scopes"), result.get("worker_runtime_config_written")) == (0, 1, True), result

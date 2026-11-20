@@ -31,7 +31,7 @@ from scope_recall.adapters.shared_entries import (
     read_shared_payload,
     shared_entry_manifest,
 )
-from scope_recall.contracts import ContractError, InstanceBinding
+from scope_recall.contracts import HOOK_CLIENT_HOSTS, ContractError, InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.entry_control import account_pin, current_account_pin
 from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
@@ -226,6 +226,8 @@ def load_shared_client(home: Path | str, host: str) -> SharedClientConfig:
 
 def load_remote_client(home: Path | str, host: str) -> SharedClientConfig:
     """Bind a token-authorized entry without pretending the server is the remote person."""
+    if host not in HOOK_CLIENT_HOSTS:
+        raise CodexConfigError("this host does not support a remote hook entry")
     return _load_shared_client(home, host, local=False)
 
 
@@ -258,7 +260,7 @@ def _load_shared_client(home: Path | str, host: str, *, local: bool) -> SharedCl
         entry_id=str(manifest.entry_id),
     )
     audience = (resolve_runtime_audience if local else resolve_granted_audience)(manifest, scope)
-    if not audience.allowed_scope_ids or audience.capture_scope_id is None:
+    if not audience.allowed_scope_ids or (host in HOOK_CLIENT_HOSTS and audience.capture_scope_id is None):
         raise CodexConfigError("the entry's grants give this client nothing to read or no scope to capture into")
     if not (manifest.data_directory / "memory.sqlite3").is_file():
         raise CodexConfigError("verified core database is required")
@@ -356,9 +358,9 @@ def install_codex_scope_recall(
 
 
 def shared_clients(binding):
-    """Yield attached local clients whose current store identity and grants fit this worker binding."""
+    """Yield attached hook clients whose ledgers and resident recall this worker maintains."""
     for entry in read_shared_payload(binding.data_directory)["entries"]:
-        if entry.get("host") not in CLIENT_HOSTS:
+        if entry.get("host") not in HOOK_CLIENT_HOSTS:
             continue
         try:
             config = load_shared_client(Path(entry["home"]), entry["host"])

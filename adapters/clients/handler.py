@@ -13,7 +13,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from scope_recall.contracts import ContractError, Origin, TrustedContext
+from scope_recall.contracts import HOOK_CLIENT_HOSTS, ContractError, Origin, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.admission import AdmissionPolicy
 from scope_recall.core.capture_inbox import DELETED_KEY, PendingCapture
@@ -253,6 +253,8 @@ class CodexHookHandler:
         runtime config is kept elsewhere (setup's disposable check entry), in place of the two seconds of an entry
         never set up.
         """
+        if host not in HOOK_CLIENT_HOSTS:
+            raise CodexConfigError("this client has no lifecycle hooks")
         config = (load_remote_client if remote_paths else load_shared_client)(home, host)
         core = _hook_core(config, clock, runtime_config_path=trusted_runtime_config_path or config.runtime_config_path)
         handler = cls(

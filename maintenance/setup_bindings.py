@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..adapters.hermes.installation import build_installation_manifest
 from ..adapters.hermes.shared_entries import read_shared_payload
+from ..contracts import READ_ONLY_CLIENT_HOSTS
 from .install_common import InstallError
 from .install_hermes import profile_identity
 
@@ -76,7 +77,11 @@ def scope_choice(home: Path, host: str, store: Path, *, share_with: str | None, 
     if not fresh:
         return dict(policy="preserve existing grants", source_entry=None)
     payload = read_shared_payload(store) if (store / "installation.json").is_file() else None
-    entries = [entry for entry in (payload or {}).get("entries", []) if not entry.get("detached_at")]
+    entries = [
+        entry
+        for entry in (payload or {}).get("entries", [])
+        if not entry.get("detached_at") and entry["host"] not in READ_ONLY_CLIENT_HOSTS
+    ]
     if not entries or host == "hermes":
         agent = payload["agent_id"] if payload else "scope-recall"
         manifest = build_installation_manifest(home, agent_id=agent, agent_workspace="hermes")

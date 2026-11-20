@@ -11,6 +11,7 @@ the `codex` extra. Updating a package in use requires stopping its hosts and wor
 
 Choose your host: [Claude Code](install/claude-code.md), [Codex](install/codex.md), [Hermes](install/hermes.md),
 [WorkBuddy](install/workbuddy.md), [DeepSeek Harness](install/dsh.md).
+For explicit memory lookups from Cherry Studio, [attach its read-only MCP entry](install/cherry-studio.md).
 
 For a shared store on a Linux Docker host, see [Docker deployment](docker.md).
 

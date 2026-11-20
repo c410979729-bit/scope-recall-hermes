@@ -66,7 +66,7 @@ from ..adapters.hermes.shared_entries import (
     write_shared_payload,
 )
 from ..adapters.host_identity import matches_owner_principal
-from ..contracts import ContractError, InstanceBinding, TrustedContext
+from ..contracts import HOOK_CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
 from ..core.storage import SQLiteStorage
 from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
 from ..runtime.instance_config import RuntimeInstanceConfig
@@ -234,7 +234,13 @@ def fresh_installation(
 
 
 def _client_grants(
-    payload: dict[str, Any], home: Path, entry_id: str, like: tuple[str, ...], capture_like: str | None
+    payload: dict[str, Any],
+    home: Path,
+    entry_id: str,
+    like: tuple[str, ...],
+    capture_like: str | None,
+    *,
+    read_only: bool = False,
 ) -> tuple[set[str], set[str], str]:
     """What a client entry reads, writes and captures into, taken from the owner rows of the store's other attached
     entries, Hermes homes and clients alike.
@@ -247,24 +253,31 @@ def _client_grants(
     brings their owner scope into the store.  The client's own record, when it is attached again, is not one of the
     others: running the same attach again finishes or repeats it.
     """
-    others = {
-        entry["entry_id"]: [
-            row
-            for row in entry["audiences"]
-            if row.get("kind") == "owner_private"
-            and matches_owner_principal(entry["owner_principals"], platform=row["platform"], user_id=row["user_id"])
-        ]
+    entries = {
+        entry["entry_id"]: entry
         for entry in payload["entries"]
-        if not entry.get("detached_at") and entry["entry_id"] != entry_id
+        if not entry.get("detached_at")
+        and entry["entry_id"] != entry_id
+        and (read_only or entry["host"] not in READ_ONLY_CLIENT_HOSTS)
     }
-    if not others:
+    if not entries:
         if like or capture_like:
             raise SharedStoreError(
                 "no other entry is attached to this store to take grants like: attach its first client without "
                 "--grants-like and --capture-like, and it brings the owner's scope"
             )
         owner = fresh_installation(home, payload).audience_scopes["owner_private"]
-        return {owner}, {owner}, owner
+        return {owner}, set() if read_only else {owner}, owner
+    others = {name: _owner_rows(entry) for name, entry in entries.items()}
+    if read_only:
+        if len(like) != 1 or like[0] not in entries:
+            raise SharedStoreError("a read-only MCP entry needs --grants-like naming one attached source entry")
+        donor = entries[like[0]]
+        allowed = {scope for row in others[like[0]] for scope in row["allowed_scope_ids"]}
+        owner = donor["audience_scopes"]["owner_private"]
+        if owner not in allowed:
+            raise SharedStoreError("the selected entry has no verified owner row that reads its owner scope")
+        return allowed, set(), owner
     if not like or not capture_like:
         raise SharedStoreError(
             "a client's entry needs --grants-like and --capture-like: the store has entries attached"
@@ -293,6 +306,16 @@ def _client_grants(
             "what the owner says in the client would not reach them"
         )
     return allowed | {capture}, writable | {capture}, capture
+
+
+def _owner_rows(entry: dict) -> list[dict]:
+    """Only grants of an explicitly approved owner can pass to a new local entry."""
+    return [
+        row
+        for row in entry["audiences"]
+        if row.get("kind") == "owner_private"
+        and matches_owner_principal(entry["owner_principals"], platform=row["platform"], user_id=row["user_id"])
+    ]
 
 
 def _ledger_made(raw: dict[str, Any]) -> list[str]:
@@ -362,6 +385,8 @@ def _refuse_misfit(
                 "example to scope-recall.local-<date>) and pass that installation.json as --grants-from"
             )
     elif host in CLIENT_HOSTS:
+        if host in READ_ONLY_CLIENT_HOSTS and capture_like is not None:
+            raise SharedStoreError("a read-only MCP entry takes no --capture-like")
         if grants_from is not None:
             raise SharedStoreError(
                 "a client has no installation to carry grants over from: it takes them like entries already "
@@ -481,7 +506,9 @@ def attach(
                 )
             record = shared_entry_record(source, entry_id=entry_id, display_name=display_name, attached_at=now)
         else:
-            allowed, writable, capture = _client_grants(payload, instance_root, entry_id, grants_like, capture_like)
+            allowed, writable, owner = _client_grants(
+                payload, instance_root, entry_id, grants_like, capture_like, read_only=host in READ_ONLY_CLIENT_HOSTS
+            )
             record = client_entry_record(
                 host=host,
                 home=instance_root,
@@ -490,7 +517,7 @@ def attach(
                 attached_at=now,
                 allowed_scope_ids=sorted(allowed),
                 writable_scope_ids=sorted(writable),
-                capture_scope_id=capture,
+                capture_scope_id=owner,
                 python_executable=python,
             )
         scopes = frozenset(record["scope_ids"])
@@ -860,10 +887,16 @@ def _client_route_holds(view: InstallationManifest) -> None:
     )
     owner_rows = tuple(row for row in view.audiences if str(row.get("kind") or "conversation") == "owner_private")
     audience = resolve_runtime_audience(replace(view, audiences=owner_rows), scope)
-    if not audience.includes_owner_private or not audience.allowed_scope_ids or audience.capture_scope_id is None:
+    needs_capture = view.entry_host in HOOK_CLIENT_HOSTS
+    if (
+        not audience.includes_owner_private
+        or not audience.allowed_scope_ids
+        or (needs_capture and not audience.capture_scope_id)
+    ):
+        access = "reads and captures" if needs_capture else "reads"
         raise SharedStoreError(
-            f"a {view.entry_host} entry needs an owner row on its own route, of an owner principal, that reads and "
-            "captures: under these grants the client would not bind as the owner"
+            f"a {view.entry_host} entry needs an owner row on its own route, of an owner principal, that {access}: "
+            "under these grants the client would not bind as the owner"
         )
 
 
@@ -1041,7 +1074,8 @@ def main(argv: list[str]) -> int:
     join.add_argument("--grants-from", help="the installation.json of the home's own store, moved aside")
     join.add_argument(
         "--grants-like",
-        help="a client's entry: the attached entries, Hermes or client, whose owner grants it gets, comma separated, "
+        help="a read-only MCP entry copies read scopes from one named entry; a hook client takes the owner grants "
+        "of the named entries, comma separated, "
         "or all; with no other entry attached, leave it and --capture-like out: the client brings the owner's scope",
     )
     join.add_argument(

@@ -25,7 +25,14 @@ from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field, StrictInt, StrictStr
-from scope_recall.contracts import ContractError, Origin, SourceEvent, TrustedContext, validate_model_request
+from scope_recall.contracts import (
+    READ_ONLY_CLIENT_HOSTS,
+    ContractError,
+    Origin,
+    SourceEvent,
+    TrustedContext,
+    validate_model_request,
+)
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.handoff import execute as execute_handoff
 from scope_recall.core.handoff import tool_schemas as handoff_schemas
@@ -252,6 +259,8 @@ class CodexMCPServer:
 
     def _register_tools(self) -> None:
         for name, description, hints in _TOOLS:
+            if self.host in READ_ONLY_CLIENT_HOSTS and hints.read_only_hint is not True:
+                continue
             if name in _MUTATIONS and self.host not in _THREAD_META:
                 # Claude Code, WorkBuddy and dsh name no conversation with a tool call, so each of these would be
                 # refused on every call: it is not offered.  The person makes such a change through an agent that names

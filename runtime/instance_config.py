@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from ..contracts import ContractError, InstanceBinding, Origin, TrustedContext
+from ..contracts import ENTRY_HOSTS, ContractError, InstanceBinding, Origin, TrustedContext
 from ..core.injection_format import FORMATS
 from ..core.recall_budget import DEFAULT_INJECTION_TOKEN_CAP
 from ..core.recall_log_storage import DEFAULT_LOG_POLICY, LOG_POLICY_BOUNDS
@@ -27,10 +27,6 @@ from .validation import (
 )
 
 _RUNTIME_ORIGINS: frozenset[Origin] = frozenset({"human_direct", "tool_observation", "external_document", "imported"})
-
-
-#: Claude Code runs the Codex adapter as an entry of a shared store (``adapters/clients/config.py``).
-_HOST_ADAPTERS = frozenset({"hermes", "codex", "claude-code", "workbuddy", "dsh"})
 
 
 _VECTOR_BACKENDS = frozenset({"sqlite", "sqlite-vec", "lancedb", "sqlite-bruteforce"})
@@ -205,7 +201,7 @@ class RuntimeInstanceConfig:
         identifier("project_id", self.project_id, required=False)
         identifier("branch_id", self.branch_id, required=False)
         if self.host_adapter is not None:
-            member("host_adapter", self.host_adapter, _HOST_ADAPTERS)
+            member("host_adapter", self.host_adapter, ENTRY_HOSTS)
         identifier("owner_id", self.owner_id)
         for name, (low, high) in _SECONDS_BOUNDS.items():
             strict_float(name, getattr(self, name), minimum=low, maximum=high)

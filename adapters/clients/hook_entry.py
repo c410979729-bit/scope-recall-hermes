@@ -18,6 +18,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from ...contracts import HOOK_CLIENT_HOSTS
 from ...runtime.worker_entry import host_process_credential_environment
 from .boundary import EMPTY_ANSWER
 from .config import load_codex_config, load_shared_client
@@ -32,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     where.add_argument("--home", type=Path, help="Absolute home of a client attached to a shared store")
     parser.add_argument(
         "--host",
-        choices=("codex", "claude-code", "workbuddy", "dsh"),
+        choices=HOOK_CLIENT_HOSTS,
         default="codex",
         help="the client whose hooks call this, for --home",
     )

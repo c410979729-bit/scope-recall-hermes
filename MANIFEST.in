@@ -11,6 +11,7 @@ recursive-include prompts *.txt *.json
 # Docs ship by name, the way modules do: a Markdown file under docs/ reaches
 # the sdist only when it is listed here.
 include docs/install.md
+include docs/install/cherry-studio.md
 include docs/configuration.md
 include docs/capture-contract.md
 include docs/claim-mutation-contract.md

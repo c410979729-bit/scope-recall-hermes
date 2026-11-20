@@ -635,6 +635,12 @@ INSTALLATION_KINDS = frozenset({"local", "shared"})
 #: An entry names the agent a source came in through.  Operator-assigned, never
 #: model-supplied; ``local`` is what every row of a store that predates entries carries.
 ENTRY_ID = re.compile(r"[a-z][a-z0-9-]{1,31}")
+
+# Shared manifests and runtime configurations use these same host identifiers. Only hook clients may capture.
+HOOK_CLIENT_HOSTS = ("codex", "claude-code", "workbuddy", "dsh")
+READ_ONLY_CLIENT_HOSTS = ("cherry-studio",)
+CLIENT_HOSTS = (*HOOK_CLIENT_HOSTS, *READ_ONLY_CLIENT_HOSTS)
+ENTRY_HOSTS = ("hermes", *CLIENT_HOSTS)
 #: What one local binding can carry.
 MAX_BINDING_SCOPES = 128
 #: What one shared binding can carry.  A shared store's worker binds every scope
