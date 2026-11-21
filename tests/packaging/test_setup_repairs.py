@@ -31,6 +31,63 @@ def installed(user, host="workbuddy"):
     return args, result
 
 
+@pytest.mark.parametrize("host", ["hermes", "workbuddy"])
+def test_rerun_recovers_an_old_python_only_from_its_own_binding(fake_user, monkeypatch, host):
+    from plugin_source import linked_interpreter
+    from scope_recall._version import __version__
+    from scope_recall.adapters.installation_receipt import receipt_digest
+    from scope_recall.adapters.shared_entries import read_attachment
+    from scope_recall.maintenance import setup, setup_packages
+    from scope_recall.maintenance.install_receipt import load_receipt, receipt_file
+    from scope_recall.maintenance.shared import attach
+
+    home = fake_user / ("." + host)
+    home.mkdir()
+    args = options(host, "--home", str(home))
+    assert apply_setup(build_plan(args))["status"] == "ready"
+    aliases = []
+    for name in ("TEST-bound", "TEST-other"):
+        directory = fake_user / name
+        directory.mkdir()
+        launcher = linked_interpreter(directory)
+        if launcher is None:
+            pytest.skip("no link to an interpreter can be created here")
+        aliases.append(launcher)
+    bound, other = aliases
+    base = bound.resolve()
+    assert bound != other and other.resolve() == base
+    pointer = read_attachment(home)
+    registration = dict(host=host, instance_root=home, root=pointer.root, entry_id=pointer.entry_id, display_name=host)
+    attach(**registration, python_executable=bound)
+
+    # A new receipt can deliberately select the base while an earlier attachment still records its venv.
+    receipt = load_receipt(home)
+    receipt["python_executable"] = str(base)
+    receipt["receipt_sha256"] = receipt_digest(receipt)
+    receipt_file(home).write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(setup, "interpreter", lambda discovered_home: (other, "host-venv"))
+    monkeypatch.setattr(setup_packages, "probe_python_package", lambda path: {"version": __version__})
+    assert Path(build_plan(args).hosts[0]["python"]) == base
+
+    # Previous writers retained only the resolved target. The registered entry distinguishes its launcher.
+    del receipt["python_executable_as_invoked"]
+    receipt["receipt_sha256"] = receipt_digest(receipt)
+    receipt_file(home).write_text(json.dumps(receipt), encoding="utf-8")
+    recovered = build_plan(args).hosts[0]
+    assert Path(recovered["python"]) == bound and recovered["python_source"] == "attached-entry"
+    override = options(host, "--home", str(home), "--python", str(other))
+    assert Path(build_plan(override).hosts[0]["python"]) == other
+
+    # An unrelated venv sharing the binary may be both discovered and running setup. Neither binds it to this home.
+    attach(**registration)
+    monkeypatch.setattr(sys, "executable", str(other))
+    monkeypatch.setattr(setup_packages, "probe_python_package", lambda path: {})
+    monkeypatch.setattr(setup_packages.shutil, "which", lambda name: None)
+    unbound = build_plan(args)
+    assert Path(unbound.hosts[0]["python"]) == base
+    assert any("--python" in reason for reason in unbound.blockers)
+
+
 def model_file(user, **extra):
     value = {"auxiliary": {"external_embedding": False, "external_consolidation": False, **extra}}
     path = user / "TEST-models.json"

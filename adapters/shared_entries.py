@@ -189,6 +189,12 @@ def shared_entry_manifest(root: Path | str, entry_id: str, *, hermes_home: Path 
     """
     store = Path(str(root)).expanduser().resolve()
     payload = read_shared_payload(store)
+    record = shared_entry_for_home(payload, entry_id, hermes_home=hermes_home)
+    return _entry_view(store, payload, record)
+
+
+def shared_entry_for_home(payload: dict[str, Any], entry_id: str, *, hermes_home: Path | None) -> dict[str, Any]:
+    """Read an entry from a checked manifest, verifying its live binding when a home is specified."""
     record = next((entry for entry in payload["entries"] if entry["entry_id"] == entry_id), None)
     if record is None:
         raise HermesIdentityError("shared store has no such entry")
@@ -199,7 +205,7 @@ def shared_entry_manifest(root: Path | str, entry_id: str, *, hermes_home: Path 
             raise HermesIdentityError("shared store entry is detached")
         if not _same_path(bounded_text(record.get("home"), field="home"), hermes_home):
             raise HermesIdentityError("shared store entry belongs to another home")
-    return _entry_view(store, payload, record)
+    return record
 
 
 def _entry_view(store: Path, payload: dict[str, Any], record: Mapping[str, Any]) -> InstallationManifest:

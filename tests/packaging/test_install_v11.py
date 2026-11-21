@@ -2160,6 +2160,7 @@ def test_plan_install_keeps_a_symlinked_interpreter_as_given(tmp_path):
     start an interpreter with no venv on its path, which cannot import this
     package, so the link is recorded as given.  The chain is still validated through the target."""
     from plugin_source import linked_interpreter
+    from scope_recall.maintenance.install_receipt import load_receipt
 
     link = linked_interpreter(tmp_path)
     if link is None:
@@ -2175,6 +2176,7 @@ def test_plan_install_keeps_a_symlinked_interpreter_as_given(tmp_path):
     )
     assert Path(plan.python_executable) == link
     apply_install(plan)
+    assert load_receipt(instance)["python_executable"] == str(link)
     hooks = json.loads((plugin / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     mcp = json.loads((plugin / ".mcp.json").read_text(encoding="utf-8"))
     assert mcp["mcpServers"]["scope-recall"]["command"] == str(link)

@@ -20,7 +20,7 @@ from .setup_bindings import scope_choice
 from .setup_configuration import read_models
 from .setup_discovery import HOST_DIRECTORIES, HostLocation, discover_hosts, host_locations, interpreter, user_home
 from .setup_existing import existing_entry_home
-from .setup_packages import choose_python
+from .setup_packages import choose_python, receipt_interpreter
 from .setup_projects import project_suggestions
 from .setup_workload import recommended_workload
 
@@ -243,13 +243,20 @@ def build_plan(args: argparse.Namespace, *, environment=None) -> SetupPlan:
         if item is None:
             item = HostLocation(host, home, *interpreter(home))
         receipt = load_receipt(home)
-        python = args.python or (Path(receipt["python_executable"]) if receipt else item.python)
-        if not python.is_absolute():
+        pointer = read_attachment(home)
+        candidate, python_source = item.python, item.python_source
+        if args.python is not None:
+            candidate, python_source = args.python, "--python"
+        elif receipt is not None:
+            candidate = receipt_interpreter(receipt, home, host, pointer)
+            python_source = "install-receipt" if candidate == Path(receipt["python_executable"]) else "attached-entry"
+        if not candidate.is_absolute():
             raise InstallError("python must be absolute")
-        python, package_command, package_problem = choose_python(host, python, explicit=args.python is not None)
+        python, package_command, package_problem = choose_python(
+            host, candidate, explicit=args.python is not None or receipt is not None
+        )
         if package_problem:
             blockers.append(host + ": " + package_problem)
-        pointer = read_attachment(home)
         state = "attached" if pointer is not None else _local_state(host, home, blockers)
         if pointer is not None:
             stores.add(pointer.root)
@@ -265,9 +272,7 @@ def build_plan(args: argparse.Namespace, *, environment=None) -> SetupPlan:
                 home=str(home),
                 env_file=receipt.get("env_file") if receipt else None,
                 python=str(python),
-                python_source=item.python_source
-                if python == item.python
-                else "setup-interpreter; host venv lacks core",
+                python_source=python_source if python == candidate else "setup-interpreter; host venv lacks core",
                 host_python_candidate=str(item.python),
                 package_command=package_command,
                 target=str(target),

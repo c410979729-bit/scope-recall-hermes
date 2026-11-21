@@ -142,7 +142,9 @@ def write_receipt(
         "target_plugin_dir": normalized_path(plan.target_plugin_dir),
         "instance_root": normalized_path(plan.instance_root),
         "project_root": normalized_path(plan.project_root) if plan.project_root is not None else None,
-        "python_executable": normalized_path(plan.python_executable),
+        # Mark a deliberate base interpreter choice as well: old receipts also held the base for any venv symlink.
+        "python_executable": str(plan.python_executable),
+        "python_executable_as_invoked": True,
         "files": files,
     }
     if plan.agent_workspace:
