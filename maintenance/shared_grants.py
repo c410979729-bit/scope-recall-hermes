@@ -1,14 +1,18 @@
-"""Verified owner grants for local shared-store attachment previews."""
+"""Resolve shared-store attachment grants and verify when a client can reuse them."""
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from ..adapters.audiences import LOCAL_PLATFORMS, LOCAL_USER_ID, HermesIdentityError
 from ..adapters.clients.config import CodexConfigError, load_shared_client
 from ..adapters.hermes.identity import bind_hermes_identity
+from ..adapters.hermes.installation import InstallationManifest, build_installation_manifest
 from ..adapters.host_identity import matches_owner_principal
 from ..adapters.shared_entries import read_attachment, read_shared_payload
 from ..contracts import CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, TrustedContext
@@ -18,6 +22,7 @@ from ..core.storage import SQLiteStorage, Transaction
 from .install_hermes import DEFAULT_AGENT_WORKSPACE
 from .legacy_catalog import offline_source_path
 from .migration_records import MigrationError, open_immutable
+from .shared_run import SharedStoreError
 
 
 def _local_owner(row: dict) -> bool:
@@ -32,6 +37,93 @@ def owner_rows(entry: dict) -> list[dict]:
         if row.get("kind") == "owner_private"
         and matches_owner_principal(entry["owner_principals"], platform=row["platform"], user_id=row["user_id"])
     ]
+
+
+def fresh_installation(
+    home: Path,
+    payload: dict[str, Any],
+    agent_identity: str | None = None,
+    *,
+    local_platforms: Sequence[str] = (),
+) -> InstallationManifest:
+    """Build a new entry's owner grants from the store identity and selected local platforms."""
+    manifest = build_installation_manifest(
+        home,
+        agent_id=payload["agent_id"],
+        agent_workspace=DEFAULT_AGENT_WORKSPACE,
+        test_mode=payload["test_mode"],
+        local_platforms=local_platforms,
+    )
+    return replace(manifest, agent_identity=agent_identity)
+
+
+def client_grants(
+    payload: dict[str, Any],
+    home: Path,
+    entry_id: str,
+    like: tuple[str, ...],
+    capture_like: str | None,
+    *,
+    read_only: bool = False,
+) -> tuple[set[str], set[str], str]:
+    """Resolve a client's readable and writable scopes and capture destination.
+
+    The first entry gets the default owner's scope. Later entries must reference
+    attached donors. A write target must be readable by every other owner entry.
+    """
+    entries = {
+        entry["entry_id"]: entry
+        for entry in payload["entries"]
+        if not entry.get("detached_at")
+        and entry["entry_id"] != entry_id
+        and (read_only or entry["host"] not in READ_ONLY_CLIENT_HOSTS)
+    }
+    if not entries:
+        if like or capture_like:
+            raise SharedStoreError(
+                "no other entry is attached to this store to take grants like: attach its first client without "
+                "--grants-like and --capture-like, and it brings the owner's scope"
+            )
+        owner = fresh_installation(home, payload).audience_scopes["owner_private"]
+        return {owner}, set() if read_only else {owner}, owner
+    others = {name: owner_rows(entry) for name, entry in entries.items()}
+    if read_only:
+        if len(like) != 1 or like[0] not in entries:
+            raise SharedStoreError("a read-only MCP entry needs --grants-like naming one attached source entry")
+        donor = entries[like[0]]
+        allowed = {scope for row in others[like[0]] for scope in row["allowed_scope_ids"]}
+        owner = donor["audience_scopes"]["owner_private"]
+        if owner not in allowed:
+            raise SharedStoreError("the selected entry has no verified owner row that reads its owner scope")
+        return allowed, set(), owner
+    if not like or not capture_like:
+        raise SharedStoreError(
+            "a client's entry needs --grants-like and --capture-like: the store has entries attached"
+        )
+    names = tuple(others) if like == ("all",) else like
+    unknown = sorted(set(names) - set(others)) + ([capture_like] if capture_like not in others else [])
+    if unknown:
+        raise SharedStoreError(f"not other entries attached to this store: {', '.join(unknown)}")
+    allowed = {scope for name in names for row in others[name] for scope in row["allowed_scope_ids"]}
+    writable = {scope for name in names for row in others[name] for scope in row["writable_scope_ids"]}
+    captures = {row["capture_scope_id"] for row in others[capture_like]}
+    if len(captures) != 1:
+        raise SharedStoreError(
+            f"{capture_like}'s owner rows capture into {len(captures)} scopes; name an entry with one"
+        )
+    capture = next(iter(captures))
+    unread = sorted(
+        f"{name}:{row['platform']}"
+        for name, rows in others.items()
+        for row in rows
+        if capture not in row["allowed_scope_ids"]
+    )
+    if unread:
+        raise SharedStoreError(
+            f"{capture_like}'s capture scope is not read by these owner rows: {', '.join(unread)}; "
+            "what the owner says in the client would not reach them"
+        )
+    return allowed | {capture}, writable | {capture}, capture
 
 
 def matching_donor(entries: list[dict], *, read_only: bool) -> str | None:

@@ -44,7 +44,6 @@ from ..adapters.hermes.installation import (
     MANIFEST_FILENAME,
     HermesIdentityError,
     InstallationManifest,
-    build_installation_manifest,
     load_archived_installation,
 )
 from ..adapters.hermes.shared_entries import (
@@ -74,9 +73,8 @@ from ..runtime.model_budget import initialize_auxiliary_budget_ledger
 from ..runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 from .backup_relocation import command_text
 from .install_common import RUNTIME_CONFIG_LIMIT
-from .install_hermes import DEFAULT_AGENT_WORKSPACE
-from .shared_grants import owner_rows as _owner_rows
-from .shared_grants import verified_donor
+from .shared_grants import client_grants as _client_grants
+from .shared_grants import fresh_installation, verified_donor
 from .shared_import import import_entry
 from .shared_run import Run, SharedStoreError, encoded, home_lock, replace_file, store_lock, write_json
 
@@ -210,105 +208,6 @@ def _entry_config(
         )
     RuntimeInstanceConfig.from_mapping(out)
     return out
-
-
-def fresh_installation(
-    home: Path,
-    payload: dict[str, Any],
-    agent_identity: str | None = None,
-    *,
-    local_platforms: Sequence[str] = (),
-) -> InstallationManifest:
-    """The grants of a home with no installation to carry over: a fresh installation's, the CLI's owner row, and the
-    owner's row on each of ``local_platforms`` (``approve_local_platforms``), which setup passes for a new entry.
-
-    Its owner scope is the one an installation of the store's agent made with the default workspace holds: that
-    installation's entry and an entry given these grants read, write and capture into the same scope.
-    The optional host identity names its profile without changing those scopes.
-    """
-    manifest = build_installation_manifest(
-        home,
-        agent_id=payload["agent_id"],
-        agent_workspace=DEFAULT_AGENT_WORKSPACE,
-        test_mode=payload["test_mode"],
-        local_platforms=local_platforms,
-    )
-    return replace(manifest, agent_identity=agent_identity)
-
-
-def _client_grants(
-    payload: dict[str, Any],
-    home: Path,
-    entry_id: str,
-    like: tuple[str, ...],
-    capture_like: str | None,
-    *,
-    read_only: bool = False,
-) -> tuple[set[str], set[str], str]:
-    """What a client entry reads, writes and captures into, taken from the owner rows of the store's other attached
-    entries, Hermes homes and clients alike.
-
-    It reads what the owner reads through any of ``like`` (``("all",)``: every other attached entry), may write where
-    the owner may there, and captures where ``capture_like``'s owner captures, which must be a scope every owner row
-    of every other attached entry reads: what the owner says in the client reaches every agent, and no other entry's
-    grants change.  With no other entry attached, the client is the store's first and there is nothing to be like: it
-    gets the owner grants of a fresh installation, as a Hermes home attached without ``--grants-from`` does, and
-    brings their owner scope into the store.  The client's own record, when it is attached again, is not one of the
-    others: running the same attach again finishes or repeats it.
-    """
-    entries = {
-        entry["entry_id"]: entry
-        for entry in payload["entries"]
-        if not entry.get("detached_at")
-        and entry["entry_id"] != entry_id
-        and (read_only or entry["host"] not in READ_ONLY_CLIENT_HOSTS)
-    }
-    if not entries:
-        if like or capture_like:
-            raise SharedStoreError(
-                "no other entry is attached to this store to take grants like: attach its first client without "
-                "--grants-like and --capture-like, and it brings the owner's scope"
-            )
-        owner = fresh_installation(home, payload).audience_scopes["owner_private"]
-        return {owner}, set() if read_only else {owner}, owner
-    others = {name: _owner_rows(entry) for name, entry in entries.items()}
-    if read_only:
-        if len(like) != 1 or like[0] not in entries:
-            raise SharedStoreError("a read-only MCP entry needs --grants-like naming one attached source entry")
-        donor = entries[like[0]]
-        allowed = {scope for row in others[like[0]] for scope in row["allowed_scope_ids"]}
-        owner = donor["audience_scopes"]["owner_private"]
-        if owner not in allowed:
-            raise SharedStoreError("the selected entry has no verified owner row that reads its owner scope")
-        return allowed, set(), owner
-    if not like or not capture_like:
-        raise SharedStoreError(
-            "a client's entry needs --grants-like and --capture-like: the store has entries attached"
-        )
-    names = tuple(others) if like == ("all",) else like
-    unknown = sorted(set(names) - set(others)) + ([capture_like] if capture_like not in others else [])
-    if unknown:
-        raise SharedStoreError(f"not other entries attached to this store: {', '.join(unknown)}")
-    allowed = {scope for name in names for row in others[name] for scope in row["allowed_scope_ids"]}
-    writable = {scope for name in names for row in others[name] for scope in row["writable_scope_ids"]}
-    captures = {row["capture_scope_id"] for row in others[capture_like]}
-    if len(captures) != 1:
-        raise SharedStoreError(
-            f"{capture_like}'s owner rows capture into {len(captures)} scopes; name an entry with one"
-        )
-    capture = next(iter(captures))
-    unread = sorted(
-        f"{name}:{row['platform']}"
-        for name, rows in others.items()
-        for row in rows
-        if capture not in row["allowed_scope_ids"]
-    )
-    if unread:
-        raise SharedStoreError(
-            f"{capture_like}'s capture scope is not read by these owner rows: {', '.join(unread)}; "
-            "what the owner says in the client would not reach them"
-        )
-    return allowed | {capture}, writable | {capture}, capture
 
 
 def _ledger_made(raw: dict[str, Any]) -> list[str]:
