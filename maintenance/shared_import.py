@@ -55,7 +55,7 @@ from ..adapters.hermes.shared_entries import read_shared_payload
 from ..contracts import InstanceBinding, TrustedContext
 from ..core import lexical_index
 from ..core.delete_storage import group_digest
-from ..core.events import indexed_terms, withheld_tool_output
+from ..core.events import indexed_terms, tool_observation_excerpt, withheld_tool_output
 from ..core.requalify import settle_brought_denials
 from ..core.schema import SCHEMA_VERSION
 from ..core.source_records import restart_body_scan_maintenance
@@ -256,6 +256,50 @@ def _claim_exclusions(conn, src):
             left_out.add(claim["claim_id"])
             skipped.append({"claim_id": claim["claim_id"], "kept": held[0], "kind": claim["kind"]})
     return left_out, skipped, summaries
+
+
+def _copy_source_postings(conn, src, source_offset: int) -> dict[str, int]:
+    """Copy existing source postings and reproject excerpts under the current rule."""
+    conn.execute("CREATE TEMP TABLE import_terms(old_id INTEGER PRIMARY KEY, term TEXT NOT NULL)")
+    cursor = src.execute("SELECT term_id, term FROM lexical_terms")
+    while batch := cursor.fetchmany(_CHUNK):
+        conn.executemany("INSERT INTO temp.import_terms(old_id, term) VALUES (?,?)", batch)
+    conn.execute("INSERT OR IGNORE INTO lexical_terms(term) SELECT term FROM temp.import_terms")
+    terms = dict(
+        conn.execute("SELECT i.old_id, t.term_id FROM temp.import_terms i JOIN lexical_terms t ON t.term=i.term")
+    )
+    conn.execute("DROP TABLE temp.import_terms")
+    projected: dict[int, tuple[str, ...]] = {}
+    withheld = 0
+    for source_id, role, origin, original_origin, content, blocked in src.execute(
+        f"""SELECT e.source_id,e.role,e.origin,e.source_original_origin,e.content,e.read_blocked FROM source_events e
+            WHERE (e.role='tool' AND {OMITTED_TOOL_OUTPUT}) OR (
+                (e.origin='tool_observation' OR e.origin='imported' AND e.source_original_origin='tool_observation')
+                AND EXISTS(SELECT 1 FROM lexical_postings p WHERE p.source_id=e.source_id))"""
+    ):
+        event = {"role": role, "origin": origin, "source_original_origin": original_origin, "content": content}
+        omitted = withheld_tool_output(event)
+        if omitted or tool_observation_excerpt(event) is not None:
+            projected[source_id] = () if blocked else indexed_terms(event)
+            withheld += int(omitted)
+
+    replaced_terms = set()
+
+    def remap(row):
+        term = terms.get(row["term_id"])
+        if term is None:
+            return None
+        if row["source_id"] in projected:
+            replaced_terms.add(term)
+            return None
+        return {"term_id": term, "source_id": row["source_id"] + source_offset}
+
+    postings = _copy(conn, src, "lexical_postings", remap, verb="INSERT OR IGNORE")
+    for source_id, keep in projected.items():
+        postings += lexical_index.index_terms(conn, source_id + source_offset, keep)
+    if replaced_terms:
+        lexical_index.prune_terms(conn, replaced_terms)
+    return {"lexical_postings": postings, "withheld_outputs": withheld}
 
 
 def _import_rows(conn, src, names: _Names, *, store_installation: str, store_scopes: frozenset[str], now: str) -> dict:
@@ -483,38 +527,7 @@ def _import_rows(conn, src, names: _Names, *, store_installation: str, store_sco
         conn, src, "expired_vectors", lambda r: {**r, "source_ref": names.event(r["source_ref"])}
     )
 
-    conn.execute("CREATE TEMP TABLE import_terms(old_id INTEGER PRIMARY KEY, term TEXT NOT NULL)")
-    cursor = src.execute("SELECT term_id, term FROM lexical_terms")
-    while batch := cursor.fetchmany(_CHUNK):
-        conn.executemany("INSERT INTO temp.import_terms(old_id, term) VALUES (?,?)", batch)
-    conn.execute("INSERT OR IGNORE INTO lexical_terms(term) SELECT term FROM temp.import_terms")
-    terms = dict(
-        conn.execute("SELECT i.old_id, t.term_id FROM temp.import_terms i JOIN lexical_terms t ON t.term=i.term")
-    )
-    conn.execute("DROP TABLE temp.import_terms")
-    # A withheld tool output's placeholder is indexed by its error text alone, when it carries one; the rest of the
-    # postings the source store holds for it stay behind.
-    withheld: dict[int, tuple[str, ...]] = {}
-    for source_id, role, content in src.execute(
-        f"SELECT e.source_id, e.role, e.content FROM source_events e WHERE e.role='tool' AND {OMITTED_TOOL_OUTPUT}"
-    ):
-        event = {"role": role, "content": content}
-        if withheld_tool_output(event):
-            withheld[source_id] = indexed_terms(event)
-    counts["lexical_postings"] = _copy(
-        conn,
-        src,
-        "lexical_postings",
-        lambda r: (
-            None
-            if r["term_id"] not in terms or r["source_id"] in withheld
-            else {"term_id": terms[r["term_id"]], "source_id": r["source_id"] + source_offset}
-        ),
-        verb="INSERT OR IGNORE",
-    )
-    for source_id, keep in withheld.items():
-        counts["lexical_postings"] += lexical_index.index_terms(conn, source_id + source_offset, keep)
-    counts["withheld_outputs"] = len(withheld)
+    counts.update(_copy_source_postings(conn, src, source_offset))
 
     expired = {
         (ref, revision) for ref, revision in src.execute("SELECT source_ref, source_revision FROM expired_vectors")

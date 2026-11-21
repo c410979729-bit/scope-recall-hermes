@@ -100,14 +100,25 @@ def unindex(conn, sources: Iterable[int]) -> int:
 
 def unindex_beyond(conn, source: int, keep: Iterable[str] = ()) -> int:
     """Drop the postings of one source version whose terms are not in ``keep``.  Returns how many went."""
-    kept = tuple(keep)
-    if not kept:
-        return unindex(conn, (source,))
-    return conn.execute(
-        f"""DELETE FROM lexical_postings WHERE source_id=? AND term_id NOT IN
-            (SELECT term_id FROM lexical_terms WHERE term IN ({",".join("?" for _ in kept)}))""",
-        (source, *kept),
-    ).rowcount
+    removed = conn.execute(
+        """DELETE FROM lexical_postings WHERE source_id=? AND term_id NOT IN
+           (SELECT term_id FROM lexical_terms WHERE term IN (SELECT value FROM json_each(?))) RETURNING term_id""",
+        (source, json.dumps(tuple(keep), ensure_ascii=False)),
+    ).fetchall()
+    if removed:
+        prune_terms(conn, tuple(row[0] for row in removed))
+    return len(removed)
+
+
+def prune_terms(conn, ids: Iterable[int]) -> None:
+    """Delete orphan terms from an affected set only, including after projection repair."""
+    conn.execute(
+        "DELETE FROM lexical_terms WHERE term_id IN (SELECT value FROM json_each(?)) "
+        "AND NOT EXISTS(SELECT 1 FROM lexical_postings p WHERE p.term_id=lexical_terms.term_id) "
+        "AND NOT EXISTS(SELECT 1 FROM claim_lexical_postings p WHERE p.term_id=lexical_terms.term_id) "
+        "AND NOT EXISTS(SELECT 1 FROM claim_version_postings p WHERE p.term_id=lexical_terms.term_id)",
+        (json.dumps(tuple(ids)),),
+    )
 
 
 #: Placeholders one page may look at.  A page drops about ten postings each in one write transaction, and holds the
@@ -247,13 +258,7 @@ def _replace_claim_terms(conn, refs: tuple[str, ...], postings: list[tuple[str, 
             (json.dumps(postings, ensure_ascii=False),),
         )
     if previous:
-        conn.execute(
-            "DELETE FROM lexical_terms WHERE term_id IN (SELECT value FROM json_each(?)) "
-            "AND NOT EXISTS(SELECT 1 FROM lexical_postings p WHERE p.term_id=lexical_terms.term_id) "
-            "AND NOT EXISTS(SELECT 1 FROM claim_lexical_postings p WHERE p.term_id=lexical_terms.term_id) "
-            "AND NOT EXISTS(SELECT 1 FROM claim_version_postings p WHERE p.term_id=lexical_terms.term_id)",
-            (json.dumps(previous),),
-        )
+        prune_terms(conn, previous)
 
 
 def _replace_version_terms(conn, refs: tuple[str, ...], *, remove: bool) -> tuple[int, ...]:

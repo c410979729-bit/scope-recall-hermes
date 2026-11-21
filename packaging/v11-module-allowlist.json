@@ -284,6 +284,7 @@
     "maintenance/backup_replay.py",
     "maintenance/budget.py",
     "maintenance/cli.py",
+    "maintenance/compact_store.py",
     "maintenance/disaster_restore.py",
     "maintenance/doctor.py",
     "maintenance/doctor_recall.py",

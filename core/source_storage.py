@@ -22,6 +22,7 @@ from .events import (
     query_terms,
     segment_key,
     stored_content_digest,
+    tool_observation_excerpt,
     withheld_tool_output,
 )
 from .inbox_rules import REKEY_MARKER, deleted_forms, deleted_text, holds_events, waiting
@@ -473,9 +474,8 @@ class Sources:
             raise ContractError("SOURCE_MISSING")
         identity = lexical_index.source_id(conn, ref, revision)
         terms = indexed_terms(source.event)
-        if withheld_tool_output(source.event):
-            # A withheld output's placeholder is indexed by its error text alone; any posting it holds beyond that
-            # goes.
+        if withheld_tool_output(source.event) or tool_observation_excerpt(source.event) is not None:
+            # Repair may encounter postings from before the source was excerpted.
             lexical_index.unindex_beyond(conn, identity, terms)
         lexical_index.index_terms(conn, identity, terms)
 

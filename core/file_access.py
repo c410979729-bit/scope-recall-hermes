@@ -8,12 +8,12 @@ from ctypes import wintypes
 from pathlib import Path
 
 
-def preserve_file_access(source: Path, target: Path) -> None:
+def preserve_file_access(source: Path, target: Path, *, protect_acl: bool = False) -> None:
     """Keep the source owner and DACL on Windows; restrict POSIX copies to their owner.
 
-    Both paths are existing files in the same protected directory. Call this
-    while the new target is still empty. Failure must abort the write rather
-    than publish a copy under broader inherited permissions.
+    Call this while the target is still empty. Protect the ACL when copying
+    to another directory so its inherited permissions cannot widen access.
+    Failure must abort the write before any protected content is copied.
     """
     if os.name != "nt":
         os.chmod(target, 0o600)
@@ -87,7 +87,7 @@ def preserve_file_access(source: Path, target: Path) -> None:
         if not api.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)):
             raise ctypes.WinError(ctypes.get_last_error())
         # Preserve protected versus inherited DACL semantics, not just its ACEs.
-        inheritance = 0x80000000 if control.value & 0x1000 else 0x20000000
+        inheritance = 0x80000000 if protect_acl or control.value & 0x1000 else 0x20000000
         flags = 4 if same_owner() else 5
         status = api.SetNamedSecurityInfoW(
             ctypes.create_unicode_buffer(str(target)),

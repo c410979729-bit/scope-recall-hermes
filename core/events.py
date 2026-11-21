@@ -246,14 +246,33 @@ def withheld_tool_output(event) -> bool:
     return event.get("role") == "tool" and bool(_WITHHELD_TOOL_OUTPUT.match(str(event.get("content") or "").strip()))
 
 
+TOOL_OBSERVATION_INDEX_CHARS = 1024
+_EXCERPT_GAP = "\n…\n"
+
+
+def tool_observation_excerpt(event) -> str | None:
+    """Return an optional bounded search excerpt; each stored revision keeps its full evidence."""
+    origin = event.get("source_original_origin") if event.get("origin") == "imported" else event.get("origin")
+    if origin != "tool_observation":
+        return None
+    # The embedding encoder normalizes before applying its input budget. Cut in
+    # the same representation so normalization cannot push the tail out of that budget.
+    text = unicodedata.normalize("NFKC", event["content"])
+    if len(text) <= TOOL_OBSERVATION_INDEX_CHARS:
+        return None
+    head = (TOOL_OBSERVATION_INDEX_CHARS - len(_EXCERPT_GAP)) // 2
+    tail = TOOL_OBSERVATION_INDEX_CHARS - len(_EXCERPT_GAP) - head
+    return text[:head] + _EXCERPT_GAP + text[-tail:]
+
+
 def indexed_terms(event) -> tuple[str, ...]:
     """The terms a source is indexed by.  A withheld tool output's placeholder is indexed by its error text alone,
     when it carries one: the rest is the envelope's own words, and indexed, the placeholders push ordinary words such
     as "tool", "status" and "patch" past the common-term ceiling, so questions lose them."""
-    if not withheld_tool_output(event):
-        return lexical_terms(event["content"])
-    error = _WITHHELD_ERROR.search(str(event.get("content") or ""))
-    return lexical_terms(error.group(1)) if error else ()
+    if withheld_tool_output(event):
+        error = _WITHHELD_ERROR.search(str(event.get("content") or ""))
+        return lexical_terms(error.group(1)) if error else ()
+    return lexical_terms(tool_observation_excerpt(event) or event["content"])
 
 
 def lexical_terms(text: str) -> tuple[str, ...]:

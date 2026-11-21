@@ -34,6 +34,8 @@ from scope_recall.core.writer_lease import TruthWriterBusyError, TruthWriterLeas
 
 from ..host_registry import ENTRY_HOSTS, INSTALL_HOSTS, LOCAL_STORE_HOSTS
 from .backup import BackupError, sqlite_busy
+from .compact_store import add_arguments as _add_compact_store_arguments
+from .compact_store import compact_store
 from .doctor import run_doctor
 from .doctor_store import read_journal_mode, recorded_schema_under_stale_header, schema_on_disk
 from .install import InstallError, apply_install, apply_uninstall, default_target, plan_install, plan_uninstall
@@ -682,6 +684,20 @@ def _report_other_tables(result: dict[str, Any], database: Path) -> None:
             )
 
 
+def _compact_store(args: argparse.Namespace) -> int:
+    """Run offline compaction and emit only a metadata receipt."""
+    if args.apply != (args.output is not None):
+        raise BackupError("--output is required with --apply and unavailable with --dry-run")
+    try:
+        result = compact_store(args.source, output=args.output, retention_days=args.retention_days)
+    except sqlite3.Error as exc:
+        raise BackupError(f"SQLite compaction failed ({getattr(exc, 'sqlite_errorname', type(exc).__name__)})") from exc
+    except OSError as exc:
+        raise BackupError(f"store compaction I/O failed ({type(exc).__name__}, error {exc.errno})") from exc
+    _emit(result)
+    return 0
+
+
 def _add_uninstall_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--instance-root", required=True)
     parser.add_argument("--target-plugin-dir")
@@ -756,6 +772,12 @@ _COMMANDS: tuple[
         "bring one store forward to this release's schema now, with a snapshot first",
         _add_upgrade_store_arguments,
         _upgrade_store,
+    ),
+    (
+        "compact-store",
+        "inspect or compact a separate copy of an offline SQLite store",
+        _add_compact_store_arguments,
+        _compact_store,
     ),
     ("plan-uninstall", None, _add_uninstall_arguments, _plan_uninstall),
     ("apply-uninstall", None, _add_uninstall_arguments, _apply_uninstall),

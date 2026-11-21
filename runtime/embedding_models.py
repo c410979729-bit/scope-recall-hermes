@@ -14,6 +14,7 @@ from functools import partial
 from typing import Any
 
 from ..core.endpoint_policy import endpoint_scheme_allowed
+from ..core.events import tool_observation_excerpt
 from ..core.recall_policy import (
     EMBEDDING_DIALECTS,
     EMBEDDING_SPACE,
@@ -293,6 +294,17 @@ def _encoded_document(text: str) -> str:
     return encoded
 
 
+def _source_document(source: StoredSource) -> str:
+    """Share the tool excerpt with lexical search and screen its original cut boundaries."""
+    original = source.event["content"]
+    excerpt = tool_observation_excerpt(source.event)
+    if excerpt is not None:
+        # A cut can leave less than the minimum length of a secret's pattern,
+        # or omit a label that identified the retained tail as sensitive.
+        reject_secrets(original)
+    return original if excerpt is None else excerpt
+
+
 class GeminiEmbeddingAdapter:
     def __init__(
         self,
@@ -354,7 +366,8 @@ class GeminiEmbeddingAdapter:
             self._transport.close()
 
     def embed_source(self, source: StoredSource, *, remaining_seconds: float) -> Sequence[float]:
-        return self._embed(_encoded_document(source.event["content"]), remaining_seconds=remaining_seconds)
+        """Embed the source's bounded search text through the guarded document route."""
+        return self._embed(_encoded_document(_source_document(source)), remaining_seconds=remaining_seconds)
 
     def embed_sources(
         self, sources: Sequence[StoredSource], *, remaining_seconds: float
@@ -365,7 +378,7 @@ class GeminiEmbeddingAdapter:
         request, and a store with a hundred thousand sources is a hundred
         thousand requests to rebuild one at a time.
         """
-        return self.embed_texts([source.event["content"] for source in sources], remaining_seconds=remaining_seconds)
+        return self.embed_texts([_source_document(source) for source in sources], remaining_seconds=remaining_seconds)
 
     def embed_texts(self, texts: Sequence[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
         """Embed document texts, each encoded and screened as ``embed_text`` does, using ``MAX_EMBED_BATCH`` as a

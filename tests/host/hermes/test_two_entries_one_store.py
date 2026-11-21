@@ -700,6 +700,35 @@ def test_an_id_two_old_stores_share_otherwise_refuses_the_second_and_writes_noth
     assert _query(root, "SELECT entry_id, count(*) FROM source_events GROUP BY entry_id") == [("agent3", 1)]
 
 
+def test_import_rebuilds_search_terms_for_long_tool_observations(root, entries):
+    from scope_recall.core import lexical_index
+    from scope_recall.core.events import lexical_terms
+    from v11_support import source_event
+
+    agent3, _agent2 = entries
+    scope = _scope(agent3)
+    core, context, _, old = _old_store(agent3, scope)
+    content = "startsignal\n" + "TEST logger words " * 100 + "hiddenmiddle " + "logs continued " * 100 + "\nendsignal"
+    observation = source_event(origin="tool_observation", role="tool", content=content)
+    tool_context = replace(context, actor_origin="tool_observation")
+    result = core.record_event(tool_context, observation, scope_id=scope, remaining_seconds=10)
+    source = result.event_refs[0]
+    with core.storage.write(context, remaining_seconds=10) as tx:
+        db = tx._check(write=True)
+        source_id = lexical_index.source_id(db, source.ref, source.revision)
+        lexical_index.index_terms(db, source_id, lexical_terms(content))
+    result = import_entry(root=root, entry_id="agent3", source=old)
+    assert result["status"] == "imported"
+    assert _query(root, "SELECT content FROM source_events") == [(content,)]
+    terms = _query(
+        root,
+        f"SELECT t.term FROM {lexical_index.JOIN} "
+        "WHERE t.term IN ('startsignal','hiddenmiddle','endsignal') ORDER BY t.term",
+    )
+    assert terms == [("endsignal",), ("startsignal",)]
+    assert not _query(root, "SELECT 1 FROM lexical_terms WHERE term='hiddenmiddle'")
+
+
 def test_import_keeps_owner_actions_and_missing_source_suppression(root, entries):
     from scope_recall.core.management import MemoryManagement
     from scope_recall.core.restore import InstallationMaintenance
