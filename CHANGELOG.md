@@ -6,7 +6,7 @@
 
 - [Antigravity](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/antigravity.md) can capture completed turns and recall evidence from a local or remote store.
 - [Cherry Studio](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/cherry-studio.md) can search a shared store through a read-only MCP entry.
-- Hermes can queue captures while a remote store is offline.
+- Hermes can run on a separate machine from its store and queue captures while the store is offline.
 - Owners can review and correct source attribution across entries.
 
 ### Fixed
