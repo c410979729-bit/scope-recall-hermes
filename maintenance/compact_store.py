@@ -6,6 +6,9 @@ import argparse
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
+from collections.abc import Callable
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +27,36 @@ _STORE_LOCKS = (
     "scope-recall-retained.lock",
     "runtime-worker.lock",
 )
+
+# Keep the pager lock in a separate process: POSIX record locks belong to a
+# process and would otherwise merge with SQLite's own locks in that process.
+# The Windows VFS locks the reserved 512-byte range at the 1 GiB boundary.
+# A POSIX whole-file record lock covers that range even beyond the file's EOF.
+# POSIX needs a writable descriptor for that lock. The holder never writes.
+_PAGER_LOCK_PROCESS = """
+import os
+import sys
+
+try:
+    with open(sys.argv[1], 'rb' if os.name == 'nt' else 'r+b', buffering=0) as source:
+        info = os.fstat(source.fileno())
+        if (info.st_dev, info.st_ino) != tuple(map(int, sys.argv[2:])):
+            sys.exit(2)
+        if os.name == 'nt':
+            import msvcrt
+            source.seek(1073741824)
+            msvcrt.locking(source.fileno(), msvcrt.LK_NBLCK, 512)
+        elif os.name == 'posix':
+            import fcntl
+            fcntl.lockf(source.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            sys.exit(2)
+        sys.stdout.buffer.write(b'1')
+        sys.stdout.buffer.flush()
+        sys.stdin.buffer.read(1)
+except OSError:
+    sys.exit(2)
+"""
 
 # A partially processed or failed item can resume from its staged fragments.
 # Require both a final outcome and a done, unleased work item before trimming.
@@ -93,18 +126,35 @@ def _offline_file(path: Path) -> os.stat_result:
 
 
 @contextmanager
+def _exclusive_pager(source: Path, before: os.stat_result):
+    """Hold SQLite's native file lock from before inspection through publication."""
+    argv = [sys.executable, "-IBS", "-c", _PAGER_LOCK_PROCESS, str(source), str(before.st_dev), str(before.st_ino)]
+    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as owner:
+        if owner.stdout is None or owner.stdout.read(1) != b"1":
+            raise BackupError("store is busy or the SQLite file could not be locked exclusively")
+        yield owner
+
+
+@contextmanager
 def _read_store(source: Path):
     """Hold the runtime locks through the final source check and output publication."""
     if any(first_link(source.parent / name) is not None for name in _STORE_LOCKS):
         raise BackupError("store lock files must not be symlinks or reparse points")
     with exclusive_store(source.parent, busy=lambda _reason: BackupError("store is busy: stop all store processes")):
         before = _offline_file(source)
-        # SQLite's ordinary read-only WAL mode may create shm or wal files.
-        # An immutable reader is safe here under the directory writer/worker
-        # leases, with a clean database and a second source check before publish.
-        with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as reader:
-            _verify_schema(reader)
-            yield reader, before
+        with _exclusive_pager(source, before) as owner:
+
+            def check_source() -> None:
+                if owner.poll() is not None:
+                    raise BackupError("exclusive SQLite file lock was lost")
+                _unchanged(source, before)
+
+            check_source()
+            # The native pager lock excludes independent SQLite readers and
+            # writers. This handle can read without opening source journals.
+            with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as reader:
+                _verify_schema(reader)
+                yield reader, before, check_source
 
 
 def _unchanged(source: Path, before: os.stat_result) -> None:
@@ -184,7 +234,12 @@ def _trim_and_vacuum(conn: sqlite3.Connection, params: dict, measured: dict) -> 
 
 
 def _copy_store(
-    reader: sqlite3.Connection, source: Path, before: os.stat_result, output: Path, params: dict, measured: dict
+    reader: sqlite3.Connection,
+    source: Path,
+    output: Path,
+    params: dict,
+    measured: dict,
+    check_source: Callable[[], None],
 ) -> int:
     """Transform a protected staging file; publish atomically without overwriting."""
     stage = output.with_name(f".scope-recall-compact-{uuid4().hex}.sqlite3")
@@ -195,7 +250,6 @@ def _copy_store(
         with closing(sqlite3.connect(stage)) as copy:
             reader.backup(copy)
             _trim_and_vacuum(copy, params, measured)
-        _unchanged(source, before)
         if not os.path.samestat(owned, stage.lstat()) or any(os.path.lexists(p) for p in _sidecars(stage)):
             raise BackupError("staging copy changed or has unexpected SQLite sidecars")
         if any(os.path.lexists(p) for p in (output, *_sidecars(output))):
@@ -203,6 +257,7 @@ def _copy_store(
         with stage.open("rb+") as file:
             os.fsync(file.fileno())
             size = os.fstat(file.fileno()).st_size
+        check_source()
         os.link(stage, output)
         return size
     finally:
@@ -225,7 +280,7 @@ def compact_store(
             raise BackupError("output or an output sidecar already exists")
     cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
     params = {"cutoff": cutoff, "large_fragment_bytes": _LARGE_FRAGMENT_BYTES}
-    with _read_store(source) as (reader, before):
+    with _read_store(source) as (reader, before, check_source):
         measured = _measure(reader, params)
         result = {
             "status": "dry_run",
@@ -236,8 +291,8 @@ def compact_store(
             **measured,
         }
         if output is None:
-            _unchanged(source, before)
+            check_source()
         else:
-            output_bytes = _copy_store(reader, source, before, output, params, measured)
+            output_bytes = _copy_store(reader, source, output, params, measured, check_source)
             result.update(status="compacted", output=str(output), output_bytes=output_bytes)
     return result

@@ -2,9 +2,10 @@
 
 import json
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 
+import pytest
 from scope_recall.core.backup_primitives import BackupError, sha256
 from scope_recall.core.storage import Transaction
 from scope_recall.core.writer_lease import TruthWriterLease
@@ -154,6 +155,82 @@ def test_live_writer_and_sqlite_sidecar_are_refused(app, tmp_path, capsys):
         assert main(apply) == 2
         assert "SQLite sidecars" in capsys.readouterr().out
     assert not output.exists() and sha256(source) == before
+
+
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("mode", ["IMMEDIATE", "EXCLUSIVE"])
+def test_rollback_journal_transactions_refuse_compaction(app, tmp_path, capsys, apply, mode):
+    source = app[0].storage.path
+    output = tmp_path / "locked-source.sqlite3"
+    args = ["compact-store", "--source", str(source)]
+    args += ["--apply", "--output", str(output)] if apply else ["--dry-run"]
+    with closing(sqlite3.connect(source)) as writer:
+        assert writer.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+        before = sha256(source)
+        writer.execute(f"BEGIN {mode}")
+        assert not list(source.parent.glob("memory.sqlite3-*"))
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=0)) as reader:
+            if mode == "EXCLUSIVE":
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    reader.execute("SELECT * FROM instance_meta").fetchall()
+            else:
+                assert reader.execute("SELECT * FROM instance_meta").fetchall()
+        assert main(args) == 2
+        assert "store is busy" in capsys.readouterr().out
+        assert not output.exists() and not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*"))
+        assert not list(source.parent.glob("memory.sqlite3-*")) and sha256(source) == before
+
+
+@pytest.mark.parametrize("mode", ["DELETE", "WAL"])
+def test_offline_pager_lock_blocks_competing_read_and_write(app, tmp_path, capsys, monkeypatch, mode):
+    source = app[0].storage.path
+    output = tmp_path / "locked-through-publish.sqlite3"
+    with closing(sqlite3.connect(source)) as setup:
+        assert setup.execute(f"PRAGMA journal_mode={mode}").fetchone() == (mode.lower(),)
+    before = sha256(source)
+    measure = compact_store._measure
+
+    def check_gate(reader, params):
+        for statement in ("SELECT * FROM instance_meta", "BEGIN IMMEDIATE"):
+            with closing(sqlite3.connect(source, timeout=0)) as peer:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    peer.execute(statement).fetchall()
+        assert not list(source.parent.glob("memory.sqlite3-*"))
+        return measure(reader, params)
+
+    monkeypatch.setattr(compact_store, "_measure", check_gate)
+    assert main(["compact-store", "--source", str(source), "--apply", "--output", str(output)]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "compacted"
+    assert output.exists() and sha256(source) == before
+    assert not list(source.parent.glob("memory.sqlite3-*"))
+    with closing(sqlite3.connect(source)) as peer:
+        assert peer.execute("SELECT * FROM instance_meta").fetchall()
+
+
+def test_compaction_drops_the_staged_copy_if_the_pager_lock_is_lost(app, tmp_path, capsys, monkeypatch):
+    source = app[0].storage.path
+    output = tmp_path / "lost-lock.sqlite3"
+    before = sha256(source)
+    exclusive = compact_store._exclusive_pager
+    trim = compact_store._trim_and_vacuum
+
+    @contextmanager
+    def exit_after_trim(path, info):
+        with exclusive(path, info) as owner:
+
+            def trim_then_exit(conn, params, measured):
+                trim(conn, params, measured)
+                owner.terminate()
+                owner.wait(timeout=5)
+
+            monkeypatch.setattr(compact_store, "_trim_and_vacuum", trim_then_exit)
+            yield owner
+
+    monkeypatch.setattr(compact_store, "_exclusive_pager", exit_after_trim)
+    assert main(["compact-store", "--source", str(source), "--apply", "--output", str(output)]) == 2
+    assert "exclusive SQLite file lock was lost" in capsys.readouterr().out
+    assert not output.exists() and not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*"))
+    assert sha256(source) == before
 
 
 def test_verification_failure_leaves_no_published_or_staging_file(app, tmp_path, capsys, monkeypatch):
