@@ -134,10 +134,11 @@ store; a 1.x or 2.x store is migrated into the agent's home first (`scope-recall
 
 ## Attach Codex or Claude Code
 
-For a client on the owner's computer, `attach` can show a complete command to reuse a verified entry’s access. Omit both grant
-options when the attached entries have the same approved local account, owner identities, read/write
-scopes and capture destination. Review and run the suggested command to attach the new entry. Otherwise choose the entries whose owner grants the client should
-inherit with `--grants-like`, and choose its capture destination with `--capture-like`. A read-only MCP
+For a client on the owner's computer, `attach` can show a complete command to reuse one verified entry's access. Omit both
+grant options to get a preview when the attached entries' current local bindings agree on the owner and permissions.
+Review and run the suggested command to attach the client. If the store has uncheckpointed SQLite changes,
+or the bindings cannot be verified, the preview asks for explicit grants. Choose the owner grants with
+`--grants-like` and the capture destination with `--capture-like`. The explicit command can run while the worker is active. A read-only MCP
 entry takes only read grants. Rows without a verified owner do not supply grants. What the owner types into
 it is captured into the scope another entry's owner captures into (`--capture-like`), which must
 be one every effective owner row of every attached entry reads, so that every agent hears it; otherwise

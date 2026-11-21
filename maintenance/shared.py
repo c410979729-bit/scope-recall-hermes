@@ -65,6 +65,7 @@ from ..adapters.hermes.shared_entries import (
     shared_entry_record,
     write_shared_payload,
 )
+from ..adapters.shared_entries import check_attachment_target
 from ..contracts import HOOK_CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
 from ..core.storage import SQLiteStorage
 from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
@@ -444,6 +445,86 @@ def _runtime_configs(
     return entry_config, worker_config, worker_now, notes
 
 
+def _check_implicit_home(root: Path, target: dict) -> None:
+    """Keep an implicit attach from changing a pointer to another entry or store."""
+    pointer = read_attachment(target["home"])
+    if pointer is not None and (pointer.root, pointer.entry_id, pointer.host) != (
+        root.resolve(),
+        target["entry_id"],
+        target["host"],
+    ):
+        raise SharedStoreError("home is already attached to another entry or shared store")
+
+
+def _attachment_target(host, home, entry_id, display_name, now, python) -> dict[str, Any]:
+    return dict(
+        host=host, home=home, entry_id=entry_id, display_name=display_name, attached_at=now, python_executable=python
+    )
+
+
+def _client_attachment_record(payload, target, like, capture):
+    """Validate the exact client record that the reviewed command would write."""
+    allowed, writable, owner = _client_grants(
+        payload, target["home"], target["entry_id"], like, capture, read_only=target["host"] in READ_ONLY_CLIENT_HOSTS
+    )
+    return client_entry_record(
+        **target,
+        allowed_scope_ids=sorted(allowed),
+        writable_scope_ids=sorted(writable),
+        capture_scope_id=owner,
+    )
+
+
+def _implicit_client(host, grants_like, capture_like) -> bool:
+    return host in CLIENT_HOSTS and not grants_like and capture_like is None
+
+
+def _has_attached_entries(payload) -> bool:
+    return any(not entry.get("detached_at") for entry in payload["entries"])
+
+
+def _grant_preview(root, target, runtime_config_from):
+    """Review one source without opening either command write lock."""
+    host, home, entry_id = target["host"], target["home"], target["entry_id"]
+    _refuse_misfit(host, home, None, (), None)
+    payload = read_shared_payload(root)
+    _check_implicit_home(root, target)
+    check_attachment_target(root, payload, home=home, entry_id=entry_id)
+    if attached_again(payload, **target) is not None or not _has_attached_entries(payload):
+        # First attachment and re-entry are writes, rechecked under both locks.
+        return None
+    read_only = host in READ_ONLY_CLIENT_HOSTS
+    binding = store_binding(payload, root, frozenset(payload["scope_ids"]))
+    donor = verified_donor(root, payload, binding, read_only=read_only)
+    if donor is None:
+        raise SharedStoreError("choose explicit owner grants for this entry with --grants-like")
+    capture = None if read_only else donor
+    _client_attachment_record(payload, target, (donor,), capture)
+    args = [
+        "scope-recall",
+        "attach",
+        "--host",
+        host,
+        "--instance-root",
+        str(home),
+        "--root",
+        str(root),
+        "--entry",
+        entry_id,
+        "--display-name",
+        target["display_name"],
+        "--grants-like",
+        donor,
+    ]
+    if capture is not None:
+        args.extend(["--capture-like", capture])
+    if target["python_executable"] is not None:
+        args.extend(["--python", target["python_executable"]])
+    if runtime_config_from is not None:
+        args.extend(["--runtime-config-from", str(runtime_config_from)])
+    return {"status": "review_grants", "donor": donor, "command": command_text(args), "arguments": args}
+
+
 def attach(
     *,
     host: str,
@@ -456,28 +537,34 @@ def attach(
     python_executable: Path | None = None,
     grants_like: tuple[str, ...] = (),
     capture_like: str | None = None,
-    suggest_grants: bool = False,
     now: str | None = None,
 ) -> dict[str, Any]:
+    """Attach or reattach using the current state under both write locks."""
     now = now or _now()
     python = str(python_executable) if python_executable else None
+    target = _attachment_target(host, instance_root, entry_id, display_name, now, python)
+    return _attach_locked(root, target, grants_from, runtime_config_from, grants_like, capture_like)
+
+
+def _attach_locked(root, target, grants_from, runtime_config_from, grants_like, capture_like, *, review=False):
+    """Apply an attachment, rechecking the CLI's implicit decision under both locks."""
+    host, instance_root, entry_id = target["host"], target["home"], target["entry_id"]
+    display_name, now, python = target["display_name"], target["attached_at"], target["python_executable"]
     shape = f"attach --host {host} --entry {entry_id}"
     _refuse_misfit(host, instance_root, grants_from, grants_like, capture_like)
     # The entry's grants are taken from this manifest and checked against it, the manifest is written over and the
     # home's pointer written: no other command writes the store or points the home elsewhere in between.
     with home_lock(instance_root, shape, now), store_lock(root, shape, now):
+        _refuse_misfit(host, instance_root, grants_from, grants_like, capture_like)
         payload = read_shared_payload(root)
         source, notes = None, []
         # A home attached as the entry already keeps the grants the entry holds, and takes none of the options.
-        record = attached_again(
-            payload,
-            entry_id=entry_id,
-            host=host,
-            home=instance_root,
-            display_name=display_name,
-            attached_at=now,
-            python_executable=python,
-        )
+        check_attachment_target(root, payload, home=instance_root, entry_id=entry_id)
+        record = attached_again(payload, **target)
+        if review:
+            _check_implicit_home(root, target)
+            if record is None and _has_attached_entries(payload):
+                raise SharedStoreError("the store gained an entry; run attach again or choose explicit --grants-like")
         if record is not None:
             if grants_from is not None or grants_like or capture_like:
                 notes.append(
@@ -499,54 +586,7 @@ def attach(
                 )
             record = shared_entry_record(source, entry_id=entry_id, display_name=display_name, attached_at=now)
         else:
-            read_only = host in READ_ONLY_CLIENT_HOSTS
-            if (
-                suggest_grants
-                and any(not e.get("detached_at") for e in payload["entries"])
-                and not grants_like
-                and capture_like is None
-            ):
-                binding = store_binding(payload, root, frozenset(payload["scope_ids"]))
-                donor = verified_donor(root, payload, binding, read_only=read_only)
-                if donor is not None:
-                    args = [
-                        "scope-recall",
-                        "attach",
-                        "--host",
-                        host,
-                        "--instance-root",
-                        str(instance_root),
-                        "--root",
-                        str(root),
-                        "--entry",
-                        entry_id,
-                        "--display-name",
-                        display_name,
-                        "--grants-like",
-                        donor,
-                    ]
-                    if not read_only:
-                        args.extend(["--capture-like", donor])
-                    if python is not None:
-                        args.extend(["--python", python])
-                    if runtime_config_from is not None:
-                        args.extend(["--runtime-config-from", str(runtime_config_from)])
-                    return {"status": "review_grants", "donor": donor, "command": command_text(args), "arguments": args}
-                raise SharedStoreError("choose explicit owner grants for this entry with --grants-like")
-            allowed, writable, owner = _client_grants(
-                payload, instance_root, entry_id, grants_like, capture_like, read_only=read_only
-            )
-            record = client_entry_record(
-                host=host,
-                home=instance_root,
-                entry_id=entry_id,
-                display_name=display_name,
-                attached_at=now,
-                allowed_scope_ids=sorted(allowed),
-                writable_scope_ids=sorted(writable),
-                capture_scope_id=owner,
-                python_executable=python,
-            )
+            record = _client_attachment_record(payload, target, grants_like, capture_like)
         scopes = frozenset(record["scope_ids"])
         union = frozenset(payload["scope_ids"]) | scopes
         worker_path = root / RUNTIME_CONFIG_FILENAME
@@ -1058,27 +1098,36 @@ def remote_hermes_grants(home: Path, payload: dict, *, profile: str, like: tuple
 
 
 def _attach_cli(args):
-    """Convert CLI options into the existing locked attachment operation."""
+    """Preview implicit owner grants or pass explicit options to the locked attach."""
     like = tuple(name.strip() for name in (args.grants_like or "").split(",") if name.strip())
     source = _absolute(args.grants_from, "grants_from") if args.grants_from else None
     if args.remote_profile is not None:
         if args.host != "hermes" or source is not None:
             raise SharedStoreError("--remote-profile requires --host hermes and no --grants-from")
         source = partial(remote_hermes_grants, profile=args.remote_profile, like=like, capture_like=args.capture_like)
+    home = _absolute(args.instance_root, "instance_root")
+    root = _absolute(args.root, "root")
+    routes = _absolute(args.runtime_config_from, "runtime_config_from") if args.runtime_config_from else None
+    python = _absolute(args.python, "python") if args.python else None
+    if source is None and _implicit_client(args.host, like, args.capture_like):
+        target = _attachment_target(
+            args.host, home, args.entry, args.display_name, _now(), str(python) if python else None
+        )
+        preview = _grant_preview(root, target, routes)
+        if preview is not None:
+            return preview
+        return _attach_locked(root, target, None, routes, (), None, review=True)
     return attach(
         host=args.host,
-        instance_root=_absolute(args.instance_root, "instance_root"),
-        root=_absolute(args.root, "root"),
+        instance_root=home,
+        root=root,
         entry_id=args.entry,
         display_name=args.display_name,
         grants_from=source,
-        runtime_config_from=_absolute(args.runtime_config_from, "runtime_config_from")
-        if args.runtime_config_from
-        else None,
-        python_executable=_absolute(args.python, "python") if args.python else None,
+        runtime_config_from=routes,
+        python_executable=python,
         grants_like=() if args.remote_profile is not None else like,
         capture_like=None if args.remote_profile is not None else args.capture_like,
-        suggest_grants=True,
     )
 
 

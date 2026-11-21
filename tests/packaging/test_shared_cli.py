@@ -12,11 +12,12 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from copy import deepcopy
 from pathlib import Path
 
@@ -338,13 +339,14 @@ CLIENT_NAMES = {
     "workbuddy": "WorkBuddy",
     "dsh": "DeepSeek Harness",
     "antigravity": "Antigravity",
+    "cherry-studio": "Cherry Studio",
 }
 
 
-def _attach_client(capsys, root, home, *, host="claude-code", like="all", capture="agent3", routes=None):
+def _attach_client(capsys, root, home, *, host="claude-code", like="all", capture="agent3", routes=None, entry=None):
     """``attach`` for a client entry named after its host; ``like`` or ``capture`` None leaves that option out."""
     argv = ["attach", "--host", host, "--instance-root", str(home), "--root", str(root)]
-    argv += ["--entry", host, "--display-name", CLIENT_NAMES[host]]
+    argv += ["--entry", entry or host, "--display-name", CLIENT_NAMES[host]]
     if like is not None:
         argv += ["--grants-like", like]
     if capture is not None:
@@ -1330,6 +1332,179 @@ def test_attach_can_reuse_a_verified_local_owner_without_copying_new_permissions
         row = record["audiences"][0]
         for key in ("allowed_scope_ids", "writable_scope_ids", "capture_scope_id"):
             assert row[key] == expected[key]
+
+
+def _attachment_snapshot(root, *homes):
+    """Capture durable scope configuration and every path under the relevant homes."""
+    manifest = (root / "installation.json").read_bytes()
+    pointers = tuple(read_attachment(home) for home in homes)
+    directories = tuple(
+        (place.exists(), tuple(sorted(str(p.relative_to(place)) for p in place.rglob("*")))) for place in (root, *homes)
+    )
+    return manifest, (root / "memory.sqlite3").read_bytes(), pointers, directories
+
+
+def test_default_attachment_preview_leaves_an_absent_home_absent(tmp_path, capsys, root, monkeypatch):
+    monkeypatch.setattr(shared_run, "LOCK_WAIT_SECONDS", 0.2)
+    donor = tmp_path / "TEST-donor"
+    recipient = tmp_path / "TEST-absent-recipient"
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    before = _attachment_snapshot(root, donor, recipient)
+
+    with _held_elsewhere(shared_run.store_lock, root):
+        code, preview = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+
+    assert code == 0, preview
+    assert (preview["status"], preview["donor"]) == ("review_grants", "dsh")
+    assert _attachment_snapshot(root, donor, recipient) == before
+    assert not recipient.exists()
+    assert _run(capsys, *preview["arguments"][1:])[0] == 0
+
+
+def test_default_preview_refuses_an_uncheckpointed_owner_control(tmp_path, capsys, root):
+    from scope_recall.contracts import TrustedContext
+    from scope_recall.core.entry_control import change
+    from scope_recall.core.storage import SQLiteStorage
+    from scope_recall.maintenance.migration_records import open_immutable
+
+    donor, recipient = tmp_path / "TEST-donor", tmp_path / "TEST-recipient"
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    payload = read_shared_payload(root)
+    binding = shared.store_binding(payload, root, frozenset(payload["scope_ids"]))
+    context = TrustedContext(binding, "TEST-live-wal", binding.scope_ids, "host_generated")
+    database, wal = root / "memory.sqlite3", root / "memory.sqlite3-wal"
+    with closing(sqlite3.connect(database)) as keeper:
+        keeper.execute("PRAGMA journal_mode=WAL")
+        with SQLiteStorage(binding).write(context) as tx:
+            change(tx, context, "dsh", "paused", "TEST-owner", "2026-01-01T00:00:00Z")
+        assert keeper.execute("SELECT state FROM entry_controls WHERE entry_id='dsh'").fetchone() == ("paused",)
+        with closing(open_immutable(database)) as checkpoint:
+            assert checkpoint.execute("SELECT state FROM entry_controls WHERE entry_id='dsh'").fetchone() is None
+        before, wal_bytes = _attachment_snapshot(root, donor, recipient), wal.read_bytes()
+        assert wal_bytes
+
+        code, result = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+
+        assert code == 2 and "--grants-like" in result["error"]
+        assert _attachment_snapshot(root, donor, recipient) == before
+        assert wal.read_bytes() == wal_bytes
+
+
+@pytest.mark.parametrize("change", ["recovery_pending", "client_route", "hermes_route", "owner_capture"])
+def test_default_preview_requires_runtime_owner_and_scope_equivalence(tmp_path, capsys, root, change):
+    from scope_recall.contracts import TrustedContext
+    from scope_recall.core.storage import SQLiteStorage
+
+    donor, recipient = tmp_path / "TEST-donor", tmp_path / "TEST-recipient"
+    if change == "hermes_route":
+        assert (
+            _run(
+                capsys,
+                "attach",
+                "--host",
+                "hermes",
+                "--instance-root",
+                str(donor),
+                "--root",
+                str(root),
+                "--entry",
+                "desk",
+                "--display-name",
+                "Desk",
+            )[0]
+            == 0
+        )
+    else:
+        assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    payload = read_shared_payload(root)
+    (entry,) = payload["entries"]
+    if change == "recovery_pending":
+        entry["recovery_pending"] = True
+    elif change == "owner_capture":
+        extra = "TEST-separate-capture"
+        binding = shared.store_binding(payload, root, frozenset(payload["scope_ids"]))
+        context = TrustedContext(binding, "TEST-expand", binding.scope_ids, "host_generated")
+        with SQLiteStorage(binding).write(context) as tx:
+            tx.registry.register_scopes(binding.scope_ids | {extra})
+        payload["scope_ids"].append(extra)
+        entry["scope_ids"].append(extra)
+        for row in entry["audiences"]:
+            row["allowed_scope_ids"].append(extra)
+            row["writable_scope_ids"].append(extra)
+            row["capture_scope_id"] = extra
+    else:
+        for row in entry["audiences"]:
+            row["agent_workspace"] = "TEST-unmapped"
+    shared_entries.write_shared_payload(root, payload)
+    before = _attachment_snapshot(root, donor, recipient)
+
+    code, refusal = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+
+    assert code == 2 and "--grants-like" in refusal["error"]
+    assert _attachment_snapshot(root, donor, recipient) == before
+    if change == "owner_capture":
+        assert load_shared_client(donor, "dsh").audience.capture_scope_id == extra
+        assert _attach_client(capsys, root, recipient, host="codex", like="dsh", capture="dsh")[0] == 0
+        assert load_shared_client(recipient, "codex").manifest.audience_scopes["owner_private"] == extra
+
+
+@pytest.mark.parametrize("conflict", ["duplicate_entry", "same_home", "foreign_store"])
+def test_default_preview_refuses_an_attachment_target_conflict(tmp_path, capsys, root, conflict):
+    donor, recipient = tmp_path / "TEST-donor", tmp_path / "TEST-recipient"
+    other = tmp_path / "TEST-other-store"
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    if conflict == "same_home":
+        recipient = donor
+    if conflict == "foreign_store":
+        assert _run(capsys, "init-shared", "--root", str(other), "--agent-id", AGENT)[0] == 0
+        assert _attach_client(capsys, other, recipient, host="codex", like=None, capture=None)[0] == 0
+    before = _attachment_snapshot(root, donor, recipient)
+    foreign = _attachment_snapshot(other, recipient) if other.exists() else None
+
+    code, result = _attach_client(
+        capsys,
+        root,
+        recipient,
+        host="codex",
+        entry="dsh" if conflict == "duplicate_entry" else None,
+        like=None,
+        capture=None,
+    )
+
+    assert code == 2 and "already attached" in result["error"]
+    assert _attachment_snapshot(root, donor, recipient) == before
+    if foreign is not None:
+        assert _attachment_snapshot(other, recipient) == foreign
+
+
+def test_default_preview_uses_an_unambiguous_donor_name(tmp_path, capsys, root):
+    donor, peer, recipient = (tmp_path / name for name in ("TEST-donor", "TEST-peer", "TEST-recipient"))
+    assert _attach_client(capsys, root, donor, host="dsh", entry="all", like=None, capture=None)[0] == 0
+    code, refusal = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+    assert code == 2 and "--grants-like" in refusal["error"]
+    assert _attach_client(capsys, root, peer, host="workbuddy", like="all", capture="all")[0] == 0
+    code, preview = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+    assert (code, preview["status"], preview["donor"]) == (0, "review_grants", "workbuddy")
+    assert _run(capsys, *preview["arguments"][1:])[0] == 0
+
+
+@pytest.mark.parametrize("competing_host", ["dsh", "cherry-studio"])
+def test_first_attachment_rechecks_grants_after_both_locks(tmp_path, capsys, root, monkeypatch, competing_host):
+    first, later = tmp_path / "TEST-first", tmp_path / "TEST-later"
+    lock = shared.store_lock
+
+    @contextmanager
+    def competing_first(place, command, now):
+        monkeypatch.setattr(shared, "store_lock", lock)
+        assert _attach_client(capsys, root, first, host=competing_host, like=None, capture=None)[0] == 0
+        with lock(place, command, now):
+            yield
+
+    monkeypatch.setattr(shared, "store_lock", competing_first)
+    code, result = _attach_client(capsys, root, later, host="codex", like=None, capture=None)
+    assert code == 2 and "--grants-like" in result["error"]
+    assert read_attachment(later) is None
+    assert [entry["entry_id"] for entry in read_shared_payload(root)["entries"]] == [competing_host]
 
 
 @pytest.mark.parametrize("change", ["unbound", "other_owner", "permissions", "capture", "no_witness"])

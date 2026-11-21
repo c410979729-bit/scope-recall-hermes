@@ -413,33 +413,34 @@ def attach_shared_entry(
     return attach_shared_record(root, record, now=now)
 
 
-def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) -> InstallationManifest:
-    """Make ``record``'s home an entry of the shared store at ``root``.
-
-    Everything is checked before anything is written.  Then the store (its
-    scopes, then the entry), the store's manifest, and last the pointer: stopped
-    anywhere, running it again finishes the job, and until the pointer exists
-    the home binds nothing new.  Returns the entry's view.
-    """
-    store = Path(str(root)).expanduser().resolve()
-    payload = read_shared_payload(store)
-    home = Path(record["home"])
-    # Another home's pointer is read here without that home's lock.  A pointer is written to name this store only by
-    # an attach to it, which holds the store's lock as this one does (``maintenance/shared.py``), and is removed from it
-    # only by a detach holding that lock too: while this one runs, another command can only point such a home away from
-    # this store.  Read before that, the pointer refuses this attach, which a run again lets through; two homes never
-    # come to hold one entry.
+def check_attachment_target(store: Path, payload: dict[str, Any], *, home: Path, entry_id: str) -> None:
+    """Ensure an entry ID and a home can name each other without displacing a live entry."""
+    entry_id = _entry_id(entry_id)
+    # A preview can read this without locking. The write checks again under
+    # the store lock, which also fences other commands binding that entry.
     for entry in payload["entries"]:
         if (
-            entry["entry_id"] == record["entry_id"]
+            entry["entry_id"] == entry_id
             and not _same_path(entry["home"], home)
             and _points_here(entry["home"], store, entry["entry_id"])
         ):
             # A home that no longer points here gives its id up: the store was
             # copied to another machine and adopted, or the home was detached.
             raise HermesIdentityError("entry_id is already attached from another home")
-        if entry["entry_id"] != record["entry_id"] and _same_path(entry["home"], home) and not entry.get("detached_at"):
+        if entry["entry_id"] != entry_id and _same_path(entry["home"], home) and not entry.get("detached_at"):
             raise HermesIdentityError("home is already attached as another entry")
+
+
+def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) -> InstallationManifest:
+    """Make the record's home an entry of the shared store.
+
+    Check the attachment first, then write the registry, manifest and pointer
+    in that order. A repeated attach can finish an interrupted write.
+    """
+    store = Path(str(root)).expanduser().resolve()
+    payload = read_shared_payload(store)
+    home = Path(record["home"])
+    check_attachment_target(store, payload, home=home, entry_id=record["entry_id"])
     before = frozenset(payload["scope_ids"])
     after = before | frozenset(record["scope_ids"])
     updated = _checked_shared_payload(
