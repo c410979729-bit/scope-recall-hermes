@@ -65,15 +65,17 @@ from ..adapters.hermes.shared_entries import (
     shared_entry_record,
     write_shared_payload,
 )
-from ..adapters.host_identity import matches_owner_principal
 from ..contracts import HOOK_CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
 from ..core.storage import SQLiteStorage
 from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
 from ..runtime.instance_config import RuntimeInstanceConfig
 from ..runtime.model_budget import initialize_auxiliary_budget_ledger
 from ..runtime.worker_launch import RUNTIME_CONFIG_FILENAME
+from .backup_relocation import command_text
 from .install_common import RUNTIME_CONFIG_LIMIT
 from .install_hermes import DEFAULT_AGENT_WORKSPACE
+from .shared_grants import owner_rows as _owner_rows
+from .shared_grants import verified_donor
 from .shared_import import import_entry
 from .shared_run import Run, SharedStoreError, encoded, home_lock, replace_file, store_lock, write_json
 
@@ -308,16 +310,6 @@ def _client_grants(
     return allowed | {capture}, writable | {capture}, capture
 
 
-def _owner_rows(entry: dict) -> list[dict]:
-    """Only grants of an explicitly approved owner can pass to a new local entry."""
-    return [
-        row
-        for row in entry["audiences"]
-        if row.get("kind") == "owner_private"
-        and matches_owner_principal(entry["owner_principals"], platform=row["platform"], user_id=row["user_id"])
-    ]
-
-
 def _ledger_made(raw: dict[str, Any]) -> list[str]:
     """Create the spend ledger a written config names, when it does not exist yet.
 
@@ -464,6 +456,7 @@ def attach(
     python_executable: Path | None = None,
     grants_like: tuple[str, ...] = (),
     capture_like: str | None = None,
+    suggest_grants: bool = False,
     now: str | None = None,
 ) -> dict[str, Any]:
     now = now or _now()
@@ -506,8 +499,42 @@ def attach(
                 )
             record = shared_entry_record(source, entry_id=entry_id, display_name=display_name, attached_at=now)
         else:
+            read_only = host in READ_ONLY_CLIENT_HOSTS
+            if (
+                suggest_grants
+                and any(not e.get("detached_at") for e in payload["entries"])
+                and not grants_like
+                and capture_like is None
+            ):
+                binding = store_binding(payload, root, frozenset(payload["scope_ids"]))
+                donor = verified_donor(root, payload, binding, read_only=read_only)
+                if donor is not None:
+                    args = [
+                        "scope-recall",
+                        "attach",
+                        "--host",
+                        host,
+                        "--instance-root",
+                        str(instance_root),
+                        "--root",
+                        str(root),
+                        "--entry",
+                        entry_id,
+                        "--display-name",
+                        display_name,
+                        "--grants-like",
+                        donor,
+                    ]
+                    if not read_only:
+                        args.extend(["--capture-like", donor])
+                    if python is not None:
+                        args.extend(["--python", python])
+                    if runtime_config_from is not None:
+                        args.extend(["--runtime-config-from", str(runtime_config_from)])
+                    return {"status": "review_grants", "donor": donor, "command": command_text(args), "arguments": args}
+                raise SharedStoreError("choose explicit owner grants for this entry with --grants-like")
             allowed, writable, owner = _client_grants(
-                payload, instance_root, entry_id, grants_like, capture_like, read_only=host in READ_ONLY_CLIENT_HOSTS
+                payload, instance_root, entry_id, grants_like, capture_like, read_only=read_only
             )
             record = client_entry_record(
                 host=host,
@@ -1051,6 +1078,7 @@ def _attach_cli(args):
         python_executable=_absolute(args.python, "python") if args.python else None,
         grants_like=() if args.remote_profile is not None else like,
         capture_like=None if args.remote_profile is not None else args.capture_like,
+        suggest_grants=True,
     )
 
 

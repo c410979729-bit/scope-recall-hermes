@@ -4,7 +4,7 @@
 
 - 迁移支持的旧格式以实际提交、schema 和配置识别：转换器的旧表与字段目录见 `maintenance/legacy_catalog.py` 和 `maintenance/migration_mapping.json`。不能按版本号推测输入格式。
 - 旧 SQLite 使用 `memories`、`journal_entries`、`fact_claims`、`fact_claim_evidence`、`task_episodes` 等表。新 Core schema 使用 `source_events`、`claims`、`claim_versions`、`evidence_links`、统一删除记录等；相同数据库引擎不代表可以原样打开。
-- 旧 Lance 行有文本和旧 scope 标识；当前向量伴随库绑定安装身份、对象版本及 embedding space，正文从 SQLite 取回。旧格式转换不导入旧向量，需通过已批准的路由重建。Core 库之间的包升级可导入兼容向量，见 [README](../README.md#data-and-host-boundaries)。
+- 旧 Lance 行有文本和旧 scope 标识；当前向量伴随库绑定安装身份、对象版本及 embedding space，正文从 SQLite 取回。旧格式转换不导入旧向量，需通过已批准的路由重建。Core 库之间的包升级可导入兼容向量，见 [宿主与数据边界](host-integration.md#data-and-host-boundaries)。
 - 迁移器实现了隔离备份、来源导入、事实与经验版本映射、删除阻断和 Core restore fence。它是一次性离线迁移，不支持原地自动升级。
 
 ## 迁移操作

@@ -134,11 +134,11 @@ store; a 1.x or 2.x store is migrated into the agent's home first (`scope-recall
 
 ## Attach Codex or Claude Code
 
-A local coding assistant brings no grants of its own: whoever types into it on this machine is
-the owner, as at the Hermes CLI. `attach` gives it the owner grants of entries already attached,
-Hermes homes and other clients alike (`--grants-like`, their ids comma separated, or `all`): it
-reads the scopes their effective owner rows read and may write where they may. Owner rows whose platform/user
-is not an approved owner principal are ignored when copying grants, just as at runtime. What the owner types into
+For a client on the owner's computer, `attach` can show a complete command to reuse a verified entry’s access. Omit both grant
+options when the attached entries have the same approved local account, owner identities, read/write
+scopes and capture destination. Review and run the suggested command to attach the new entry. Otherwise choose the entries whose owner grants the client should
+inherit with `--grants-like`, and choose its capture destination with `--capture-like`. A read-only MCP
+entry takes only read grants. Rows without a verified owner do not supply grants. What the owner types into
 it is captured into the scope another entry's owner captures into (`--capture-like`), which must
 be one every effective owner row of every attached entry reads, so that every agent hears it; otherwise
 `attach` refuses and names the rows that would not. No other entry's grants change and the
@@ -262,7 +262,7 @@ to the store whatever that file's `binding` block names, and the first client at
 gives the shared worker its routes. Then install each client as its section says, and give the
 shared worker its credentials and register it as for a Hermes entry
 ([above](#make-a-store-and-attach-the-first-agent)). A first client given `--grants-like` or
-`--capture-like` is refused, and so is a later one without them.
+`--capture-like` is refused. Later clients can request a command to inherit matching verified owner grants as described above.
 
 A Hermes home attached to such a store later meets the clients in that scope when it is attached
 without `--grants-from`, or with the grants of an installation made with the default

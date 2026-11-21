@@ -113,3 +113,14 @@ A cold rollback can return to the pre-upgrade snapshot when no later deletion, w
 3. Confirm no restore marker is pending. If one is present, resolve that pending restore rather than bypassing the fence.
 4. Replace `memory.sqlite3` with the pre-upgrade snapshot and delete the old `memory.sqlite3-wal` and `memory.sqlite3-shm`, which belong to the replaced newer store.
 5. Open with 3.16, verify the restored memories, and then restart hosts and workers.
+
+## Compact an offline SQLite copy
+
+Stop the processes using the source database and preview the eligible records. To create a smaller file, choose a new path in an existing directory.
+
+```sh
+scope-recall compact-store --source /path/to/memory.sqlite3 --dry-run
+scope-recall compact-store --source /path/to/memory.sqlite3 --apply --output /path/to/archive/compacted.sqlite3
+```
+
+The default retention period is 180 days. Use `--retention-days` to set a different age. The command trims large staged payloads of completed consolidation work and redundant evidence lists of obsolete evaluations. It checks the resulting SQLite file and its foreign keys before publishing the copy. Raw source messages, current facts, permissions and deletion records stay in the copy. A full backup also includes the store's other files.

@@ -349,6 +349,7 @@
     "maintenance/setup_verify.py",
     "maintenance/setup_workload.py",
     "maintenance/shared.py",
+    "maintenance/shared_grants.py",
     "maintenance/shared_import.py",
     "maintenance/shared_run.py",
     "maintenance/source_review.py",

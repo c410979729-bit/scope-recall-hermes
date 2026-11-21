@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -1311,6 +1312,69 @@ def test_each_client_attaches_first_to_a_new_store_and_another_client_names_it(t
         assert (entry.binding, entry.host_adapter) == (config.to_binding(), name)
 
 
+def test_attach_can_reuse_a_verified_local_owner_without_copying_new_permissions(tmp_path, capsys, root):
+    homes = _client_homes(tmp_path, "workbuddy", "dsh", "codex")
+    for host in ("workbuddy", "dsh", "codex"):
+        code, result = _attach_client(capsys, root, homes[host], host=host, like=None, capture=None)
+        assert code == 0, result
+        if host != "workbuddy":
+            assert result["status"] == "review_grants"
+            assert read_attachment(homes[host]) is None
+            assert result["command"].startswith("scope-recall ")
+            code, applied = _run(capsys, *result["arguments"][1:])
+            assert (code, applied["status"]) == (0, "attached")
+    records = read_shared_payload(root)["entries"]
+    assert len(records) == 3
+    expected = records[0]["audiences"][0]
+    for record in records[1:]:
+        row = record["audiences"][0]
+        for key in ("allowed_scope_ids", "writable_scope_ids", "capture_scope_id"):
+            assert row[key] == expected[key]
+
+
+@pytest.mark.parametrize("change", ["unbound", "other_owner", "permissions", "capture", "no_witness"])
+def test_default_attach_declines_uncertain_or_different_grants(tmp_path, capsys, root, change):
+    from scope_recall.maintenance.shared_grants import matching_donor
+
+    home = _client_homes(tmp_path, "dsh")["dsh"]
+    code, result = _attach_client(capsys, root, home, host="dsh", like=None, capture=None)
+    assert code == 0, result
+    original = read_shared_payload(root)["entries"][0]
+    other = deepcopy(original)
+    other["entry_id"] = "TEST-second"
+    row = other["audiences"][0]
+    if change == "unbound":
+        other["local_account_id"] = None
+    elif change == "other_owner":
+        other["owner_principals"].append({"platform": "TEST-service", "user_id": "TEST-other"})
+    elif change == "permissions":
+        row["allowed_scope_ids"].append("TEST-extra-scope")
+    elif change == "capture":
+        row["writable_scope_ids"] = []
+    else:
+        other["owner_principals"] = []
+    assert matching_donor([original, other], read_only=False) is None
+
+
+@pytest.mark.parametrize("state", ["paused", "read-only"])
+def test_attach_does_not_suggest_inheriting_a_restricted_entry(tmp_path, capsys, root, state):
+    from scope_recall.contracts import TrustedContext
+    from scope_recall.core.entry_control import change
+    from scope_recall.core.storage import SQLiteStorage
+
+    homes = _client_homes(tmp_path, "dsh", "codex")
+    code, result = _attach_client(capsys, root, homes["dsh"], host="dsh", like=None, capture=None)
+    assert code == 0, result
+    payload = read_shared_payload(root)
+    binding = shared.store_binding(payload, root, frozenset(payload["scope_ids"]))
+    context = TrustedContext(binding, "TEST-attach", binding.scope_ids, "host_generated")
+    with SQLiteStorage(binding).write(context) as tx:
+        change(tx, context, "dsh", state, "TEST-owner", "2026-01-01T00:00:00Z")
+    code, result = _attach_client(capsys, root, homes["codex"], host="codex", like=None, capture=None)
+    assert code == 2 and "--grants-like" in result["error"]
+    assert read_attachment(homes["codex"]) is None and read_shared_payload(root) == payload
+
+
 def test_a_client_names_only_entries_attached_beside_it(tmp_path, capsys, root):
     """On a new store the first client names no entry to take grants like, and a client after it must name attached
     ones; the first client's attach run again repeats it.  A refused attach writes nothing."""
@@ -1322,7 +1386,6 @@ def test_a_client_names_only_entries_attached_beside_it(tmp_path, capsys, root):
         code, result = _attach_client(capsys, root, homes["workbuddy"], host="workbuddy", like=None, capture=None)
         assert (code, result.get("new_scopes")) == (0, new_scopes), result
     for like, capture, refused in (
-        (None, None, "needs --grants-like and --capture-like"),
         ("all", None, "needs --grants-like and --capture-like"),
         ("workbuddy,nobody", "workbuddy", "not other entries attached to this store: nobody"),
         ("all", "dsh", "not other entries attached to this store: dsh"),

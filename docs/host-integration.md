@@ -166,3 +166,15 @@ coordinator's rollback snapshot. To return to an older release, restore its
 pre-upgrade snapshot using the documented restore workflow; older code does not
 write the newer schema. Handoffs are local coordination records and are not
 included in the portable memory interchange format.
+
+## Data and host boundaries
+
+SQLite truth lives in the verified Core data directory. Vector indexes are companions and may be rebuilt only through an explicit configured space. The Hermes and Codex adapters bind host identity, installation identity, scopes, and project roots before opening Core. After that binding is verified, an omitted runtime-config argument checks only `<data_directory>/runtime-config.json`; a missing file stays basic plus an explicit capability gap. The file is never generated or discovered from the current directory, parent directories, or credential locations. Optional host wiring must report a capability gap instead of creating or repairing a database.
+
+The `codex` extra adds the MCP SDK. NumPy provides mapped retrieval and exact full-vector
+scoring without SQLite extensions. The `lancedb` extra is only a reader for existing
+LanceDB embeddings. Legacy `vector.backend` values map to the SQLite companion automatically.
+The worker imports existing vectors without embedding calls and retains the original files.
+Until all visible identities are verified, recall uses lexical channels and reports an import gap.
+Missing or unreadable input remains a reported gap. Changing the embedding model still requires
+an explicit re-embedding run; opening a store never authorizes paid reconstruction.
