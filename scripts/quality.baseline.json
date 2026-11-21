@@ -627,9 +627,6 @@
   "maintenance/cli.py": {
    "E501": 1
   },
-  "maintenance/doctor.py": {
-   "E501": 1
-  },
   "maintenance/doctor_store.py": {
    "E501": 1,
    "PLR0915": {

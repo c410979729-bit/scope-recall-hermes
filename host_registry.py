@@ -234,3 +234,9 @@ REMOTE_RECORD_HOSTS = frozenset(
 HOOK_TIMEOUTS = {
     host: dict(profile.remote_hook_timeouts) for host, profile in HOSTS.items() if profile.remote_hook_timeouts
 }
+
+
+def remote_hook_wire(host: str | None) -> str | None:
+    """Return the protocol for a known remote hook. A missing host uses the standard envelope."""
+    profile = HOSTS.get(host) if host is not None else None
+    return profile.remote_hook_wire if profile is not None else None

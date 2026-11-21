@@ -9,6 +9,7 @@ from scope_recall.core.capture_filters import without_private
 from scope_recall.core.private import normalize_project_path
 
 from ...contracts import ContractError
+from ...host_registry import remote_hook_wire
 from . import transcript
 from .boundary import IN_CONTEXT_FIELD, filter_capture_reply, without_lone_surrogates
 from .session_marks import clear_compaction, compaction_marker, mark_compaction, rebase_compaction
@@ -132,7 +133,7 @@ def _hook_input(
     raw: bytes, *, host: str | None = None, event: str | None = None
 ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any] | None]:
     """Decode one event and resolve local text filtering before any transport access."""
-    if host == "antigravity" and event is not None:
+    if event is not None and remote_hook_wire(host) == "antigravity":
         from .antigravity import normalize_bytes
 
         raw = normalize_bytes(raw, event)

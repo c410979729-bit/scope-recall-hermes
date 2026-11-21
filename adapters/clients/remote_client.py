@@ -27,6 +27,10 @@ from typing import Any
 from scope_recall.core.file_lock import advisory_file_lock
 from scope_recall.core.private import notice_for_mode, parse_recording_command
 
+from ...host_registry import HOOK_TIMEOUTS as HOOK_TIMEOUTS
+from ...host_registry import REMOTE_HOSTS as HOSTS
+from ...host_registry import REMOTE_RECORD_HOSTS as _RECORD_HOSTS
+from ...host_registry import remote_hook_wire
 from ...runtime.remote_clock import event_times as _private_times
 from ...runtime.remote_clock import private_metadata, prompt_times
 from ..host_profiles import HERMES_MAX_FACT_BYTES, HERMES_MAX_WIRE_BYTES, agent_run
@@ -50,20 +54,6 @@ from .remote_hook_input import (
 from .remote_hook_input import _visible_payload as _visible_payload
 from .session_marks import compaction_marker
 
-HOSTS = ("claude-code", "codex", "workbuddy", "dsh", "hermes", "antigravity")
-#: Hosts whose Stop and SessionEnd send the lines of their own session record (``transcript``).
-_RECORD_HOSTS = frozenset({"claude-code", "workbuddy", "codex", "antigravity"})
-#: How long the client's host waits for each hook (the plugin's hooks.json): the local installers' ceilings
-#: (``maintenance/install_claude_code.py``, ``maintenance/install_codex.py``), for the events forwarded.  A hook
-#: answers as soon as the server does; the server's work is bounded by the entry's budget.  WorkBuddy's hooks are
-#: given the same waits as the claude-code host's: its prompt is blocked by a hook that runs past its wait.
-HOOK_TIMEOUTS = {
-    "claude-code": {"SessionStart": 5, "UserPromptSubmit": 15, "Stop": 10, "SessionEnd": 10},
-    "codex": {"SessionStart": 5, "UserPromptSubmit": 15, "Stop": 10, "Interrupt": 3, "SessionEnd": 3},
-    "antigravity": {"SessionStart": 10, "UserPromptSubmit": 15, "Stop": 10},
-    "workbuddy": {"UserPromptSubmit": 15, "Stop": 10, "SessionEnd": 10},
-    "dsh": {"UserPromptSubmit": 9, "Stop": 20},
-}
 #: The part of each wait the request may use; the interpreter's start and the answer take the rest.
 _REQUEST_SHARE = 0.8
 
@@ -420,7 +410,7 @@ def owner_prompt(host: str, payload: dict[str, Any]) -> bool:
         return False
     if payload.get("attachments") not in (None, []) or payload.get("record") is not None:
         return False
-    if host == "antigravity":
+    if remote_hook_wire(host) == "antigravity":
         return False
     if host == "dsh" and payload.get("scope_recall_command_eligible") is False:
         return False
@@ -850,7 +840,7 @@ def run_hook(
             # The record is here, not on the server: this side says whether the reply is an error WorkBuddy showed.
             body["error_reply"] = True
 
-    if host == "antigravity":
+    if remote_hook_wire(host) == "antigravity":
         from .antigravity import scrub_remote
 
         scrub_remote(body)
@@ -962,7 +952,7 @@ def _recall_only(body, host=None):
         "prompt",
         IN_CONTEXT_FIELD,
     }
-    if host == "antigravity":
+    if remote_hook_wire(host) == "antigravity":
         fields.add("occurred_at")
     return {**body, "payload": {key: value for key, value in body["payload"].items() if key in fields}}
 
