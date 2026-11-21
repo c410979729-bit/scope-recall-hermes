@@ -56,6 +56,7 @@ def test_window_offsets_and_repeated_quotes_prefer_the_authorized_window(app):
         ('TEST 配色 "蓝色" .', "TEST 配色  “蓝色”。"),
         ("TEST 选项 , 蓝色 .", "TEST 选项，蓝色。"),
         ("TEST 版本为3.14.", "TEST 版本为３．１４。"),
+        ("TEST 确认好了 ?", "TEST 确认好了？"),
     ],
 )
 def test_normalized_quote_maps_back_to_the_literal_source(app, quote, content):
@@ -407,12 +408,23 @@ def test_unlocated_quote_is_refused_with_sources_and_during_publication(app):
 @pytest.mark.parametrize(
     ("content", "quote"),
     [
-        ("TEST 色调  蓝色。 TEST 色调\t蓝色．", "TEST 色调 蓝色."),
+        ("TEST 色调  蓝色． TEST 色调\t蓝色.", "TEST 色调 蓝色."),
         ("TEST 版本为 3.11。", "TEST 版本为 3 .11."),
+        ("TEST 版本为v3。rc2已发布。", "TEST 版本为v3.rc2已发布。"),
+        ("TEST 版本为v3.rc2已发布。", "TEST 版本为v3。rc2已发布。"),
+        ("TEST 域名为service。example.com。", "TEST 域名为service.example.com。"),
+        ("TEST 版本为v3.rc2", "TEST 版本为v3。 \r\n"),
+        ("TEST 版本为v3。 rc2", "TEST 版本为v3 .\t"),
         ("TEST 端口为3。14天后关闭", "TEST 端口为3.14天后关闭"),
+        ("TEST 端口为3。\n14天后关闭", "TEST 端口为3.14天后关闭"),
+        ("TEST 域名为service。\r\nexample.com", "TEST 域名为service.example.com"),
         ("TEST 端口为３ 。１４天后关闭", "TEST 端口为3.14天后关闭"),
         ("TEST 端口为3.14天后关闭", "TEST 端口为3。14天后关闭"),
         ("TEST 端口未知。14天后关闭", "TEST 端口未知.14天后关闭"),
+        ("TEST 已开始。 正在复核。", "TEST 已开始. 正在复核."),
+        ("TEST 已开始。\n正在复核。", "TEST 已开始. 正在复核。"),
+        ("TEST 设计，\n同意。", "TEST 设计，同意."),
+        ("TEST 已开始。\r正在复核。", "TEST 已开始."),
         ("TEST 配色不是蓝色。", "TEST 配色是蓝色."),
         ("TEST red fox approved.", "TEST redfox approved."),
         ("TEST 值 1, 000。", "TEST 值 1,000."),
@@ -425,25 +437,70 @@ def test_equivalent_anchors_reject_ambiguity_and_changed_assertions(content, quo
     assert quote_interval(quote, content) is None
 
 
-@pytest.mark.parametrize("invalid_span", ["quote", "source_revision"])
-def test_numeric_anchor_and_float_source_revision_cannot_cost_a_valid_claim(worker_app, invalid_span):
+@pytest.mark.parametrize(
+    ("content", "quote", "literal"),
+    [
+        ("TEST 已开始。 正在复核。 \r\n", "TEST 已开始。正在复核.", None),
+        ("TEST 已开始。 正在复核。 \r\n", "TEST 已开始。 正在复核 . \t", "TEST 已开始。 正在复核。"),
+        ("TEST 调色  蓝色 . \t", "TEST 调色 蓝色。 \r\n", "TEST 调色  蓝色 ."),
+        ("TEST 版本为v3．rc2。", "TEST 版本为v3.rc2.", "TEST 版本为v3．rc2。"),
+        ("TEST 已开始。 正在复核。", "TEST 已开始。", "TEST 已开始。"),
+        ("TEST 已开始。 \t\n正在复核。", "TEST 已开始.", "TEST 已开始。"),
+        ("TEST 已开始 .　\r\n正在复核。", "TEST 已开始。", "TEST 已开始 ."),
+    ],
+)
+def test_terminal_full_stop_substitution_requires_a_raw_line_end(content, quote, literal):
+    from scope_recall.core.evidence_quote import quote_interval
+
+    interval = quote_interval(quote, content)
+    if literal is None:
+        assert interval is None
+    else:
+        assert interval is not None and content[slice(*interval)] == literal
+
+
+def test_internal_source_window_end_does_not_permit_full_stop_substitution(app):
+    core, ctx = app
+    content = "TEST 版本为v3。rc2已发布。"
+    source = capture(core, ctx, content)
+    end = content.index("。") + 1
+    page = ChunkedSource(
+        **dict(source.__dict__, event=dict(source.event, content=content[:end])),
+        consolidation_window=ConsolidationChunk(0, end, len(content)),
+    )
+    claim = draft(source, quote_override="TEST 版本为v3.")
+    rejected = []
+    raw = json.dumps(consolidation_payload(source, claims=[claim]))
+
+    assert decode_consolidation_result(raw, (page,), rejected_items=rejected)["claim_proposals"] == []
+    assert rejected == [RejectedProposal("claim", "DERIVATION_INVALID", "claim_proposals[0].evidence_spans[0].quote")]
+
+
+@pytest.mark.parametrize("case", ["decimal", "version", "source_revision"])
+def test_invalid_numeric_or_version_anchor_or_revision_leaves_valid_claim(worker_app, case):
     core, ctx, _ = worker_app
     color = "TEST-project 配色蓝色。"
-    port = "TEST-service 端口为3。14天后关闭。"
-    source = capture(core, ctx, f"{port}\n{color}")
+    evidence, predicate, value = (
+        ("TEST-service 版本为v3。rc2已发布。", "版本", "v3.rc2")
+        if case == "version"
+        else ("TEST-service 端口为3。14天后关闭。", "端口", "3.14")
+    )
+    source = capture(core, ctx, f"{evidence}\n{color}")
     good = draft(source, quote_override=color)
-    if invalid_span == "quote":
+    if case == "source_revision":
+        bad = draft(source, quote_override=color)
+        bad["evidence_spans"][0]["source_revision"] = float(source.revision)
+        invalid_span = "source_revision"
+    else:
         bad = draft(
             source,
             kind="fact",
             subject="TEST-service",
-            predicate="端口",
-            value="3.14",
-            quote_override=port.replace("3。14", "3.14"),
+            predicate=predicate,
+            value=value,
+            quote_override=evidence.replace("。", ".", 1),
         )
-    else:
-        bad = draft(source, quote_override=color)
-        bad["evidence_spans"][0]["source_revision"] = float(source.revision)
+        invalid_span = "quote"
     model = _AgreeingJudge(lambda sources, **kw: consolidation_payload(*sources, claims=[bad, good]))
 
     receipt = core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=20)

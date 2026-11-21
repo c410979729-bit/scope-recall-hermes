@@ -293,7 +293,7 @@ def decode_consolidation_result(
         for claim in claims:
             if isinstance(claim, dict):
                 _undecorate_claim(claim, source_text)
-    anchors = {key: QuoteAnchors(content) for key, content in source_text.items()}
+    anchors: dict[tuple[str, int], QuoteAnchors] = {}
     align = (
         partial(_align_model_claim, available=available, source_text=source_text, anchors=anchors)
         if available

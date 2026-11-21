@@ -132,6 +132,11 @@ def resolve_evidence_quotes(value: dict, contents: dict) -> int:
 _PUNCTUATION = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
 _CLAUSE_MARKS = frozenset(",;:")
 _CJK_PREFIXES = ("CJK ", "HIRAGANA ", "KATAKANA ", "HANGUL ")
+_FULL_STOPS = (".", "。")
+
+
+def _horizontal_space(char: str) -> bool:
+    return char in " \t" or unicodedata.category(char) == "Zs"
 
 
 def _clause_spacing(left: str, right: str) -> bool:
@@ -161,23 +166,19 @@ def _normalized_origin(content: str) -> tuple[str, list[tuple[int, int]]]:
         ):
             end += 1
         for char in unicodedata.normalize("NFKC", content[index:end]).translate(_PUNCTUATION):
-            # An ideographic sentence break followed by a digit cannot
-            # stand for the decimal dot in either 3.14 or .14.
-            if char == "。" and (end == len(content) or not content[end].isnumeric()):
-                char = "."
             if char.isspace():
                 char = " "
                 if characters and characters[-1] == " ":
                     origins[-1] = (origins[-1][0], end)
                     continue
-            # Internal dots and Western word or numeric boundaries keep their spacing.
             if (
                 len(characters) >= 2
                 and characters[-1] == " "
                 and (
                     _clause_spacing(characters[-2], char)
-                    or (char in ".!?" and (content[index] == "。" or end == len(content) or content[end].isspace()))
+                    or (char in "!?" and (end == len(content) or content[end].isspace()))
                 )
+                and all(_horizontal_space(c) for c in content[slice(*origins[-1])])
             ):
                 characters.pop()
                 origins.pop()
@@ -187,11 +188,28 @@ def _normalized_origin(content: str) -> tuple[str, list[tuple[int, int]]]:
     return "".join(characters), origins
 
 
+def _terminal_forms(quote: str, needle: str):
+    """Generate last-character variants while keeping all internal punctuation."""
+    raw = quote.rstrip()
+    if unicodedata.normalize("NFKC", raw[-1:]) not in _FULL_STOPS or needle[-1:] not in _FULL_STOPS:
+        return
+    body = raw[:-1].rstrip()
+    if not body or not all(_horizontal_space(c) for c in raw[len(body) : -1]):
+        return
+    stem = needle[:-1].rstrip()
+    for stop in _FULL_STOPS:
+        for separator in ("", " "):
+            form = stem + separator + stop
+            if form != needle:
+                yield form
+
+
 class QuoteAnchors:
     """Resolve unique short anchors within one authorized source or source window."""
 
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, *, complete_end: bool = True) -> None:
         self.content = content
+        self._complete_end = complete_end
 
     @cached_property
     def _normalized(self) -> tuple[str, list[tuple[int, int]]]:
@@ -215,24 +233,50 @@ class QuoteAnchors:
         needle = needle.strip()
         if not needle:
             return None
+        matches = self._matches(needle)
+        if matches is None:
+            return None
+        for form in _terminal_forms(quote, needle):
+            alternatives = self._matches(form, terminal_only=True)
+            if alternatives is None:
+                return None
+            matches.update(alternatives)
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def _matches(self, needle: str, *, terminal_only: bool = False) -> set[tuple[int, int]] | None:
         normalized, origins = self._normalized
-        match = None
+        matches = set()
         start = normalized.find(needle)
-        # Bound the work on repeated compatibility expansions that cannot
-        # themselves supply an interval. A second valid hit is ambiguous.
+        # Bound searches even when matches fail the raw interval checks.
         for _ in range(8):
             if start < 0:
-                return match
+                return matches
             end = start + len(needle)
             if (start == 0 or origins[start - 1] != origins[start]) and (
                 end == len(origins) or origins[end - 1] != origins[end]
             ):
                 interval = origins[start][0], origins[end - 1][1]
-                if match is not None or interval[1] - interval[0] > 4096:
-                    return None
-                match = interval
+                if interval[1] - interval[0] <= 4096 and (not terminal_only or self._line_end(end)):
+                    matches.add(interval)
             start = normalized.find(needle, start + 1)
         return None
+
+    def _line_end(self, end: int) -> bool:
+        normalized, origins = self._normalized
+        at = origins[end - 1][1]
+        if unicodedata.normalize("NFKC", self.content[at - 1 : at]) not in _FULL_STOPS:
+            return False
+        if (
+            end > 1
+            and normalized[end - 2] == " "
+            and not all(_horizontal_space(c) for c in self.content[slice(*origins[end - 2])])
+        ):
+            return False
+        while at < len(self.content) and _horizontal_space(self.content[at]):
+            at += 1
+        if at == len(self.content):
+            return self._complete_end
+        return self.content.startswith(("\n", "\r\n"), at)
 
 
 def quote_interval(quote: str, content: str) -> tuple[int, int] | None:
@@ -251,6 +295,8 @@ def align_claim_evidence(claim: dict, sources: dict, *, index: int, anchors: dic
     spans = claim.get("evidence_spans")
     if not isinstance(spans, list):
         return
+    if anchors is None:
+        anchors = {}
     for span_index, span in enumerate(spans):
         if not isinstance(span, dict) or not isinstance(span.get("quote"), str):
             continue
@@ -271,10 +317,15 @@ def align_claim_evidence(claim: dict, sources: dict, *, index: int, anchors: dic
             and content[start - offset : end - offset] == quote
         ):
             continue
-        if anchors is None:
-            interval = quote_interval(quote, content)
-        else:
-            interval = anchors[(source.ref, source.revision)].locate(quote)
+        key = (source.ref, source.revision)
+        if key not in anchors:
+            complete_end = (
+                (window is None or window.final)
+                and source.event.get("capture_state") == "complete"
+                and not source.capture_gaps
+            )
+            anchors[key] = QuoteAnchors(content, complete_end=complete_end)
+        interval = anchors[key].locate(quote)
         if interval is None:
             raise ContractError("DERIVATION_INVALID", f"claim_proposals[{index}].evidence_spans[{span_index}].quote")
         start, end = interval
