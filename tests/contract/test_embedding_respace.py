@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from scope_recall.contracts import ContractError
-from scope_recall.core import work_storage
+from scope_recall.core import embedding_queue, work_storage
 from scope_recall.core.index_rebuild import IMPORT_EMBED_QUEUE_CEILING
 from scope_recall.core.storage import SQLiteStorage
 from scope_recall.runtime.vector_upkeep import respace_if_due
@@ -395,7 +395,7 @@ def test_a_page_looks_through_a_bounded_window_of_work_ids(app, monkeypatch):
     core, ctx = app
     edge(core, ctx, "TEST-A", "TEST-B")
     _finish_embeds(core)
-    monkeypatch.setattr(work_storage, "RESPACE_SCAN", 1)
+    monkeypatch.setattr(embedding_queue, "RESPACE_SCAN", 1)
     run = _start(core, ctx)["run"]
     pages = []
     while not pages or pages[-1]["outcome"] == "progress":

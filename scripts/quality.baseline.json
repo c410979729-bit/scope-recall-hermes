@@ -68,6 +68,9 @@
   "core/consolidation_summary.py": {
    "reportArgumentType": 5
   },
+  "core/embedding_queue.py": {
+   "reportReturnType": 1
+  },
   "core/episode_storage.py": {
    "reportArgumentType": 1,
    "reportCallIssue": 1
@@ -86,9 +89,12 @@
    "reportOptionalSubscript": 1
   },
   "core/recall.py": {
+   "reportAttributeAccessIssue": 1,
+   "reportGeneralTypeIssues": 2
+  },
+  "core/recall_channels.py": {
    "reportArgumentType": 2,
-   "reportAttributeAccessIssue": 3,
-   "reportGeneralTypeIssues": 2,
+   "reportAttributeAccessIssue": 2,
    "reportOptionalMemberAccess": 2
   },
   "core/recall_needs.py": {
@@ -108,9 +114,6 @@
   "core/source_storage.py": {
    "reportArgumentType": 4,
    "reportAssignmentType": 1,
-   "reportReturnType": 1
-  },
-  "core/work_storage.py": {
    "reportReturnType": 1
   },
   "core/worker.py": {
@@ -472,10 +475,13 @@
    "UP035": 1
   },
   "core/recall.py": {
-   "BLE001": 5,
+   "BLE001": 2,
    "C901": {
     "RetrievalPipeline._expand": 17
    }
+  },
+  "core/recall_channels.py": {
+   "BLE001": 3
   },
   "core/recall_packet.py": {
    "B905": 1,
@@ -534,9 +540,7 @@
    "E501": 7
   },
   "core/storage.py": {
-   "B010": 1,
-   "BLE001": 4,
-   "E501": 5
+   "BLE001": 3
   },
   "core/trace.py": {
    "C901": {
@@ -549,6 +553,9 @@
     "read_trace": 66
    }
   },
+  "core/transaction.py": {
+   "BLE001": 1
+  },
   "core/truth_connection.py": {
    "B009": 1,
    "B010": 12,
@@ -558,10 +565,7 @@
    "BLE001": 1
   },
   "core/work_storage.py": {
-   "E501": 8,
-   "PLR0911": {
-    "WorkItems._operator_retry_rejection": 10
-   },
+   "E501": 6,
    "UP017": 2
   },
   "core/worker.py": {
