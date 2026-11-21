@@ -646,6 +646,15 @@ def test_other_tiers_do_not_require_an_installed_distribution(monkeypatch) -> No
 UNGATED_CONTRACTS_BY_DESIGN: set[str] = set()
 
 
+@pytest.mark.parametrize(
+    "tier,directory", [("unit", "tests/unit"), ("host", "tests/host/codex"), ("packaging", "tests/packaging")]
+)
+def test_default_tier_includes_its_test_files(tier, directory):
+    """A clean CI checkout has no change list to pick up newly added tests."""
+    expected = {path.relative_to(ROOT).as_posix() for path in (ROOT / directory).glob("test_*.py")}
+    assert expected <= set(check.select_tests(tier)[0])
+
+
 def test_every_contract_file_is_selected_by_some_tier():
     """A contract file no tier selects runs nowhere: its passing assertions protect nothing and its failures are
     not seen, even when a deliberate change to the contract should turn the file red."""

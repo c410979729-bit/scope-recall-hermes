@@ -70,7 +70,9 @@ class ControlledDirectory:
         shutil.rmtree(self.name)
 
 
-def _run_check(monkeypatch, tmp_path: Path, *, fail_cleanup: bool, timed_out=False) -> tuple[int, dict, str]:
+def _run_check(
+    monkeypatch, tmp_path: Path, *, fail_cleanup: bool, timed_out=False, keep_junit=False
+) -> tuple[int, dict, str]:
     (tmp_path / "tests" / "unit").mkdir(parents=True)
     (tmp_path / "tests" / "unit" / "pass_test.py").write_text("def test_pass():\n    assert True\n", encoding="utf-8")
     (tmp_path / "tests" / "v11_guard.py").write_text("", encoding="utf-8")
@@ -109,7 +111,10 @@ def _run_check(monkeypatch, tmp_path: Path, *, fail_cleanup: bool, timed_out=Fal
     )
     monkeypatch.setattr(check.subprocess, "run", fake_run)
     monkeypatch.setattr(check.subprocess, "check_output", fake_check_output)
-    monkeypatch.setattr(sys, "argv", ["check.py", "--tier", "unit", "--task", "P07"])
+    argv = ["check.py", "--tier", "unit", "--task", "P07"]
+    if keep_junit:
+        argv.append("--keep-junit")
+    monkeypatch.setattr(sys, "argv", argv)
 
     exit_code = check.main()
     receipts = sorted(
@@ -130,6 +135,13 @@ def test_watchdog_preserves_thread_dump_and_progress(monkeypatch, tmp_path: Path
     assert "pytest progress" in log
     assert "Timeout (0:05:00)!\nThread TEST-stack" in log
     assert f"TEST_TIMEOUT after {receipt['watchdog_seconds']} seconds" in log
+
+
+def test_case_evidence_survives_the_owned_sandbox(monkeypatch, tmp_path: Path) -> None:
+    """A certifying controller can check individual cases after the temporary test home is removed."""
+    code, receipt, _ = _run_check(monkeypatch, tmp_path, fail_cleanup=False, keep_junit=True)
+    report = tmp_path / receipt["source_manifest"].replace("-inputs.json", "-junit.xml")
+    assert code == 0 and check._junit_counts(report) == {"passed": 2, "failed": 0, "skipped": 0}
 
 
 def test_cleanup_failure_is_recorded_and_nonzero(monkeypatch, tmp_path: Path) -> None:

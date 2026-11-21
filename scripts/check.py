@@ -184,12 +184,14 @@ SUITES = {
         "tests/unit/test_check_runner.py",
         "tests/unit/test_failure_reporting.py",
         "tests/unit/test_secret_patterns.py",
+        "tests/unit/test_secret_env_name_exemption.py",
         "tests/unit/test_recall_budget.py",
         "tests/unit/test_query_time.py",
         "tests/unit/test_contract_schemas.py",
         "tests/unit/test_claude_code_record.py",
         "tests/unit/test_workbuddy_record.py",
         "tests/unit/test_dsh_record.py",
+        "tests/unit/test_antigravity_record.py",
     ],
     "contract": [
         "tests/contract/test_revision_receipts.py",
@@ -411,6 +413,7 @@ SUITES = {
         "tests/host/codex/test_clients_only_store.py",
         "tests/host/codex/test_remote.py",
         "tests/host/codex/test_dsh_remote.py",
+        "tests/host/codex/test_antigravity.py",
         "tests/host/codex/test_resident_recall.py",
         "tests/host/codex/test_capture_ledger.py",
         "tests/host/codex/test_ledger_recovery_boundaries.py",
@@ -443,6 +446,9 @@ SUITES = {
     ],
     "packaging": [
         "tests/storage_native/test_process_numeric_threads.py",
+        "tests/packaging/test_local_ci_attestation.py",
+        "tests/packaging/test_local_ci_collection.py",
+        "tests/packaging/test_local_release_promotion.py",
         "tests/packaging/test_hermes_catalog_setup.py",
         "tests/packaging/test_hermes_remote_install.py",
         "tests/packaging/test_setup.py",
@@ -1147,13 +1153,18 @@ def _test_environment(tier: str, isolated: Path) -> dict[str, str]:
     return env
 
 
-def _junit_counts(junit: Path) -> dict[str, int]:
+def _junit_counts(junit: Path, *, keep_as: Path | None = None) -> dict[str, int]:
+    """Count the completed cases and optionally preserve their report before sandbox cleanup."""
     counts = {"passed": 0, "failed": 0, "skipped": 0}
+    if junit.is_symlink():
+        raise ValueError("the test report must be a regular file")
     if junit.is_file():
         cases = ET.parse(junit).findall(".//testcase")
         counts["failed"] = sum(c.find("failure") is not None or c.find("error") is not None for c in cases)
         counts["skipped"] = sum(c.find("skipped") is not None for c in cases)
         counts["passed"] = len(cases) - counts["failed"] - counts["skipped"]
+        if keep_as is not None:
+            shutil.copyfile(junit, keep_as)
     return counts
 
 
@@ -1180,6 +1191,7 @@ def main() -> int:
     parser.add_argument("--changed-base")
     parser.add_argument("--changed-files", nargs="*", default=None)
     parser.add_argument("--allow-model-calls", action="store_true")
+    parser.add_argument("--keep-junit", action="store_true", help="keep the case-level XML beside the local receipt")
     parser.add_argument("--task", choices=[f"P{i:02d}" for i in range(20)], default="P01")
     args = parser.parse_args()
     changed, change_diagnostics = _changed_paths(args)
@@ -1266,6 +1278,25 @@ def _test_parent() -> Path:
     return temp_root / "sr"
 
 
+def _run_pytest(command: list[str], env: dict[str, str], watchdog: int) -> subprocess.CompletedProcess:
+    """Capture the terminal output even when the test process exceeds its time budget."""
+    try:
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=watchdog,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            command, 124, _as_text(exc.stdout), _as_text(exc.stderr) + f"\nTEST_TIMEOUT after {watchdog} seconds\n"
+        )
+
+
 def _execute(args, selected: list[str], selection: dict) -> int:
     """Run the selected files under the watchdog, always clean up, always write a receipt.
 
@@ -1277,6 +1308,7 @@ def _execute(args, selected: list[str], selection: dict) -> int:
     evidence.mkdir(parents=True, exist_ok=True)
     parent = _test_parent()
     parent.mkdir(parents=True, exist_ok=True)
+    source_base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     manifest = _source_manifest()
     stem = f"{args.tier}-{time.time_ns()}"
     log = evidence / f"{stem}.log"
@@ -1302,27 +1334,10 @@ def _execute(args, selected: list[str], selection: dict) -> int:
         command = pytest_command(selected, junit)
         transitions.append("pytest_started")
         start = time.perf_counter()
-        try:
-            result = subprocess.run(
-                command,
-                cwd=ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=watchdog_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            result = subprocess.CompletedProcess(
-                command,
-                124,
-                _as_text(exc.stdout),
-                _as_text(exc.stderr) + f"\nTEST_TIMEOUT after {watchdog_seconds} seconds\n",
-            )
+        result = _run_pytest(command, env, watchdog_seconds)
         elapsed = time.perf_counter() - start
         output_parts.extend((_as_text(result.stdout), _as_text(result.stderr)))
-        counts = _junit_counts(junit)
+        counts = _junit_counts(junit, keep_as=evidence / f"{stem}-junit.xml" if args.keep_junit else None)
         pytest_exit_code = (
             result.returncode if result.returncode else (0 if counts["passed"] and not counts["failed"] else 2)
         )
@@ -1397,7 +1412,7 @@ def _execute(args, selected: list[str], selection: dict) -> int:
         if args.tier in PROCESS_TIERS
         else "v11_guard_no_child_processes",
         "test_data": "synthetic_only",
-        "source_base": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "source_base": source_base,
         "source_inputs_sha256": _source_inputs_sha256(manifest),
         "source_manifest": f"verification/{args.task}/{stem}-inputs.json",
         "evidence_scope": _evidence_scope(args.tier, args.task),

@@ -7,6 +7,7 @@ pip_dependencies:
   - "hermes-scope-recall[vectors]==4.0.5"
 provides_hooks:
   - pre_llm_call
+  - pre_api_request
   - api_request_error
   - post_tool_call
   - post_llm_call

@@ -331,7 +331,13 @@ def _hermes_pair(tmp_path, capsys, root, *, second_workspace=None):
     return first, second
 
 
-CLIENT_NAMES = {"codex": "Codex", "claude-code": "Claude Code", "workbuddy": "WorkBuddy", "dsh": "DeepSeek Harness"}
+CLIENT_NAMES = {
+    "codex": "Codex",
+    "claude-code": "Claude Code",
+    "workbuddy": "WorkBuddy",
+    "dsh": "DeepSeek Harness",
+    "antigravity": "Antigravity",
+}
 
 
 def _attach_client(capsys, root, home, *, host="claude-code", like="all", capture="agent3", routes=None):
