@@ -18,6 +18,7 @@ from ..core.backup_primitives import BackupError, create_output, exclusive_store
 from ..core.file_access import preserve_file_access
 from ..core.schema import APPLICATION_ID, SCHEMA_VERSION
 from ..core.writer_lease import TRUTH_WRITER_LEASE_FILENAME, TRUTH_WRITER_LEASE_INFO_FILENAME
+from ._compact_pager import SCRIPT_PATH
 
 RETENTION_DAYS = 180
 _LARGE_FRAGMENT_BYTES = 4096
@@ -27,36 +28,6 @@ _STORE_LOCKS = (
     "scope-recall-retained.lock",
     "runtime-worker.lock",
 )
-
-# Keep the pager lock in a separate process: POSIX record locks belong to a
-# process and would otherwise merge with SQLite's own locks in that process.
-# The Windows VFS locks the reserved 512-byte range at the 1 GiB boundary.
-# A POSIX whole-file record lock covers that range even beyond the file's EOF.
-# POSIX needs a writable descriptor for that lock. The holder never writes.
-_PAGER_LOCK_PROCESS = """
-import os
-import sys
-
-try:
-    with open(sys.argv[1], 'rb' if os.name == 'nt' else 'r+b', buffering=0) as source:
-        info = os.fstat(source.fileno())
-        if (info.st_dev, info.st_ino) != tuple(map(int, sys.argv[2:])):
-            sys.exit(2)
-        if os.name == 'nt':
-            import msvcrt
-            source.seek(1073741824)
-            msvcrt.locking(source.fileno(), msvcrt.LK_NBLCK, 512)
-        elif os.name == 'posix':
-            import fcntl
-            fcntl.lockf(source.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        else:
-            sys.exit(2)
-        sys.stdout.buffer.write(b'1')
-        sys.stdout.buffer.flush()
-        sys.stdin.buffer.read(1)
-except OSError:
-    sys.exit(2)
-"""
 
 # A partially processed or failed item can resume from its staged fragments.
 # Require both a final outcome and a done, unleased work item before trimming.
@@ -128,7 +99,9 @@ def _offline_file(path: Path) -> os.stat_result:
 @contextmanager
 def _exclusive_pager(source: Path, before: os.stat_result):
     """Hold SQLite's native file lock from before inspection through publication."""
-    argv = [sys.executable, "-IBS", "-c", _PAGER_LOCK_PROCESS, str(source), str(before.st_dev), str(before.st_ino)]
+    # POSIX record locks belong to a process and must conflict with every
+    # SQLite connection even when the command has been called in-process.
+    argv = [sys.executable, "-IBS", str(SCRIPT_PATH), str(source), str(before.st_dev), str(before.st_ino)]
     with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as owner:
         if owner.stdout is None or owner.stdout.read(1) != b"1":
             raise BackupError("store is busy or the SQLite file could not be locked exclusively")

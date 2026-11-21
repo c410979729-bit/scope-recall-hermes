@@ -276,6 +276,7 @@
     "distribution/hermes/__init__.py",
     "host_registry.py",
     "maintenance/__init__.py",
+    "maintenance/_compact_pager.py",
     "maintenance/autostart.py",
     "maintenance/backup.py",
     "maintenance/backup_bundle.py",
