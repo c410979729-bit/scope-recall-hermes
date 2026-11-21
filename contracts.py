@@ -538,11 +538,21 @@ def _check_forget_request(payload: dict) -> None:
 
 def _check_consolidation_result(payload: dict, *, indexed_errors: bool = False) -> None:
     for index, claim in enumerate(payload["claim_proposals"]):
-        _check_claim_interval(claim, index if indexed_errors else None)
+        _check_claim_contract(claim, index if indexed_errors else None)
     _check_reference_resolutions(payload, indexed_errors=indexed_errors)
 
 
-def _check_claim_interval(claim: dict, index: int | None) -> None:
+def _check_claim_contract(claim: dict, index: int | None) -> None:
+    # JSON Schema's integer includes 1.0. A source revision is serialized in
+    # a versioned identity, where 1 and 1.0 name different references.
+    for span_index, span in enumerate(claim["evidence_spans"]):
+        if type(span["source_revision"]) is not int:
+            field = (
+                f"claim_proposals[{index}].evidence_spans[{span_index}].source_revision"
+                if index is not None
+                else "source_revision"
+            )
+            raise ContractError("INPUT_INVALID", field)
     start, end = claim["valid_from"], claim["valid_to"]
     if start is not None and end is not None and datetime.fromisoformat(end) <= datetime.fromisoformat(start):
         field = f"claim_proposals[{index}].valid_interval" if index is not None else "valid_interval"
@@ -652,7 +662,7 @@ def partition_consolidation_items(
             try:
                 _validate_model_item(validator, item_schema, item, collection, index)
                 if collection == "claim_proposals":
-                    _check_claim_interval(item, index)
+                    _check_claim_contract(item, index)
                     if align_claim is not None and align_claim(item, index):
                         _validate_model_item(validator, item_schema, item, collection, index)
             except ContractError as exc:

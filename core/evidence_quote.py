@@ -129,7 +129,7 @@ def resolve_evidence_quotes(value: dict, contents: dict) -> int:
     return resolved
 
 
-_PUNCTUATION = str.maketrans({"。": ".", "‘": "'", "’": "'", "“": '"', "”": '"'})
+_PUNCTUATION = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
 _CLAUSE_MARKS = frozenset(",;:")
 _CJK_PREFIXES = ("CJK ", "HIRAGANA ", "KATAKANA ", "HANGUL ")
 
@@ -161,6 +161,10 @@ def _normalized_origin(content: str) -> tuple[str, list[tuple[int, int]]]:
         ):
             end += 1
         for char in unicodedata.normalize("NFKC", content[index:end]).translate(_PUNCTUATION):
+            # An ideographic sentence break followed by a digit cannot
+            # stand for the decimal dot in either 3.14 or .14.
+            if char == "。" and (end == len(content) or not content[end].isnumeric()):
+                char = "."
             if char.isspace():
                 char = " "
                 if characters and characters[-1] == " ":

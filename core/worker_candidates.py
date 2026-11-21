@@ -92,9 +92,6 @@ def _candidate_obsolete(
 
 def _apply_verdict(tx, item, current, value, live_sources, now):
     """Apply a decoded proposal and report whether an added condition was dropped."""
-    if len(value["claim_proposals"]) > 1:
-        raise ContractError("DERIVATION_INVALID", "candidate_proposal_count")
-
     # A verdict whose value no source it cites carries is no verdict on this candidate: the evaluation waits for
     # evidence as when the verdict's value is not in a root's words (``rooted_verdict``), instead of failing.
     validated = validate_claims(tx, value, item.scope_id, ungrounded_values=[])

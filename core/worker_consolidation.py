@@ -301,6 +301,8 @@ def decode_consolidation_result(
     )
     if rejected_items is None or candidate is not None:
         value = validate_payload("consolidation_result", value, indexed_errors=True)
+        if candidate is not None:
+            _check_candidate_shape(value)
         if align is not None:
             changed = False
             for index, claim in enumerate(value["claim_proposals"]):
@@ -313,6 +315,15 @@ def decode_consolidation_result(
     value["claim_proposals"] = _keep_model_items(value, "claim_proposals", "claim", malformed, rejected_items)
     value["resume_proposals"] = _keep_model_items(value, "resume_proposals", "summary", malformed, rejected_items)
     return value
+
+
+def _check_candidate_shape(value: dict) -> None:
+    """Limit a candidate verdict to one claim before it reaches publication."""
+    if len(value["claim_proposals"]) > 1:
+        raise ContractError("DERIVATION_INVALID", "candidate_proposal_count")
+    for field in ("resume_proposals", "reference_proposals"):
+        if value[field]:
+            raise ContractError("INPUT_INVALID", field)
 
 
 def _keep_model_items(value, collection, stage, malformed, rejected_items):

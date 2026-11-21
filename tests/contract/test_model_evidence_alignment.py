@@ -55,6 +55,7 @@ def test_window_offsets_and_repeated_quotes_prefer_the_authorized_window(app):
         ("TEST café。", "TEST cafe\u0301。"),
         ('TEST 配色 "蓝色" .', "TEST 配色  “蓝色”。"),
         ("TEST 选项 , 蓝色 .", "TEST 选项，蓝色。"),
+        ("TEST 版本为3.14.", "TEST 版本为３．１４。"),
     ],
 )
 def test_normalized_quote_maps_back_to_the_literal_source(app, quote, content):
@@ -408,6 +409,10 @@ def test_unlocated_quote_is_refused_with_sources_and_during_publication(app):
     [
         ("TEST 色调  蓝色。 TEST 色调\t蓝色．", "TEST 色调 蓝色."),
         ("TEST 版本为 3.11。", "TEST 版本为 3 .11."),
+        ("TEST 端口为3。14天后关闭", "TEST 端口为3.14天后关闭"),
+        ("TEST 端口为３ 。１４天后关闭", "TEST 端口为3.14天后关闭"),
+        ("TEST 端口为3.14天后关闭", "TEST 端口为3。14天后关闭"),
+        ("TEST 端口未知。14天后关闭", "TEST 端口未知.14天后关闭"),
         ("TEST 配色不是蓝色。", "TEST 配色是蓝色."),
         ("TEST red fox approved.", "TEST redfox approved."),
         ("TEST 值 1, 000。", "TEST 值 1,000."),
@@ -418,6 +423,37 @@ def test_equivalent_anchors_reject_ambiguity_and_changed_assertions(content, quo
     from scope_recall.core.evidence_quote import quote_interval
 
     assert quote_interval(quote, content) is None
+
+
+@pytest.mark.parametrize("invalid_span", ["quote", "source_revision"])
+def test_numeric_anchor_and_float_source_revision_cannot_cost_a_valid_claim(worker_app, invalid_span):
+    core, ctx, _ = worker_app
+    color = "TEST-project 配色蓝色。"
+    port = "TEST-service 端口为3。14天后关闭。"
+    source = capture(core, ctx, f"{port}\n{color}")
+    good = draft(source, quote_override=color)
+    if invalid_span == "quote":
+        bad = draft(
+            source,
+            kind="fact",
+            subject="TEST-service",
+            predicate="端口",
+            value="3.14",
+            quote_override=port.replace("3。14", "3.14"),
+        )
+    else:
+        bad = draft(source, quote_override=color)
+        bad["evidence_spans"][0]["source_revision"] = float(source.revision)
+    model = _AgreeingJudge(lambda sources, **kw: consolidation_payload(*sources, claims=[bad, good]))
+
+    receipt = core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=20)
+
+    assert receipt.completed == 1 and receipt.failed == receipt.retried == 0
+    with core.storage.read(ctx) as tx:
+        (saved,) = tx._check().execute("SELECT payload_json,state FROM claim_versions").fetchall()
+        assert json.loads(saved["payload_json"])["value_text"] == "蓝色" and saved["state"] == "active"
+        (error,) = tx._check().execute("SELECT stage,error_field FROM work_error_details").fetchall()
+        assert tuple(error) == ("claim", f"claim_proposals[0].evidence_spans[0].{invalid_span}")
 
 
 @pytest.mark.parametrize("field", ["source_ref", "source_revision"])

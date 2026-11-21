@@ -256,6 +256,55 @@ def test_empty_candidate_result_keeps_the_candidate_without_decode_retry(app):
 
 
 @pytest.mark.parametrize(
+    ("array", "field"),
+    [
+        ("claim_proposals", "candidate_proposal_count"),
+        ("resume_proposals", "resume_proposals"),
+        ("reference_proposals", "reference_proposals"),
+    ],
+)
+def test_candidate_rejects_out_of_scope_model_arrays_before_publication(app, array, field):
+    from test_candidate_lifecycle import _candidate as stored_candidate
+    from test_candidate_lifecycle import _finish_source_work
+
+    core, ctx = app
+    saved, source, proposal, _ = stored_candidate(core, ctx)
+    _finish_source_work(core)
+    value = consolidation_payload(source, claims=[proposal])
+    unrelated_resume = resume(source)
+    unrelated_resume["goal"]["evidence_refs"] = ["TEST-unavailable@1"]
+    value[array] = {
+        "claim_proposals": [proposal, proposal],
+        "resume_proposals": [unrelated_resume],
+        "reference_proposals": [
+            dict(
+                mention="TEST reference",
+                candidate_refs=[],
+                resolved_ref=None,
+                resolution="unresolved",
+                evidence_refs=["TEST-unavailable@1"],
+            )
+        ],
+    }[array]
+    raw = json.dumps(value)
+    candidate = _candidate(source, proposal["evidence_spans"])
+    with pytest.raises(ContractError, match=field):
+        decode_consolidation_result(raw, (source,), candidate=candidate)
+
+    class ExtraOutput:
+        def evaluate_candidate(self, candidate, sources, **kwargs):
+            return raw
+
+    receipt = core.drain_worker(ctx, consolidation=ExtraOutput(), max_items=1, remaining_seconds=20)
+    assert receipt.completed == 0 and receipt.failed + receipt.retried == 1
+    assert receipt.obsolete == 0
+    assert [claim.state for claim in core.claim_history(ctx, saved.ref)] == ["proposed"]
+    with core.storage.read(ctx) as tx:
+        (error,) = tx._check().execute("SELECT error_field FROM work_error_details").fetchall()
+        assert error["error_field"] == field
+
+
+@pytest.mark.parametrize(
     ("field", "nested"),
     [("claim_proposals", "conditions"), ("resume_proposals", "decisions"), ("reference_proposals", "candidate_refs")],
 )
