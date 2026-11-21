@@ -117,6 +117,7 @@ A cold rollback can return to the pre-upgrade snapshot when no later deletion, w
 ## Compact an offline SQLite copy
 
 Stop the processes using the source database and preview the eligible records. To create a smaller file, choose a new path in an existing directory.
+On Linux and macOS, the account needs write permission on the source file to acquire SQLite's exclusive lock. The command writes database content only to the new copy.
 
 ```sh
 scope-recall compact-store --source /path/to/memory.sqlite3 --dry-run

@@ -5,7 +5,7 @@ Session ids distinguish conversations; they do not attest a person's identity. L
 owner's approved grant. A shared coding-client entry uses the route approved when it was attached. An unknown route
 never borrows another route's scopes.
 
-The host declarations in `adapters/host_profiles.py` specify session and turn fields, lifecycle events, application
+The host declarations in `host_registry.py` specify session and turn fields, lifecycle events, application
 messages and local surfaces. The shared interpreter removes complete application envelopes before treating visible
 words as evidence. Codex rollout recovery reads visible response messages and excludes analysis, tool traffic and
 application suggestion requests. Claude Code reminders and task notices, and WorkBuddy wrappers, meta messages and

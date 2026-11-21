@@ -2,10 +2,16 @@
 
 ## [4.0.6.dev0]
 
+### Added
+
+- `scope-recall compact-store` can preview expired processing data and write a smaller, verified copy of an offline SQLite store.
+- `scope-recall attach` suggests a command when it can verify that active entries share the same local owner and grants.
+
 ### Fixed
 
 - Doctor checks the read-only shared-store binding for Cherry Studio.
 - Consolidation keeps valid facts when another proposal fails validation. Evidence anchors must resolve to a unique passage in the source.
+- Long tool output is indexed from its beginning and end. The full text stays available as evidence.
 
 ## [4.0.5]
 
