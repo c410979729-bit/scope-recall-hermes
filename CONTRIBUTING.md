@@ -203,3 +203,11 @@ commands are described in [Memory benchmarks](docs/benchmarks.md).
   an operator must do beyond installing the package. The release workflow
   publishes that section as the release notes on GitHub.
 - The `integration` and `native` tiers pass before a tag is pushed.
+
+### Releases tested on self-managed machines
+
+A maintainer can approve a local test policy for one stable tag. Build the wheel and source distribution from a clean checkout of the release commit. Keep the original files together in a directory with no other entries. Install that wheel in each test environment. Run `.github/scripts/collect_local_ci.py` from a separately reviewed control checkout. `inspect` identifies the source and locks. `observe` runs a platform and Python test group and records its cases and skips. Keep the raw logs private. Include the package installation and source rebuild check in the approved matrix.
+
+An independently approved policy pins the source, both signing roles and the expected evidence for each group. Use `collect` to run the groups against that policy. The platform signer signs the resulting DSSE signing input from its protected account. `envelope` verifies and wraps the detached signature. After all groups pass, create the annotated tag for the tested commit. `aggregate` binds the tag object to the platform envelopes. The release signer signs that input and `bundle` verifies the completed `LOCAL-CI.dsse.json`. Test processes must have no access to either signing identity.
+
+Set `LOCAL_CI_RELEASE_TAG`, `LOCAL_CI_CONTROL_SHA` and `LOCAL_CI_POLICY_JSON` through trusted repository administration. Protect the release workflows and the `local-ci-release` and `pypi` environments. Once the tested commit is on `main`, upload the original wheel, source distribution and bundle to one draft release with that annotated tag. Send a `scope-recall-local-ci-ready` repository event containing `tag`, `release_id`, `wheel_id`, `sdist_id` and `bundle_id`. The release workflow verifies the uploaded bytes and publishes that draft. PyPI receives the same files after the successful release run. Its final check downloads both distributions and compares their hashes.

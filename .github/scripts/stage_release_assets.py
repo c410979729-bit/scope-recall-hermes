@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 
-def _expected_package_names(version: str) -> tuple[str, str]:
+def expected_package_names(version: str) -> tuple[str, str]:
+    """Return the two canonical upload names for the released version."""
     return (
         f"hermes_scope_recall-{version}-py3-none-any.whl",
         f"hermes_scope_recall-{version}.tar.gz",
@@ -50,6 +51,7 @@ def stage_release_assets(
     packages_dir: Path,
     metadata_dir: Path,
     version: str,
+    local_ci: bool = False,
 ) -> dict[str, Any]:
     """Verify the exact Release inventory and stage only PyPI distributions."""
 
@@ -60,7 +62,7 @@ def stage_release_assets(
         raise ValueError("release assets are missing SHA256SUMS")
     if not provenance_path.is_file():
         raise ValueError("release assets are missing RELEASE-PROVENANCE.json")
-    package_names = _expected_package_names(version)
+    package_names = expected_package_names(version)
     hashed_names = (*package_names,)
     package_paths = [source / name for name in package_names]
     if any(not path.is_file() for path in package_paths):
@@ -71,6 +73,9 @@ def stage_release_assets(
         sums_path.name,
         provenance_path.name,
     }
+    evidence_name = "LOCAL-CI.dsse.json"
+    if local_ci:
+        expected_inventory.add(evidence_name)
     actual_inventory = {path.name for path in source.iterdir()}
     if actual_inventory != expected_inventory or any(
         path.is_symlink() or not path.is_file() for path in source.iterdir()
@@ -91,10 +96,12 @@ def stage_release_assets(
         shutil.copy2(path, packages_dir / path.name)
     shutil.copy2(sums_path, metadata_dir / sums_path.name)
     shutil.copy2(provenance_path, metadata_dir / provenance_path.name)
+    if local_ci:
+        shutil.copy2(source / evidence_name, metadata_dir / evidence_name)
     return {
         "ok": True,
         "packages": sorted(package_names),
-        "metadata": sorted((sums_path.name, provenance_path.name)),
+        "metadata": sorted(expected_inventory - set(hashed_names)),
     }
 
 

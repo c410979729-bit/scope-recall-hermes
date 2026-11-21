@@ -28,8 +28,7 @@ def _distribution_hashes(packages_dir: Path) -> dict[str, str]:
     return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in packages}
 
 
-def write_provenance(
-    output: Path,
+def build_provenance(
     *,
     repository: str,
     source_sha: str,
@@ -39,9 +38,9 @@ def write_provenance(
     workflow_run_attempt: str,
     packages_dir: Path,
 ) -> dict[str, Any]:
-    """Write a deterministic receipt binding distributions to source and run."""
+    """Bind the exact distributions to their source and workflow attempt."""
 
-    payload: dict[str, Any] = {
+    return {
         "format": PROVENANCE_FORMAT,
         "repository": repository,
         "release_tag": release_tag,
@@ -54,10 +53,20 @@ def write_provenance(
         },
         "artifacts": _distribution_hashes(packages_dir),
     }
+
+
+def save_receipt(output: Path, payload: dict[str, Any]) -> None:
+    """Use the same deterministic JSON representation for both release routes."""
     Path(output).write_text(
         json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def write_provenance(output: Path, **fields) -> dict[str, Any]:
+    """Write the ordinary release receipt."""
+    payload = build_provenance(**fields)
+    save_receipt(output, payload)
     return payload
 
 

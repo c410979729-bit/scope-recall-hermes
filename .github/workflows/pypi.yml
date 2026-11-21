@@ -1,8 +1,11 @@
 name: Publish to PyPI
 run-name: >-
-  PyPI publish ${{ github.event.client_payload.tag || inputs.release_tag }}
+  PyPI publish ${{ github.event.client_payload.tag || inputs.release_tag || github.event.workflow_run.id }}
 
 on:
+  workflow_run:
+    workflows: [Publish GitHub Release]
+    types: [completed]
   repository_dispatch:
     types: [scope-recall-pypi-publish]
   workflow_dispatch:
@@ -13,7 +16,7 @@ on:
         type: string
 
 concurrency:
-  group: pypi-publish-${{ github.event.client_payload.tag || inputs.release_tag }}
+  group: pypi-publish-${{ github.event.client_payload.tag || inputs.release_tag || github.event.workflow_run.id }}
   cancel-in-progress: false
 
 permissions:
@@ -26,6 +29,9 @@ env:
 
 jobs:
   verify_release_origin:
+    if: >-
+      github.event_name != 'workflow_run' &&
+      (vars.LOCAL_CI_RELEASE_TAG == '' || (github.event.client_payload.tag || inputs.release_tag) != vars.LOCAL_CI_RELEASE_TAG)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -37,6 +43,16 @@ jobs:
       workflow_run_status: ${{ steps.release_origin.outputs.workflow_run_status }}
       workflow_run_conclusion: ${{ steps.release_origin.outputs.workflow_run_conclusion }}
     steps:
+      - name: Refuse an incomplete local release selector
+        env:
+          LOCAL_TAG: ${{ vars.LOCAL_CI_RELEASE_TAG }}
+          HAS_APPROVAL: ${{ vars.LOCAL_CI_CONTROL_SHA != '' || vars.LOCAL_CI_POLICY_JSON != '' }}
+        run: |
+          if [ -z "$LOCAL_TAG" ]; then
+            test "$HAS_APPROVAL" = false
+          else
+            [[ "$LOCAL_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          fi
       - name: Verify originating release workflow run
         id: release_origin
         env:
@@ -263,8 +279,64 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  prepare_local:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'repository_dispatch' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      pypi_complete: ${{ steps.existing.outputs.complete }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require an independently pinned control revision
+        env:
+          CONTROL: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+        run: '[[ "$CONTROL" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+          path: control
+          persist-credentials: false
+      - name: Download the successful release attempt's immutable receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: local-ci-proof-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: proof
+      - name: Reverify published asset IDs, local signatures and package bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCAL_CI_RELEASE_TAG: ${{ vars.LOCAL_CI_RELEASE_TAG }}
+          LOCAL_CI_CONTROL_SHA: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+          LOCAL_CI_POLICY_JSON: ${{ vars.LOCAL_CI_POLICY_JSON }}
+        run: /usr/bin/python3 -I control/.github/scripts/local_release.py pypi
+      - name: Compare any existing PyPI files before retrying an incomplete upload
+        id: existing
+        env:
+          RELEASE_TAG: ${{ vars.LOCAL_CI_RELEASE_TAG }}
+        run: /usr/bin/python3 -I control/.github/scripts/local_pypi_files.py --packages-dir release-staging/packages --tag "$RELEASE_TAG"
+      - name: Upload the two verified PyPI distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scope-recall-pypi
+          path: |
+            release-staging/packages/*.whl
+            release-staging/packages/*.tar.gz
+            release-staging/metadata/*
+          if-no-files-found: error
+          retention-days: 3
+
   publish:
-    needs: prepare
+    needs: [prepare, prepare_local]
+    if: >-
+      !cancelled() &&
+      ((needs.prepare.result == 'success' && needs.prepare_local.result == 'skipped') ||
+      (needs.prepare_local.result == 'success' && needs.prepare.result == 'skipped'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi
@@ -278,7 +350,36 @@ jobs:
           name: scope-recall-pypi
           path: release-assets
       - name: Publish distributions to PyPI
+        if: needs.prepare_local.outputs.pypi_complete != 'true'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: release-assets/packages/
           print-hash: true
+          skip-existing: ${{ needs.prepare_local.result == 'success' }}
+
+  confirm_local_files:
+    needs: [prepare_local, publish]
+    if: >-
+      !cancelled() && needs.prepare_local.result == 'success' && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require an independently pinned control revision
+        env:
+          CONTROL: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+        run: '[[ "$CONTROL" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: scope-recall-pypi
+          path: release-assets
+      - name: Read both published distributions back from PyPI
+        env:
+          RELEASE_TAG: ${{ vars.LOCAL_CI_RELEASE_TAG }}
+        run: /usr/bin/python3 -I control/.github/scripts/local_pypi_files.py --packages-dir release-assets/packages --tag "$RELEASE_TAG" --read-back

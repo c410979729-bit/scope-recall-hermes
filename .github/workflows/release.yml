@@ -1,6 +1,8 @@
 name: Publish GitHub Release
 
 on:
+  repository_dispatch:
+    types: [scope-recall-local-ci-ready]
   push:
     tags:
       - "v*"
@@ -13,7 +15,7 @@ on:
         type: string
 
 concurrency:
-  group: github-release-${{ inputs.release_tag || github.ref_name }}
+  group: github-release-${{ github.event.client_payload.tag || inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -26,6 +28,10 @@ env:
 
 jobs:
   verify_release_policy:
+    # An approved local version waits for its ready event. No failed local decision enters the cloud build.
+    if: >-
+      github.event_name != 'repository_dispatch' &&
+      (vars.LOCAL_CI_RELEASE_TAG == '' || (inputs.release_tag || github.ref_name) != vars.LOCAL_CI_RELEASE_TAG)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -35,6 +41,16 @@ jobs:
       release_tag: ${{ steps.release_tag.outputs.release_tag }}
       release_sha: ${{ steps.release_policy.outputs.release_sha }}
     steps:
+      - name: Refuse an incomplete local release selector
+        env:
+          LOCAL_TAG: ${{ vars.LOCAL_CI_RELEASE_TAG }}
+          HAS_APPROVAL: ${{ vars.LOCAL_CI_CONTROL_SHA != '' || vars.LOCAL_CI_POLICY_JSON != '' }}
+        run: |
+          if [ -z "$LOCAL_TAG" ]; then
+            test "$HAS_APPROVAL" = false
+          else
+            [[ "$LOCAL_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          fi
       - name: Resolve and validate release tag
         id: release_tag
         env:
@@ -207,3 +223,63 @@ jobs:
             -f "client_payload[tag]=${RELEASE_TAG}" \
             -f "client_payload[source_sha]=${SOURCE_SHA}" \
             -f "client_payload[release_run_id]=${GITHUB_RUN_ID}"
+
+  verify_local:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Require an independently pinned control revision
+        env:
+          CONTROL: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+        run: '[[ "$CONTROL" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+          path: control
+          persist-credentials: false
+      - name: Verify the identified draft with the approved local CI policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCAL_CI_RELEASE_TAG: ${{ vars.LOCAL_CI_RELEASE_TAG }}
+          LOCAL_CI_CONTROL_SHA: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+          LOCAL_CI_POLICY_JSON: ${{ vars.LOCAL_CI_POLICY_JSON }}
+        run: /usr/bin/python3 -I control/.github/scripts/local_release.py verify
+      - name: Save the verified run receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: local-ci-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: proof/
+          if-no-files-found: error
+          retention-days: 90
+
+  promote_local:
+    needs: verify_local
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: local-ci-release
+    permissions:
+      contents: write
+    steps:
+      - name: Require an independently pinned control revision
+        env:
+          CONTROL: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+        run: '[[ "$CONTROL" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: local-ci-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: proof
+      - name: Publish the verified draft by release and asset ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCAL_CI_RELEASE_TAG: ${{ vars.LOCAL_CI_RELEASE_TAG }}
+          LOCAL_CI_CONTROL_SHA: ${{ vars.LOCAL_CI_CONTROL_SHA }}
+          LOCAL_CI_POLICY_JSON: ${{ vars.LOCAL_CI_POLICY_JSON }}
+        run: /usr/bin/python3 -I control/.github/scripts/local_release.py promote
