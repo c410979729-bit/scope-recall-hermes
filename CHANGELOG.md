@@ -5,6 +5,7 @@
 ### Fixed
 
 - Doctor checks the read-only shared-store binding for Cherry Studio.
+- Consolidation keeps valid facts when another proposal fails validation. Evidence anchors must resolve to a unique passage in the source.
 
 ## [4.0.5]
 
