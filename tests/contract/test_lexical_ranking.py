@@ -1,5 +1,7 @@
 """Lexical density changes ordering without changing the evidence admission score."""
 
+import sqlite3
+from contextlib import closing
 from dataclasses import replace
 
 import pytest
@@ -9,6 +11,14 @@ from scope_recall.core.retrieval_storage import RetrievalStorage
 
 from tests.contract.test_claims import app, capture
 from tests.v11_support import recall_request
+
+
+@pytest.fixture(scope="module")
+def has_metadata_length():
+    """Ask the linked SQLite engine whether it can measure a body without reading it."""
+    with closing(sqlite3.connect(":memory:")) as db:
+        row = db.execute("SELECT 1 FROM pragma_function_list WHERE name = 'octet_length' AND narg = 1").fetchone()
+        return row is not None
 
 
 @pytest.mark.parametrize("origin", ["tool_observation", "external_document"])
@@ -28,8 +38,8 @@ from tests.v11_support import recall_request
     ],
     ids=["english", "chinese"],
 )
-def test_concise_evidence_precedes_long_partial_context(app, origin, query, answer, long_text):
-    """A longer source cannot win on extra query words alone, including overlapping CJK bigrams."""
+def test_body_length_changes_rank_only_when_supported(app, has_metadata_length, origin, query, answer, long_text):
+    """Concise evidence wins with length metadata, while older engines rank by query hits."""
     core, ctx = app
     short = capture(core, ctx, answer, when="2026-09-01T12:00:00Z")
     long = capture(core, ctx, long_text, origin=origin, when="2026-09-02T12:00:00Z")
@@ -42,9 +52,11 @@ def test_concise_evidence_precedes_long_partial_context(app, origin, query, answ
     )
     with core.storage.read(reader) as tx:
         found = RetrievalStorage().lexical(tx, search, limit=2)
-    assert [candidate.ref for candidate in found] == [short.ref, long.ref]
+    expected = [short.ref, long.ref] if has_metadata_length else [long.ref, short.ref]
+    assert [candidate.ref for candidate in found] == expected
     # Match counts still describe admission evidence; length changes only the channel rank.
-    short_score, long_score = (candidate.lexical_score for candidate in found)
+    scores = {candidate.ref: candidate.lexical_score for candidate in found}
+    short_score, long_score = scores[short.ref], scores[long.ref]
     assert short_score is not None and long_score is not None
     assert short_score < long_score
     assert all(candidate.lexical_score == len(candidate.matched_query_terms or ()) for candidate in found)
@@ -72,8 +84,8 @@ def test_ordinary_messages_keep_recency_when_their_query_hits_are_equal(app):
     assert found[0].lexical_score == found[1].lexical_score
 
 
-def test_multibyte_body_size_counts_encoded_bytes(app):
-    """Equally sized Unicode strings can consume different body budgets; query hit scores stay unchanged."""
+def test_multibyte_body_rank_uses_encoded_bytes_when_available(app, has_metadata_length):
+    """Equal hit counts use encoded length when available, then recency when length is unavailable."""
     core, ctx = app
     ascii_source = capture(core, ctx, "Orchard database port. " + "a" * 3000, when="2026-09-01T12:00:00Z")
     multibyte_source = capture(core, ctx, "Orchard database port. " + "汉" * 3000, when="2026-09-02T12:00:00Z")
@@ -85,7 +97,10 @@ def test_multibyte_body_size_counts_encoded_bytes(app):
     )
     with core.storage.read(ctx) as tx:
         found = RetrievalStorage().lexical(tx, search, limit=2)
-    assert [candidate.ref for candidate in found] == [ascii_source.ref, multibyte_source.ref]
+    expected = (
+        [ascii_source.ref, multibyte_source.ref] if has_metadata_length else [multibyte_source.ref, ascii_source.ref]
+    )
+    assert [candidate.ref for candidate in found] == expected
     assert found[0].lexical_score == found[1].lexical_score
 
 
