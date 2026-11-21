@@ -54,6 +54,7 @@ def test_window_offsets_and_repeated_quotes_prefer_the_authorized_window(app):
         ("TEST ＡＢＣ ﬁnish。", "TEST ABC finish。"),
         ("TEST café。", "TEST cafe\u0301。"),
         ('TEST 配色 "蓝色" .', "TEST 配色  “蓝色”。"),
+        ("TEST 选项 , 蓝色 .", "TEST 选项，蓝色。"),
     ],
 )
 def test_normalized_quote_maps_back_to_the_literal_source(app, quote, content):
@@ -408,6 +409,8 @@ def test_unlocated_quote_is_refused_with_sources_and_during_publication(app):
         ("TEST 色调  蓝色。 TEST 色调\t蓝色．", "TEST 色调 蓝色."),
         ("TEST 版本为 3.11。", "TEST 版本为 3 .11."),
         ("TEST 配色不是蓝色。", "TEST 配色是蓝色."),
+        ("TEST red fox approved.", "TEST redfox approved."),
+        ("TEST 值 1, 000。", "TEST 值 1,000."),
         ("TEST 要启用蓝色？", "TEST 要启用蓝色."),
     ],
 )

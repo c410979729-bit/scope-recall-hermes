@@ -130,6 +130,17 @@ def resolve_evidence_quotes(value: dict, contents: dict) -> int:
 
 
 _PUNCTUATION = str.maketrans({"。": ".", "‘": "'", "’": "'", "“": '"', "”": '"'})
+_CLAUSE_MARKS = frozenset(",;:")
+_CJK_PREFIXES = ("CJK ", "HIRAGANA ", "KATAKANA ", "HANGUL ")
+
+
+def _clause_spacing(left: str, right: str) -> bool:
+    """Allow typographic spaces beside a clause mark and East Asian text."""
+    if left in _CLAUSE_MARKS:
+        return unicodedata.name(right, "").startswith(_CJK_PREFIXES)
+    if right in _CLAUSE_MARKS:
+        return unicodedata.name(left, "").startswith(_CJK_PREFIXES)
+    return False
 
 
 def _normalized_origin(content: str) -> tuple[str, list[tuple[int, int]]]:
@@ -155,13 +166,14 @@ def _normalized_origin(content: str) -> tuple[str, list[tuple[int, int]]]:
                 if characters and characters[-1] == " ":
                     origins[-1] = (origins[-1][0], end)
                     continue
-            # A space before a sentence terminator is typographic. An
-            # internal dot in a version, domain or decimal keeps its spacing.
+            # Internal dots and Western word or numeric boundaries keep their spacing.
             if (
-                char in ".!?"
-                and characters
+                len(characters) >= 2
                 and characters[-1] == " "
-                and (content[index] == "。" or end == len(content) or content[end].isspace())
+                and (
+                    _clause_spacing(characters[-2], char)
+                    or (char in ".!?" and (content[index] == "。" or end == len(content) or content[end].isspace()))
+                )
             ):
                 characters.pop()
                 origins.pop()
