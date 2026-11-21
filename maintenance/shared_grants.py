@@ -127,14 +127,20 @@ def client_grants(
 
 
 def matching_donor(entries: list[dict], *, read_only: bool) -> str | None:
-    """Select a donor only when all active entries identify the same locally approved owner and grants."""
-    signatures = set()
+    """Choose a verified donor when peer grants agree on the access the new entry can use."""
+    read_grants = set()
+    write_grants = set()
+    donors = set()
     for entry in entries:
         if not local_account_matches(entry.get("local_account_id")):
             return None
         rows = owner_rows(entry)
-        if not any(_local_owner(r) for r in rows) or (not read_only and entry["host"] in READ_ONLY_CLIENT_HOSTS):
+        if not any(_local_owner(r) for r in rows):
             return None
+        can_donate_writes = entry["host"] not in READ_ONLY_CLIENT_HOSTS
+        # The explicit write command reserves "all" for a group of donors.
+        if read_only or (can_donate_writes and entry["entry_id"] != "all"):
+            donors.add(entry["entry_id"])
         owner = entry["audience_scopes"].get("owner_private")
         # An external login remains a separate identity even when two entries run under the same OS account.
         identities = frozenset(
@@ -146,13 +152,16 @@ def matching_donor(entries: list[dict], *, read_only: bool) -> str | None:
             allowed = frozenset(row["allowed_scope_ids"])
             writable = frozenset(row["writable_scope_ids"])
             capture = row["capture_scope_id"]
-            if owner not in allowed or (not read_only and (capture != owner or capture not in writable)):
+            if owner not in allowed:
                 return None
-            signatures.add((owner, identities, allowed, writable, capture))
-    if len(signatures) == 1:
-        # For a writer, this spelling expands to every donor in the explicit command.
-        return min((entry["entry_id"] for entry in entries if read_only or entry["entry_id"] != "all"), default=None)
-    return None
+            read_grants.add((owner, identities, allowed))
+            if not read_only and can_donate_writes:
+                if capture != owner or capture not in writable:
+                    return None
+                write_grants.add((writable, capture))
+    if len(read_grants) != 1 or len(write_grants) > 1:
+        return None
+    return min(donors, default=None)
 
 
 def _runtime_owner_matches(root: Path, entry: dict, binding) -> bool:

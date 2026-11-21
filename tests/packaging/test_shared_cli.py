@@ -1344,6 +1344,64 @@ def _attachment_snapshot(root, *homes):
     return manifest, (root / "memory.sqlite3").read_bytes(), pointers, directories
 
 
+@pytest.mark.parametrize("recipient_host", ["codex", "cherry-studio"])
+@pytest.mark.parametrize("writer_attached", [True, False])
+def test_preview_agrees_on_read_access_across_read_only_and_capture_hosts(
+    tmp_path, capsys, root, recipient_host, writer_attached
+):
+    writer, reader, recipient = (tmp_path / name for name in ("TEST-writer", "TEST-reader", "TEST-recipient"))
+    assert _attach_client(capsys, root, writer, host="dsh", like=None, capture=None)[0] == 0
+    assert (
+        _run(
+            capsys,
+            "attach",
+            "--host",
+            "cherry-studio",
+            "--root",
+            str(root),
+            "--instance-root",
+            str(reader),
+            "--entry",
+            "cherry",
+            "--display-name",
+            "Reader",
+            "--grants-like",
+            "dsh",
+        )[0]
+        == 0
+    )
+    origin = load_shared_client(writer, "dsh").audience
+    if not writer_attached:
+        assert _run(capsys, "detach", "--instance-root", str(writer))[0] == 0
+    before = _attachment_snapshot(root, writer, reader, recipient)
+    code, preview = _run(
+        capsys,
+        "attach",
+        "--host",
+        recipient_host,
+        "--root",
+        str(root),
+        "--instance-root",
+        str(recipient),
+        "--entry",
+        "new-client",
+        "--display-name",
+        "New client",
+    )
+    can_capture = recipient_host == "codex"
+    assert _attachment_snapshot(root, writer, reader, recipient) == before
+    if can_capture and not writer_attached:
+        assert code == 2 and "--grants-like" in preview["error"]
+        return
+    assert code == 0, preview
+    assert (preview["status"], preview["donor"]) == ("review_grants", "dsh" if can_capture else "cherry")
+    assert _run(capsys, *preview["arguments"][1:])[0] == 0
+    actual = load_shared_client(recipient, recipient_host).audience
+    assert actual.allowed_scope_ids == origin.allowed_scope_ids
+    assert actual.writable_scope_ids == (origin.writable_scope_ids if can_capture else frozenset())
+    assert actual.capture_scope_id == (origin.capture_scope_id if can_capture else None)
+
+
 def test_default_attachment_preview_leaves_an_absent_home_absent(tmp_path, capsys, root, monkeypatch):
     monkeypatch.setattr(shared_run, "LOCK_WAIT_SECONDS", 0.2)
     donor = tmp_path / "TEST-donor"
