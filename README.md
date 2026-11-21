@@ -5,6 +5,8 @@ SQLite keeps the original conversations; model-derived facts and vectors remain 
 
 ## Quick start
 
+This checkout is `4.0.6.dev0`. The package-index command installs the published release.
+
 1. In the Python environment you want the hooks to use, run `python -m pip install -U "hermes-scope-recall[codex]"`.
 2. Run `scope-recall setup`. Review the detected hosts, store, scopes, zero model budget and worker plan, then confirm.
 3. Start a new host session. Approve the plugin hooks or MCP server when the host asks.

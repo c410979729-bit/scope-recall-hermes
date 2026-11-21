@@ -199,9 +199,9 @@ commands are described in [Memory benchmarks](docs/benchmarks.md).
 - Changes that belong together ship as one release once all of them are done
   and verified. A fix a user is waiting for goes out as one pull request with
   the fix, the version and its notes, and is tagged without a release candidate.
-- `CHANGELOG.md` gives each release a heading and one paragraph, plus anything
-  an operator must do beyond installing the package. The release workflow
-  publishes that section as the release notes on GitHub.
+- Give each version a heading in `CHANGELOG.md`. Group short notes by topic
+  and include any steps required to upgrade. The release workflow publishes
+  the text between that heading and the next version as the GitHub release notes.
 - The `integration` and `native` tiers pass before a tag is pushed.
 
 ### Releases tested on self-managed machines
