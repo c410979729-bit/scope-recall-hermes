@@ -98,6 +98,7 @@ packages = [
 package-dir = { "scope_recall" = "." }
 
 [tool.setuptools.cmdclass]
+bdist_wheel = "packaging_hooks.v11_build.PortableWheel"
 build_py = "packaging_hooks.v11_build.AllowlistedBuildPy"
 install_lib = "packaging_hooks.v11_build.AllowlistedInstallLib"
 

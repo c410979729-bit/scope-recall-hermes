@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 
+from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.command.build_py import build_py
 from setuptools.command.install_lib import install_lib
 
@@ -40,6 +41,18 @@ def _package_and_module(relative_py: str) -> tuple[str, str]:
     if parts[-1] == "__init__":
         return "scope_recall." + ".".join(parts[:-1]), "__init__"
     return "scope_recall." + ".".join(parts[:-1]), parts[-1]
+
+
+class PortableWheel(bdist_wheel):
+    """Give the generated distribution metadata a stable representation on every build host."""
+
+    def egg2dist(self, egginfo_path: str, distinfo_path: str) -> None:
+        """Normalize the text produced by setuptools before the wheel records its digest."""
+        super().egg2dist(egginfo_path, distinfo_path)
+        metadata = Path(distinfo_path) / "METADATA"
+        raw = metadata.read_bytes()
+        if b"\r\n" in raw:
+            metadata.write_bytes(raw.replace(b"\r\n", b"\n"))
 
 
 class AllowlistedBuildPy(build_py):

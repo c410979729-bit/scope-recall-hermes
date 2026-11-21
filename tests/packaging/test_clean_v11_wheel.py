@@ -162,6 +162,7 @@ def test_clean_v11_wheel_exact_allowlist(built_wheel: Path) -> None:
     metadata_name = next(name for name in dist_info if name.endswith(".dist-info/METADATA"))
     with zipfile.ZipFile(built_wheel) as archive:
         metadata = archive.read(metadata_name).decode("utf-8")
+    assert "\r\n" not in metadata, "wheel metadata must have identical line endings on all build hosts"
     assert "Name: hermes-scope-recall" in metadata
     assert f"Version: {allowlist['package_version']}" in metadata
 
