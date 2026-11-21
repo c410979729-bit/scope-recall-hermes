@@ -1,12 +1,27 @@
 # Changelog
 
-A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``).
-
 ## [4.0.5]
 
-Antigravity can capture completed conversation turns and recall evidence from a local or remote Scope Recall store. Cherry Studio can query a shared store through a read-only MCP entry. Hermes can run on a separate machine and queue captures while the store is offline. Recall groups repeated reports from the same source, distinguishes numbered links by repository, and can resume the current project on the first question in a new session. Remote capture checks respect the original message time when applying privacy settings. Provider quota and rate limits delay work, account errors pause it, and unrecognized errors consume the normal retry budget. Owners can review source attribution and correct it across entries. Model-initiated changes to memory require evidence of the current native user request. [Antigravity setup](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/antigravity.md) · [Cherry Studio setup](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/cherry-studio.md)
+### Added
 
-**Upgrading.** The upgrade takes a pre-upgrade snapshot before migrating the store from schema 1134 to 1135. For an existing entry without an approved local account, run `scope-recall approve-local-account --host <host> --instance-root <home> --yes` from the owner's account to restore owner access. Reapply the Codex plugin installation to register its new hooks. To rebuild an existing Hermes plugin environment, disable and re-enable the plugin, then start a new backend session. [Hermes upgrade instructions](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/hermes.md)
+- [Antigravity](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/antigravity.md) can capture completed turns and recall evidence from a local or remote store.
+- [Cherry Studio](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/cherry-studio.md) can search a shared store through a read-only MCP entry.
+- Hermes can queue captures while a remote store is offline.
+- Owners can review and correct source attribution across entries.
+
+### Fixed
+
+- Recall groups repeated reports from the same source, distinguishes numbered links by repository, and can resume a project on the first question in a new session.
+- Remote capture applies privacy rules using the original message time.
+- Quota and rate limits delay background work. Account errors pause it. Other provider errors consume the normal retry budget.
+- Model-initiated memory changes require evidence of the current user request from the host.
+
+### Upgrading
+
+- The upgrade takes a snapshot before migrating the store from schema 1134 to 1135.
+- To restore owner access for an existing entry without an approved local account, run `scope-recall approve-local-account --host <host> --instance-root <home> --yes` from the owner's account.
+- Reapply the Codex plugin installation to register its new hooks.
+- To rebuild a [Hermes plugin environment](https://github.com/c410979729-bit/scope-recall-hermes/blob/v4.0.5/docs/install/hermes.md), disable and re-enable the plugin, then start a new backend session.
 
 ## [4.0.4] - 2026-11-14
 

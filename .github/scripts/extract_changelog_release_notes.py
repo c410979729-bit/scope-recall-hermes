@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Extract one GitHub Release body from a versioned changelog section.
-
-The parser stays with its sole production consumer so release-note extraction
-does not depend on a separate repository tool.
-"""
+"""Extract the Markdown body of a versioned changelog section."""
 
 from __future__ import annotations
 
@@ -12,7 +8,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+_VERSION = r"[0-9]+\.[0-9]+\.[0-9]+"
+_SECTION_VERSION = re.compile(_VERSION + r"(?:\.dev[0-9]+)?")
+_UNFINISHED = re.compile(r"\b(?:TODO|TBD|FIXME)\b", re.ASCII)
 _FENCE_RE = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})(?P<tail>[^\r\n]*)(?:\r?\n)?$")
 _VERSION_HEADING_RE = re.compile(r"^ {0,3}##[ \t]+\[(?P<label>[^\]\r\n]+)\][^\r\n]*(?:\r?\n)?$")
 
@@ -27,7 +25,7 @@ class _Heading:
 
 
 def _version_headings(changelog: str) -> list[_Heading]:
-    """Return bracketed level-two headings that carry Markdown authority."""
+    """Find bracketed level-two headings outside fenced code blocks."""
     headings: list[_Heading] = []
     offset = 0
     fence_char: str | None = None
@@ -62,8 +60,8 @@ def extract_version_section(changelog: str, version: str) -> str:
     delimit a release. Missing, duplicate, or empty target sections fail
     closed so release tooling cannot publish ambiguous or example content.
     """
-    if not SEMVER_RE.fullmatch(version):
-        raise ValueError("version must use major.minor.patch syntax")
+    if not _SECTION_VERSION.fullmatch(version):
+        raise ValueError("expected a release version or a numbered development version")
 
     headings = _version_headings(changelog)
     matches = [(index, heading) for index, heading in enumerate(headings) if heading.label == version]
@@ -75,12 +73,15 @@ def extract_version_section(changelog: str, version: str) -> str:
     body = changelog[heading.body_start : end].strip()
     if not body:
         raise ValueError(f"changelog section for {version} is empty")
+    if _UNFINISHED.search(body):
+        raise ValueError(f"changelog section for {version} contains an unfinished note")
     return body + "\n"
 
 
 def extract_release_notes(changelog: str, version: str) -> str:
-    """Return the authoritative body for one release version."""
-
+    """Return publishable notes for a final release."""
+    if not re.fullmatch(_VERSION, version):
+        raise ValueError("version must use major.minor.patch syntax")
     return extract_version_section(changelog, version)
 
 
