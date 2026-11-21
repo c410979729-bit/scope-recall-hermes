@@ -798,7 +798,8 @@ def test_mirror_deadline_resumes_after_the_last_validated_line(tmp_path, monkeyp
     mirror_dir = tmp_path / "backups"
     deletion_mirror.sync_deletion_mirror(binding.data_directory, mirror_dir)
     mirror = mirror_dir / DELETION_MIRROR_FILENAME
-    mirror.write_bytes(mirror.read_bytes())
+    # Legal JSON whitespace changes the size, forcing a rescan even if the filesystem keeps the same mtime.
+    mirror.write_bytes(b" " + mirror.read_bytes())
     actual_decode = checkpoint.decode_mirror_record
     seen = []
     clock = [0.0]
@@ -816,6 +817,8 @@ def test_mirror_deadline_resumes_after_the_last_validated_line(tmp_path, monkeyp
     assert len(seen) == 1
     with sqlite3.connect(binding.data_directory / "deletion-mirror-checkpoint.sqlite3") as conn:
         offset = conn.execute("SELECT offset FROM checkpoint WHERE singleton=1").fetchone()[0]
+    with mirror.open("rb") as stream:
+        assert offset == len(stream.readline())
     assert 0 < offset < mirror.stat().st_size
     deletion_mirror.sync_deletion_mirror(binding.data_directory, mirror_dir)
     assert seen.count(binding.installation_id) == 1
