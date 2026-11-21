@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import stat
 import subprocess
 import sys
 from collections.abc import Callable
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -18,7 +19,7 @@ from ..core.backup_primitives import BackupError, create_output, exclusive_store
 from ..core.file_access import preserve_file_access
 from ..core.schema import APPLICATION_ID, SCHEMA_VERSION
 from ..core.writer_lease import TRUTH_WRITER_LEASE_FILENAME, TRUTH_WRITER_LEASE_INFO_FILENAME
-from ._compact_pager import SCRIPT_PATH
+from ._compact_pager import SCRIPT_PATH, STAGE_PREFIX, file_revision, sidecars
 
 RETENTION_DAYS = 180
 _LARGE_FRAGMENT_BYTES = 4096
@@ -82,13 +83,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--retention-days", type=int, default=RETENTION_DAYS, help="minimum payload age (default: 180)")
 
 
-def _sidecars(path: Path) -> tuple[Path, ...]:
-    return tuple(path.with_name(path.name + suffix) for suffix in ("-wal", "-shm", "-journal"))
-
-
 def _offline_file(path: Path) -> os.stat_result:
     """Refuse live or unrecovered journals and aliases that evade the directory lease."""
-    if any(os.path.lexists(candidate) for candidate in _sidecars(path)):
+    if any(os.path.lexists(candidate) for candidate in sidecars(path)):
         raise BackupError("store is busy or needs recovery: close it and clear its SQLite sidecars normally")
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -101,11 +98,31 @@ def _exclusive_pager(source: Path, before: os.stat_result):
     """Hold SQLite's native file lock from before inspection through publication."""
     # POSIX record locks belong to a process and must conflict with every
     # SQLite connection even when the command has been called in-process.
-    argv = [sys.executable, "-IBS", str(SCRIPT_PATH), str(source), str(before.st_dev), str(before.st_ino)]
+    argv = [sys.executable, "-IBS", str(SCRIPT_PATH), str(source), *map(str, file_revision(before))]
     with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as owner:
         if owner.stdout is None or owner.stdout.read(1) != b"1":
             raise BackupError("store is busy or the SQLite file could not be locked exclusively")
         yield owner
+
+
+def _publish_with_pager(owner: subprocess.Popen[bytes], stage: Path, output: Path, verified: os.stat_result) -> None:
+    """Request a link from the lock owner and verify the outcome after it has stopped."""
+    if owner.stdin is None:
+        raise BackupError("missing SQLite publication pipe")
+    request = json.dumps((str(stage), str(output), file_revision(verified))).encode("ascii") + b"\n"
+    try:
+        with suppress(OSError), owner.stdin as pipe:
+            pipe.write(request)
+    finally:
+        owner.wait()
+    # The link may have succeeded immediately before the child exited abnormally.
+    # The output inode, rather than the exit status, records the commit point.
+    try:
+        published = output.lstat()
+    except FileNotFoundError:
+        raise BackupError("SQLite lock was lost or the compacted copy could not be published") from None
+    if file_revision(published) != file_revision(verified) or not stat.S_ISREG(published.st_mode):
+        raise BackupError("output path is occupied by another file")
 
 
 @contextmanager
@@ -122,18 +139,20 @@ def _read_store(source: Path):
                     raise BackupError("exclusive SQLite file lock was lost")
                 _unchanged(source, before)
 
+            def publish(stage: Path, output: Path, verified: os.stat_result) -> None:
+                check_source()
+                _publish_with_pager(owner, stage, output, verified)
+
             check_source()
             # The native pager lock excludes independent SQLite readers and
             # writers. This handle can read without opening source journals.
             with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as reader:
                 _verify_schema(reader)
-                yield reader, before, check_source
+                yield reader, before, check_source, publish
 
 
 def _unchanged(source: Path, before: os.stat_result) -> None:
-    after = _offline_file(source)
-    same_data = (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size)
-    if not os.path.samestat(before, after) or not same_data:
+    if file_revision(_offline_file(source)) != file_revision(before):
         raise BackupError("source changed during compaction")
 
 
@@ -212,10 +231,10 @@ def _copy_store(
     output: Path,
     params: dict,
     measured: dict,
-    check_source: Callable[[], None],
+    publish: Callable[[Path, Path, os.stat_result], None],
 ) -> int:
     """Transform a protected staging file; publish atomically without overwriting."""
-    stage = output.with_name(f".scope-recall-compact-{uuid4().hex}.sqlite3")
+    stage = output.with_name(f"{STAGE_PREFIX}{uuid4().hex}.sqlite3")
     create_output(stage)
     owned = stage.stat()
     try:
@@ -223,16 +242,17 @@ def _copy_store(
         with closing(sqlite3.connect(stage)) as copy:
             reader.backup(copy)
             _trim_and_vacuum(copy, params, measured)
-        if not os.path.samestat(owned, stage.lstat()) or any(os.path.lexists(p) for p in _sidecars(stage)):
+        if not os.path.samestat(owned, stage.lstat()) or any(os.path.lexists(p) for p in sidecars(stage)):
             raise BackupError("staging copy changed or has unexpected SQLite sidecars")
-        if any(os.path.lexists(p) for p in (output, *_sidecars(output))):
+        if any(os.path.lexists(p) for p in (output, *sidecars(output))):
             raise BackupError("output or an output sidecar already exists")
         with stage.open("rb+") as file:
             os.fsync(file.fileno())
-            size = os.fstat(file.fileno()).st_size
-        check_source()
-        os.link(stage, output)
-        return size
+            verified = os.fstat(file.fileno())
+        if not os.path.samestat(owned, verified):
+            raise BackupError("staging copy changed before publication")
+        publish(stage, output, verified)
+        return verified.st_size
     finally:
         if os.path.lexists(stage) and os.path.samestat(owned, stage.lstat()):
             stage.unlink()
@@ -247,13 +267,13 @@ def compact_store(
     source = safe_path(source, must_exist=True)
     if output is not None:
         output = safe_path(output)
-        if not output.parent.is_dir() or output in _sidecars(source) or output.name in _STORE_LOCKS:
+        if not output.parent.is_dir() or output in sidecars(source) or output.name in _STORE_LOCKS:
             raise BackupError("output must be a new SQLite file in an existing directory")
-        if any(os.path.lexists(p) for p in (output, *_sidecars(output))):
+        if any(os.path.lexists(p) for p in (output, *sidecars(output))):
             raise BackupError("output or an output sidecar already exists")
     cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
     params = {"cutoff": cutoff, "large_fragment_bytes": _LARGE_FRAGMENT_BYTES}
-    with _read_store(source) as (reader, before, check_source):
+    with _read_store(source) as (reader, before, check_source, publish):
         measured = _measure(reader, params)
         result = {
             "status": "dry_run",
@@ -266,6 +286,6 @@ def compact_store(
         if output is None:
             check_source()
         else:
-            output_bytes = _copy_store(reader, source, output, params, measured, check_source)
+            output_bytes = _copy_store(reader, source, output, params, measured, publish)
             result.update(status="compacted", output=str(output), output_bytes=output_bytes)
     return result

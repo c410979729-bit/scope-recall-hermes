@@ -233,6 +233,113 @@ def test_compaction_drops_the_staged_copy_if_the_pager_lock_is_lost(app, tmp_pat
     assert sha256(source) == before
 
 
+def test_compaction_never_publishes_if_the_pager_dies_after_the_parent_source_check(app, tmp_path, capsys, monkeypatch):
+    source = app[0].storage.path
+    output = tmp_path / "late-writer.sqlite3"
+    with closing(sqlite3.connect(source)) as db:
+        assert db.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+        revision = db.execute("SELECT storage_revision FROM instance_meta").fetchone()[0]
+    exclusive = compact_store._exclusive_pager
+    unchanged = compact_store._unchanged
+    writer_committed = False
+
+    @contextmanager
+    def stop_at_publish(path, info):
+        with exclusive(path, info) as owner:
+
+            def check_then_stop(source_path, before):
+                nonlocal writer_committed
+                unchanged(source_path, before)
+                if not list(tmp_path.glob(".scope-recall-compact-*.sqlite3")):
+                    return
+                owner.terminate()
+                owner.wait(timeout=5)
+                with closing(sqlite3.connect(source, timeout=0)) as writer, writer:
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute("UPDATE instance_meta SET storage_revision=storage_revision+1")
+                writer_committed = True
+
+            monkeypatch.setattr(compact_store, "_unchanged", check_then_stop)
+            yield owner
+
+    monkeypatch.setattr(compact_store, "_exclusive_pager", stop_at_publish)
+    result = main(["compact-store", "--source", str(source), "--apply", "--output", str(output)])
+    assert writer_committed
+    with closing(sqlite3.connect(source)) as db:
+        assert db.execute("SELECT storage_revision FROM instance_meta").fetchone() == (revision + 1,)
+    assert result == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "error"
+    assert not output.exists() and not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*"))
+
+
+def test_compaction_verifies_the_output_if_the_pager_exits_after_linking(app, tmp_path, capsys, monkeypatch):
+    source = app[0].storage.path
+    output = tmp_path / "linked-before-exit.sqlite3"
+    before = sha256(source)
+    shim = tmp_path / "pager-exit-after-link.py"
+    shim.write_text(
+        "import os, runpy, sys\n"
+        f"pager = runpy.run_path({str(compact_store.SCRIPT_PATH)!r})\n"
+        "link = os.link\n"
+        "def link_and_exit(*args, **kwargs):\n"
+        "    link(*args, **kwargs)\n"
+        "    os._exit(79)\n"
+        "os.link = link_and_exit\n"
+        "raise SystemExit(pager['_main'](sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    exclusive = compact_store._exclusive_pager
+    exit_codes = []
+
+    @contextmanager
+    def record_exit(path, info):
+        with exclusive(path, info) as owner:
+            yield owner
+            exit_codes.append(owner.returncode)
+
+    monkeypatch.setattr(compact_store, "SCRIPT_PATH", shim)
+    monkeypatch.setattr(compact_store, "_exclusive_pager", record_exit)
+    assert main(["compact-store", "--source", str(source), "--apply", "--output", str(output)]) == 0
+    assert exit_codes == [79]
+    assert json.loads(capsys.readouterr().out)["status"] == "compacted"
+    with closing(sqlite3.connect(output)) as copy:
+        assert copy.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    assert not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*")) and sha256(source) == before
+
+
+def test_pager_ignores_a_publication_frame_interrupted_by_parent_exit(app, tmp_path):
+    source = app[0].storage.path
+    before = sha256(source)
+    stage = tmp_path / f"{compact_store.STAGE_PREFIX}interrupted.sqlite3"
+    stage.write_bytes(b"TEST staged bytes")
+    output = tmp_path / "partial-request.sqlite3"
+    request = json.dumps((str(stage), str(output), compact_store.file_revision(stage.stat()))).encode("ascii")
+    with compact_store._exclusive_pager(source, source.stat()) as owner:
+        assert owner.stdin is not None
+        with owner.stdin as pipe:
+            pipe.write(request)
+        assert owner.wait(timeout=5) == 2
+    assert not output.exists() and sha256(source) == before
+
+
+def test_compaction_preserves_an_output_created_during_publication(app, tmp_path, capsys, monkeypatch):
+    source = app[0].storage.path
+    output = tmp_path / "late-output.sqlite3"
+    before = sha256(source)
+    unchanged = compact_store._unchanged
+
+    def check_and_create_output(path, info):
+        unchanged(path, info)
+        if list(tmp_path.glob(".scope-recall-compact-*.sqlite3")):
+            output.write_bytes(b"TEST independently published data")
+
+    monkeypatch.setattr(compact_store, "_unchanged", check_and_create_output)
+    assert main(["compact-store", "--source", str(source), "--apply", "--output", str(output)]) == 2
+    assert "output path is occupied" in capsys.readouterr().out
+    assert output.read_bytes() == b"TEST independently published data"
+    assert not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*")) and sha256(source) == before
+
+
 def test_verification_failure_leaves_no_published_or_staging_file(app, tmp_path, capsys, monkeypatch):
     source = app[0].storage.path
     output = tmp_path / "failed.sqlite3"
