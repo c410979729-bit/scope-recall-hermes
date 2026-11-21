@@ -52,19 +52,29 @@ def object_id(value: object) -> int:
     return int(str(value))
 
 
-def git_source(tag: str, commit: str, *, at_main: bool) -> dict:
-    """Require the actual annotated tag, its direct commit target, and that commit's tree."""
+def git_source(tag: str, run_head: str, *, at_main: bool) -> dict:
+    """Bind the approved package commit to its annotated tag and the workflow revision serving it."""
     require(re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) is not None, "invalid stable tag")
-    require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None, "invalid run commit")
+    approved = json.loads(os.environ["LOCAL_CI_POLICY_JSON"])["source"]
+    commit = approved["commit"]
+    require(approved["tag"] == tag and re.fullmatch(r"[0-9a-f]{40}", commit) is not None, "invalid approved source")
+    require(re.fullmatch(r"[0-9a-f]{40}", run_head) is not None, "invalid workflow revision")
     ref = api(repo_path(f"git/ref/tags/{tag}"))
     require(ref["ref"] == f"refs/tags/{tag}" and ref["object"]["type"] == "tag", "annotated tag required")
     tag_object = ref["object"]["sha"]
     require(re.fullmatch(r"[0-9a-f]{40}", tag_object) is not None, "invalid tag object")
     annotation = api(repo_path(f"git/tags/{tag_object}"))
     require(annotation["sha"] == tag_object and annotation["tag"] == tag, "tag object mismatch")
-    require(annotation["object"]["type"] == "commit" and annotation["object"]["sha"] == commit, "run/tag mismatch")
+    require(annotation["object"]["type"] == "commit" and annotation["object"]["sha"] == commit, "policy/tag mismatch")
+    if run_head != commit:
+        # A publisher repair can follow the tag. Only an independently pinned descendant may serve the original bytes.
+        require(run_head == os.environ["LOCAL_CI_CONTROL_SHA"], "unapproved publisher revision")
+        comparison = api(repo_path(f"compare/{commit}...{run_head}"))
+        require(
+            comparison["status"] == "ahead" and comparison["merge_base_commit"]["sha"] == commit, "unrelated publisher"
+        )
     if at_main:
-        require(api(repo_path("git/ref/heads/main"))["object"]["sha"] == commit, "main moved beyond the candidate")
+        require(api(repo_path("git/ref/heads/main"))["object"]["sha"] == run_head, "main moved beyond the release run")
     source = api(repo_path(f"git/commits/{commit}"))
     tree = source["tree"]["sha"]
     require(source["sha"] == commit and re.fullmatch(r"[0-9a-f]{40}", tree) is not None, "invalid source tree")
@@ -256,7 +266,7 @@ def promote(event: dict, tag: str, receipt: dict) -> None:
         )
         require(upload["name"] == name and upload["digest"] == "sha256:" + sha256(file), "metadata upload mismatch")
         ids[name] = object_id(upload["id"])
-    require(git_source(tag, source["commit"], at_main=True) == source, "tag changed during promotion")
+    require(git_source(tag, os.environ["GITHUB_SHA"], at_main=True) == source, "tag changed during promotion")
     hashes = {name: "sha256:" + value for name, value in digests.items()}
     hashes.update({name: "sha256:" + sha256(Path("proof") / name) for name in (SUMS, RECEIPT)})
     verified_assets(inventory(api(endpoint), release_id, tag, draft=True), ids, hashes)

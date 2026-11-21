@@ -31,7 +31,7 @@ def candidate(tmp_path, monkeypatch):
         "GITHUB_RUN_ID": "13",
         "GITHUB_RUN_ATTEMPT": "2",
         "LOCAL_CI_CONTROL_SHA": CONTROL,
-        "LOCAL_CI_POLICY_JSON": "{}",
+        "LOCAL_CI_POLICY_JSON": json.dumps({"source": {"commit": COMMIT, "tag": TAG}}),
     }.items():
         monkeypatch.setenv(key, value)
     wheel, sdist = release.expected_package_names(TAG[1:])
@@ -175,6 +175,39 @@ def test_changed_run_or_public_inventory_cannot_reach_pypi(candidate, change):
     assert not Path("release-staging/packages").exists()
 
 
+def test_pinned_publisher_can_promote_the_signed_tag_after_a_workflow_repair(candidate, monkeypatch):
+    release, event, objects, _ = candidate
+    monkeypatch.setenv("GITHUB_SHA", CONTROL)
+    objects["git/ref/heads/main"]["object"]["sha"] = CONTROL
+    objects[f"compare/{COMMIT}...{CONTROL}"] = dict(status="ahead", merge_base_commit={"sha": COMMIT})
+    event["workflow_run"]["head_sha"] = CONTROL
+    objects["actions/runs/13/attempts/2"]["head_sha"] = CONTROL
+
+    release.verify_draft(event, TAG)
+    receipt = json.loads((Path("proof") / release.RECEIPT).read_text())
+    assert receipt["source_sha"] == COMMIT
+    release.promote(event, TAG, receipt)
+    release.prepare_pypi(event, TAG, receipt)
+
+
+@pytest.mark.parametrize("change", ["unpinned", "diverged", "wrong-ancestor", "moved-main", "wrong-tag"])
+def test_changed_publisher_head_requires_the_approved_control_and_source(candidate, monkeypatch, change):
+    release, event, objects, _ = candidate
+    head = "e" * 40 if change == "unpinned" else CONTROL
+    monkeypatch.setenv("GITHUB_SHA", head)
+    objects["git/ref/heads/main"]["object"]["sha"] = COMMIT if change == "moved-main" else head
+    objects[f"compare/{COMMIT}...{head}"] = dict(
+        status="diverged" if change == "diverged" else "ahead",
+        merge_base_commit={"sha": TREE if change == "wrong-ancestor" else COMMIT},
+    )
+    if change == "wrong-tag":
+        objects["git/tags/" + ANNOTATION]["object"]["sha"] = CONTROL
+    with pytest.raises(ValueError):
+        release.verify_draft(event, TAG)
+    assert objects["releases/21"]["draft"]
+    assert not Path("proof").exists()
+
+
 def test_cloud_route_and_oidc_permissions_are_separate():
     release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())["jobs"]
     pypi = yaml.safe_load((ROOT / ".github/workflows/pypi.yml").read_text())["jobs"]
@@ -182,8 +215,14 @@ def test_cloud_route_and_oidc_permissions_are_separate():
     assert "!= vars.LOCAL_CI_RELEASE_TAG" in release["verify_release_policy"]["if"]
     assert release["build"]["needs"] == "verify_release_policy"
     assert release["publish"]["needs"] == "build"
-    assert release["verify_local"]["permissions"] == {"contents": "read"}
-    assert release["promote_local"]["needs"] == "verify_local"
+    local = release["promote_local"]
+    assert local["permissions"] == {"contents": "write"} and local["environment"] == "local-ci-release"
+    assert "repository_dispatch" in local["if"]
+    steps = local["steps"]
+    verify = next(i for i, step in enumerate(steps) if step.get("run", "").endswith("local_release.py verify"))
+    save = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("actions/upload-artifact@"))
+    promote = next(i for i, step in enumerate(steps) if step.get("run", "").endswith("local_release.py promote"))
+    assert verify < save < promote
     assert pypi["prepare_local"]["permissions"] == {"actions": "read", "contents": "read"}
     assert set(pypi["publish"]["needs"]) == {"prepare", "prepare_local"}
     assert pypi["publish"]["environment"] == "pypi"
