@@ -8,13 +8,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..host_registry import HOSTS
+
+# Keep discovery order stable: the first fresh entry supplies the store's default grants.
 HOST_DIRECTORIES = {
-    "claude-code": ("CLAUDE_CONFIG_DIR", ".claude"),
-    "codex": ("CODEX_HOME", ".codex"),
-    "hermes": ("HERMES_HOME", ".hermes"),
-    "workbuddy": ("CODEBUDDY_CONFIG_DIR", ".workbuddy"),
-    "dsh": ("DSH_HOME", ".dsh"),
-    "antigravity": ("SCOPE_RECALL_ANTIGRAVITY_HOME", ".gemini"),
+    host: profile.home
+    for host, profile in sorted(HOSTS.items(), key=lambda item: item[1].discovery_priority)
+    if profile.home is not None
 }
 
 

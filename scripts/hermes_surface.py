@@ -141,7 +141,7 @@ def registered_hooks(repo: Path) -> list[str]:
     observers = hooks.get("_OBSERVERS")
     if observers is None or 'HOSTS["hermes"].hook_observers' not in ast.unparse(observers).replace("'", '"'):
         raise ValueError("hook registration shape changed; inspect adapters/hermes/hooks.py")
-    profile = syntax(repo / "adapters/host_profiles.py")
+    profile = syntax(repo / "host_registry.py")
     registered = []
     for node in ast.walk(profile):
         if isinstance(node, ast.Dict):

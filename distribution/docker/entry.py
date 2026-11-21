@@ -18,6 +18,7 @@ configure_numeric_threads()
 
 from ...adapters.clients.remote_server import RemoteServerConfig, load_server_config
 from ...core.writer_lease import TruthWriterLease, try_lock_exclusive_nonblocking
+from ...host_registry import CONTAINER_REMOTE_HOSTS
 
 DATA = Path("/data")
 SECRET = Path("/run/secrets/runtime")
@@ -51,7 +52,7 @@ def discover_entries(homes: Path) -> list[RemoteServerConfig]:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             host = raw.get("host") if isinstance(raw, dict) else None
-            if host not in {"codex", "claude-code", "workbuddy", "dsh", "hermes"}:
+            if host not in CONTAINER_REMOTE_HOSTS:
                 raise ValueError("invalid remote host")
             entries.append(load_server_config(home, host))
         except (OSError, ValueError) as exc:

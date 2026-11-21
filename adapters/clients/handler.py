@@ -75,8 +75,6 @@ _TOTAL_BUDGET_S = 2.0
 _SUPPORTED_EVENTS = frozenset({"SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "Interrupt", "SessionEnd"})
 #: Attached prompt hooks may use the entry's bounded processing allowance. The installed command timeout also
 #: leaves room for loading, serialization and shutdown outside the recall operation.
-_CONFIGURED_PROMPT_BUDGET = frozenset(HOOK_CLIENT_HOSTS)
-_HOST_EVENTS = {host: profile.events for host, profile in HOSTS.items()}
 
 
 class HookClock(Protocol):
@@ -262,12 +260,11 @@ class CodexHookHandler:
         )
         handler.remote_paths = remote_paths
         handler._pending_runtime_config_path = trusted_runtime_config_path or str(config.runtime_config_path)
-        if host in _CONFIGURED_PROMPT_BUDGET:
-            handler._prompt_budget = (
-                _configured_budget(handler._pending_runtime_config_path)
-                if prompt_budget is None
-                else strict_hook_budget(prompt_budget)
-            )
+        handler._prompt_budget = (
+            _configured_budget(handler._pending_runtime_config_path)
+            if prompt_budget is None
+            else strict_hook_budget(prompt_budget)
+        )
         return handler
 
     # -- diagnostics and budget ------------------------------------------
@@ -692,7 +689,7 @@ class CodexHookHandler:
 
     def _admit(self, event: object, payload: dict[str, Any]) -> tuple[str, Any] | None:
         """The session and audience of a hook this client sends and this handler takes, or None, said why."""
-        if event not in _HOST_EVENTS[self.host]:
+        if event not in HOSTS[self.host].events:
             self.note("unsupported_event")
             return None
         if agent_run(self.host, payload):

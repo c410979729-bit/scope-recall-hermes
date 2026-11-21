@@ -175,7 +175,7 @@ def host_dependencies(drift: dict, host: str) -> dict:
     rows = drift.get("requirements")
     if not isinstance(rows, list) or not all(isinstance(row, dict) and "extra" in row for row in rows):
         return drift
-    from scope_recall.adapters.hermes.shared_entries import CLIENT_HOSTS
+    from scope_recall.host_registry import CLIENT_HOSTS
 
     unused = () if host in CLIENT_HOSTS else ("codex",)
     rows = [{**row, "applies": row["extra"] not in unused} for row in rows]

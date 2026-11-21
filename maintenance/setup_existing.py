@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from ..adapters.shared_entries import attachment_path, read_attachment
+from ..host_registry import HOSTS
 from .install_common import RUNTIME_CONFIG_LIMIT, InstallError, require_absolute
 from .install_receipt import receipt_file
 
@@ -38,9 +39,9 @@ def _mcp_home(server: dict, host: str) -> Path:
         if _argument(args, "--host") != host:
             raise InstallError("existing Scope Recall server host differs from the selected host")
         return require_absolute(Path(_argument(args, "--home")), "registered entry home")
-    if host == "codex" and "--config" in args:
+    if HOSTS[host].workspace_mapping and "--config" in args:
         config = require_absolute(Path(_argument(args, "--config")), "registered config")
-        if config.name == "codex-installation.json":
+        if config.name == HOSTS[host].local_manifest:
             return config.parent
     raise InstallError("existing Scope Recall server does not declare its entry home")
 
@@ -66,9 +67,11 @@ def existing_entry_home(host: str, home: Path, target: Path, *, user_root: Path)
     """Follow only this product's structured registration; its attachment must bind the same host."""
     if attachment_path(home).is_file() or receipt_file(home).is_file():
         return home
-    if host == "codex":
+    profile = HOSTS[host]
+    registration = profile.existing_registration
+    if registration == "catalog":
         target = _catalog_target(target, user_root)
-    if host == "dsh":
+    if registration == "patch":
         layers = _read(target / "cordis.patch.yml", yaml_file=True) or []
         if not isinstance(layers, list):
             raise InstallError("existing dsh patch is not a layer list")
@@ -85,9 +88,8 @@ def existing_entry_home(host: str, home: Path, target: Path, *, user_root: Path)
         if not isinstance(declared, str):
             raise InstallError("existing Scope Recall plugin has no local entry home; preserve its configuration")
         bound = require_absolute(Path(declared), "registered entry home")
-    elif host in {"codex", "claude-code", "workbuddy", "antigravity"}:
-        filename = {"workbuddy": "mcp.json", "antigravity": "config/mcp_config.json"}.get(host, ".mcp.json")
-        value = _read(target / filename) or {}
+    elif registration in {"catalog", "mcp"}:
+        value = _read(target / profile.existing_mcp_file) or {}
         if not isinstance(value, dict) or not isinstance(value.get("mcpServers", {}), dict):
             raise InstallError("existing host MCP configuration is not a server mapping")
         server = (value.get("mcpServers") or {}).get("scope-recall")
@@ -99,7 +101,7 @@ def existing_entry_home(host: str, home: Path, target: Path, *, user_root: Path)
     else:
         return home
     pointer = read_attachment(bound)
-    if pointer is None and not (bound / "codex-installation.json").is_file():
+    if pointer is None and (profile.local_manifest is None or not (bound / profile.local_manifest).is_file()):
         raise InstallError("registered entry binding is missing; preserve the existing host registration")
     if pointer is not None and pointer.host != host:
         raise InstallError("registered entry binding belongs to a different host")

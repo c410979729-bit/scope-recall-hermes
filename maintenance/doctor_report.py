@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 from scope_recall._version import __version__
-
-HostChoice = Literal["hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"]
+from scope_recall.host_registry import HostChoice as HostChoice
 
 
 @dataclass

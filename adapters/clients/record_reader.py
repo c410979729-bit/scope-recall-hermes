@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 #: turns, at most ``_RECORD_READ_S`` each, so the end of a turn is not held up.
 #: dsh has no record a hook can read (its session log is compressed); its plugin sends the turn's messages with the Stop
 #: as the lines a remote client sends (``transcript.dsh_lines``).
-_READS_RECORD = frozenset(host for host, profile in HOSTS.items() if profile.record_format is not None)
 _RECORD_READ_S = 3.0
 #: A capture is started only with this much of the reading time left.
 _RECORD_CAPTURE_MIN_S = 0.5
@@ -91,7 +90,7 @@ class RecordReader:
         self._hook = hook
 
     def reads(self, event: object) -> bool:
-        return event in ("Stop", "SessionEnd") and self._hook.host in _READS_RECORD
+        return event in ("Stop", "SessionEnd") and HOSTS[self._hook.host].record_format is not None
 
     def read(
         self,

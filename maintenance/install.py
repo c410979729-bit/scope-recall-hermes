@@ -10,9 +10,9 @@ from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
+from ..host_registry import HOOK_CLIENT_HOSTS, HOSTS
 from . import install_antigravity, install_claude_code, install_codex, install_dsh, install_hermes, install_workbuddy
 from .backup import adjacent_backup, atomic_write, sha256, write_private_configuration
-from .doctor import check_host_registration
 from .install_common import (
     BACKUP_DIRNAME,
     PACKAGE_VERSION,
@@ -48,18 +48,51 @@ __all__ = [
     "plan_uninstall",
 ]
 
-# Every host module exposes the same functions; the entry picks one instead of branching.  A host that reads its hooks
-# from its own configuration (WorkBuddy) names those files in ``host_config_files``: its target is then the host's own
-# home, which the host shares, and the install merges its entries into those files (``merged_file``) and takes them
-# out again at uninstall (``unmerged_file``) instead of owning files there.
-_HOSTS: dict[str, ModuleType] = {
-    "codex": install_codex,
-    "claude-code": install_claude_code,
-    "hermes": install_hermes,
-    "workbuddy": install_workbuddy,
-    "dsh": install_dsh,
-    "antigravity": install_antigravity,
+# Static imports let the wheel inventory follow the adapter dependencies.
+_INSTALLERS = {
+    module.__name__.rsplit(".", 1)[-1]: module
+    for module in (
+        install_codex,
+        install_claude_code,
+        install_hermes,
+        install_workbuddy,
+        install_dsh,
+        install_antigravity,
+    )
 }
+
+
+def installer_for(host: str) -> ModuleType:
+    """Return the installer selected by the host profile."""
+    name = HOSTS[validate_host(host)].installer
+    assert name is not None
+    return _INSTALLERS[name]
+
+
+def default_target(host: str) -> Path | None:
+    """A host that merges its own settings can choose its own configuration home."""
+    default_home = getattr(installer_for(host), "default_home", None)
+    return default_home() if default_home is not None else None
+
+
+def check_host_registration(host: str, instance: Path, python_executable: Path | None = None) -> str:
+    """Check the installed host registration, returning pending when the host has no probe."""
+    profile = HOSTS.get(host)
+    if profile is None or profile.doctor_registration is None:
+        return "pending"
+    adapter = installer_for(host)
+    if profile.doctor_registration == "provider":
+        return adapter.registration(instance, python_executable)
+
+    try:
+        receipt = load_receipt(instance)
+        if receipt is None:
+            return "pending"
+        target = Path(receipt["target_plugin_dir"])
+        validate_receipt_binding(receipt, host=host, instance_root=instance, target_plugin_dir=target)
+        return adapter.registration(target, instance)
+    except (InstallError, OSError, KeyError, TypeError, ValueError):
+        return "unknown"
 
 
 def _instance_files(host: ModuleType, instance_root: Path) -> tuple[Path, Path]:
@@ -145,7 +178,7 @@ def _written_digest(content: str | bytes) -> str:
 def _backup_copy(path: Path, backup_root: Path, plan: InstallPlan | UninstallPlan) -> Path:
     """Copy a file the install is about to overwrite under plugin/, instance/ or other/."""
     if normalized_path(path) in {
-        normalized_path(p) for p in _HOSTS[plan.host].host_config_files(plan.target_plugin_dir)
+        normalized_path(p) for p in installer_for(plan.host).host_config_files(plan.target_plugin_dir)
     }:
         return adjacent_backup(path)
     norm = normalized_path(path)
@@ -214,7 +247,7 @@ def plan_install(
 def _validated_options(options: InstallPlan):
     """Normalize typed planning inputs through the same host/path rules for both entry paths."""
     host = validate_host(options.host)
-    adapter = _HOSTS[host]
+    adapter = installer_for(host)
     target = require_absolute(options.target_plugin_dir, "target_plugin_dir")
     instance = require_absolute(options.instance_root, "instance_root")
     project = require_absolute(options.project_root, "project_root") if options.project_root is not None else None
@@ -372,7 +405,7 @@ def _stop_residents(host: str, instance_root: Path) -> None:
     """Stop the entry's resident recall servers, for a client that may keep one (``adapters/clients/resident_entry``).
     They write nothing.  One that cannot be stopped (its identity not proven, as on macOS, or this account may not end
     it) is said on stderr and left to its own end; nothing here fails the install."""
-    if host not in ("codex", "claude-code", "workbuddy", "dsh", "antigravity"):
+    if host not in HOOK_CLIENT_HOSTS:
         return
     import sys
 
@@ -415,7 +448,7 @@ def apply_install(plan: InstallPlan) -> InstallResult:
     )
     if plan.conflicts:
         raise InstallError("; ".join(plan.conflicts))
-    adapter = _HOSTS[plan.host]
+    adapter = installer_for(plan.host)
     planned = adapter.planned_files(plan)
     tracked = _instance_files(adapter, plan.instance_root)
     backup_root = plan.instance_root / BACKUP_DIRNAME / uuid.uuid4().hex
@@ -494,7 +527,7 @@ def apply_install(plan: InstallPlan) -> InstallResult:
         # Codex operator step and full mode is never verified by an install.
         host_registration_pending=check_host_registration(plan.host, plan.instance_root, plan.python_executable)
         != "registered",
-        hook_trust_pending=plan.host == "codex",
+        hook_trust_pending=HOSTS[plan.host].hook_trust,
         full_mode_unverified=True,
         receipt_path=str(receipt_path),
         installation_id=installation_id,
@@ -515,7 +548,7 @@ def plan_uninstall(
         raise InstallError("install receipt is required for uninstall")
 
     host = validate_host(str(receipt.get("host") or ""))
-    adapter = _HOSTS[host]
+    adapter = installer_for(host)
     if target_plugin_dir is None:
         target_plugin_dir = str(receipt.get("target_plugin_dir") or "")
     target = require_absolute(Path(target_plugin_dir), "target_plugin_dir")
@@ -584,7 +617,7 @@ def apply_uninstall(plan: UninstallPlan, *, purge: bool = False) -> UninstallRes
     plan = plan_uninstall(instance_root=plan.instance_root, target_plugin_dir=plan.target_plugin_dir, purge=purge)
     if plan.conflicts:
         raise InstallError("; ".join(plan.conflicts))
-    adapter = _HOSTS[plan.host]
+    adapter = installer_for(plan.host)
     data_dir = adapter.data_dir(plan.instance_root)
     _disable_autostart(data_dir)
     # A resident recall server of this entry runs from the package (``adapters/clients/resident_entry``): with the hooks

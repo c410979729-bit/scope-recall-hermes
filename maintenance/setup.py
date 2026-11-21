@@ -13,6 +13,7 @@ from typing import Any
 from scope_recall.adapters.host_memory import inspect_host_memory
 
 from ..adapters.hermes.shared_entries import read_attachment, read_shared_payload
+from ..host_registry import HOSTS
 from .install_common import InstallError, require_absolute
 from .install_receipt import load_receipt
 from .onboarding import inspect_installation, planning_database_state
@@ -134,11 +135,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _target(host: str, home: Path) -> Path:
-    if host in {"workbuddy", "dsh", "antigravity"}:
-        return home
-    if host == "hermes":
-        return home / "plugins" / "scope-recall"
-    return home / "skills" / "scope-recall"
+    """Return the native configuration target for the selected host."""
+    return home.joinpath(*HOSTS[host].setup_target)
 
 
 def _check_store(store: Path, test_mode: bool, blockers: list[str]) -> None:
@@ -162,11 +160,7 @@ def _check_model_change(store: Path, rows: list[dict], models: dict | None, bloc
     if route is None:
         return
     candidates = [store / "runtime-config.json"]
-    candidates += [
-        Path(row["home"]) / ("data" if row["host"] == "codex" else "scope-recall") / "runtime-config.json"
-        for row in rows
-        if row["state"] == "local"
-    ]
+    candidates += [_runtime_directory(row) / "runtime-config.json" for row in rows if row["state"] == "local"]
     for path in candidates:
         if path.is_file():
             old = json.loads(path.read_text(encoding="utf-8"))
@@ -190,9 +184,15 @@ def _selected_hosts(args: argparse.Namespace, found: dict) -> list[str]:
     return selected
 
 
+def _runtime_directory(row: dict) -> Path:
+    """An entry uses the shared layout unless it has a host-owned local store."""
+    local = HOSTS[row["host"]].local_data if row["state"] == "local" else None
+    return Path(row["home"]) / (local or "scope-recall")
+
+
 def _existing_settings(row: dict, store: Path) -> dict:
     """Read known runtime settings once for planning; a new entry inherits its shared worker's choices."""
-    directory = Path(row["home"]) / ("data" if row["host"] == "codex" and row["state"] == "local" else "scope-recall")
+    directory = _runtime_directory(row)
     path = directory / "runtime-config.json"
     if not path.is_file() and row["state"] == "fresh":
         path = store / "runtime-config.json"
@@ -208,7 +208,7 @@ def _existing_settings(row: dict, store: Path) -> dict:
 
 def _local_state(host: str, home: Path, blockers: list[str]) -> str:
     """Classify local stores through the existing read-only detector; clients otherwise need an attachment."""
-    if host in {"codex", "hermes"}:
+    if HOSTS[host].local_manifest is not None:
         inspected = inspect_installation(home, host=host)
         if inspected["route"] == "current_upgrade":
             return "local"
@@ -262,7 +262,7 @@ def build_plan(args: argparse.Namespace, *, environment=None) -> SetupPlan:
             stores.add(pointer.root)
         if state == "fresh" and receipt is not None:
             blockers.append(host + ": installation receipt has no usable binding; preserve and repair it")
-        if state == "local" and host == "codex":
+        if state == "local" and HOSTS[host].workspace_mapping:
             copies.extend(dict(copy, home=str(home)) for copy in project_suggestions(home, project))
         target = Path(receipt["target_plugin_dir"]) if receipt is not None else _target(host, home)
         rows.append(
@@ -278,7 +278,7 @@ def build_plan(args: argparse.Namespace, *, environment=None) -> SetupPlan:
                 target=str(target),
                 state=state,
                 action="repair missing configuration" if receipt else "install",
-                memory_skill=host != "antigravity",
+                memory_skill=HOSTS[host].setup_memory_skill,
                 host_memory=inspect_host_memory(host, host_home, project=project, environment=env),
             )
         )
@@ -303,7 +303,7 @@ def build_plan(args: argparse.Namespace, *, environment=None) -> SetupPlan:
         ):
             row["scopes"]["source_entry"] = first_fresh
     for row in rows:
-        directory = Path(row["home"]) / ("data" if row["host"] == "codex" else "scope-recall")
+        directory = _runtime_directory(row)
         row["database_inspection"] = planning_database_state(
             (directory if row["state"] == "local" else store) / "memory.sqlite3"
         )

@@ -23,6 +23,7 @@ from pathlib import Path
 from ... import _version
 from ..._version import __version__
 from ...core.file_lock import advisory_file_lock
+from ...host_registry import HOOK_CLIENT_HOSTS
 from ...runtime.running_code import version_on_disk
 from ...runtime.worker_entry import host_process_credential_environment
 from .config import load_shared_client
@@ -61,7 +62,7 @@ FUTURE_MARK_SECONDS = 60.0
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scope Recall resident prompt recall server")
     parser.add_argument("--home", type=Path, required=True, help="Absolute home of a client attached to a shared store")
-    parser.add_argument("--host", choices=("codex", "claude-code", "workbuddy", "dsh", "antigravity"), required=True)
+    parser.add_argument("--host", choices=HOOK_CLIENT_HOSTS, required=True)
     parser.add_argument(
         "--env-file",
         type=Path,

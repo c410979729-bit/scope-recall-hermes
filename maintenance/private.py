@@ -13,6 +13,7 @@ import json
 from scope_recall.contracts import ContractError, validate_payload
 from scope_recall.core.private import MODES, parse_duration
 
+from ..host_registry import INSTALL_HOSTS
 from .memory import open_management, table
 from .restore import RestoreError
 
@@ -21,7 +22,7 @@ FORMAT = "scope-recall-private/1"
 
 def _common(parser):
     parser.add_argument("--root", help="shared store root")
-    parser.add_argument("--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"))
+    parser.add_argument("--host", choices=INSTALL_HOSTS)
     parser.add_argument("--instance-root", help="host installation home for a store of its own")
     parser.add_argument("--json", action="store_true", help="emit the versioned JSON contract")
 

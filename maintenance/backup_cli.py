@@ -18,6 +18,7 @@ from typing import Any
 
 from ..core.backup_primitives import BackupError, backup_sqlite, safe_path
 from ..core.file_lock import advisory_file_lock
+from ..host_registry import INSTALL_HOSTS
 from ..runtime.backup_bundle import BackupBundleError, create_backup_bundle
 from .backup_bundle import resolve_store_binding, verify_backup_bundle
 from .disaster_restore import DisasterRestoreError
@@ -72,9 +73,7 @@ def main(argv: list[str]) -> int:
         parser.add_argument("--output", type=Path, required=True, help="output zip bundle destination")
         parser.add_argument("--root", type=Path, help="shared store root directory")
         parser.add_argument("--instance-root", type=Path, help="local instance root directory")
-        parser.add_argument(
-            "--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"), help="host type"
-        )
+        parser.add_argument("--host", choices=INSTALL_HOSTS, help="host type")
         parser.add_argument("--with-vectors", action="store_true", help="include vector files in backup")
         parser.add_argument(
             "--client-config",

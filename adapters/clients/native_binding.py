@@ -14,6 +14,7 @@ from uuid import uuid4
 from scope_recall.core.entry_control import refuse_unbound_mutation
 from scope_recall.core.file_lock import advisory_file_lock
 
+from ...host_registry import HOSTS
 from ..request_binding import bind_source
 from . import transcript
 from .boundary import host_source_key
@@ -200,7 +201,7 @@ def request_context(server, ctx, tool, body, context):
 @contextmanager
 def _request_context(server, ctx, tool, body, context):
     if (
-        server.host != "codex"
+        not HOSTS[server.host].native_write_witness
         or not isinstance(server.config, SharedClientConfig)
         or not server.config.local_account_attested
     ):

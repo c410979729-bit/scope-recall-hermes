@@ -267,6 +267,7 @@
     "distribution/docker/__init__.py",
     "distribution/docker/entry.py",
     "distribution/hermes/__init__.py",
+    "host_registry.py",
     "maintenance/__init__.py",
     "maintenance/autostart.py",
     "maintenance/backup.py",

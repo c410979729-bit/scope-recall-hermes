@@ -6,6 +6,7 @@ import argparse
 import webbrowser
 
 from ..contracts import ContractError
+from ..host_registry import INSTALL_HOSTS
 from .memory import open_management
 from .restore import RestoreError
 from .ui_api import UIApi
@@ -16,7 +17,7 @@ def parser():
     """Select the same store as the memory CLI, with no listening-address option."""
     result = argparse.ArgumentParser(prog="scope-recall ui", description=__doc__)
     result.add_argument("--root", help="shared store root")
-    result.add_argument("--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"))
+    result.add_argument("--host", choices=INSTALL_HOSTS)
     result.add_argument("--instance-root", help="host installation home for a store of its own")
     return result
 

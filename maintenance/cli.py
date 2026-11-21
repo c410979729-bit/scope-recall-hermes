@@ -32,14 +32,13 @@ from scope_recall.core.store_upgrade import read_upgrade_state
 from scope_recall.core.truth_connection import connect_truth_database
 from scope_recall.core.writer_lease import TruthWriterBusyError, TruthWriterLease
 
+from ..host_registry import ENTRY_HOSTS, INSTALL_HOSTS, LOCAL_STORE_HOSTS
 from .backup import BackupError, sqlite_busy
 from .doctor import run_doctor
 from .doctor_store import read_journal_mode, recorded_schema_under_stale_header, schema_on_disk
-from .install import InstallError, apply_install, apply_uninstall, plan_install, plan_uninstall
+from .install import InstallError, apply_install, apply_uninstall, default_target, plan_install, plan_uninstall
 from .install_common import absolute
-from .install_dsh import default_home as dsh_home
 from .install_hermes import LOCAL_PLATFORM_CHOICES
-from .install_workbuddy import default_home
 
 
 def _emit(payload: dict) -> None:
@@ -383,9 +382,7 @@ def _respace_embeddings(args: argparse.Namespace) -> int:
 
 
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity")
-    )
+    parser.add_argument("--host", required=True, choices=INSTALL_HOSTS)
     parser.add_argument(
         "--target-plugin-dir",
         default=None,
@@ -443,14 +440,9 @@ def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
 def _install_target(args: argparse.Namespace) -> Path:
     if args.target_plugin_dir:
         return _path(args.target_plugin_dir, "target_plugin_dir")
-    if args.host == "workbuddy":
-        return default_home()
-    if args.host == "dsh":
-        return dsh_home()
-    if args.host == "antigravity":
-        from .install_antigravity import default_home as antigravity_home
-
-        return antigravity_home()
+    target = default_target(args.host)
+    if target is not None:
+        return target
     raise SystemExit(f"--target-plugin-dir is required for --host {args.host}")
 
 
@@ -482,9 +474,7 @@ def _apply_install(args: argparse.Namespace) -> int:
 
 
 def _add_doctor_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity")
-    )
+    parser.add_argument("--host", required=True, choices=ENTRY_HOSTS)
     parser.add_argument("--instance-root", required=True)
     parser.add_argument("--python")
     parser.add_argument("--recall-request-id")
@@ -530,7 +520,7 @@ def _tables_not_in_schema(database: Path) -> dict[str, int]:
 
 
 def _add_upgrade_store_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
+    parser.add_argument("--host", required=True, choices=LOCAL_STORE_HOSTS)
     parser.add_argument("--instance-root", required=True)
     parser.add_argument("--backup-dir", help="snapshot directory; defaults to upgrade-snapshots beside the store")
     parser.add_argument(

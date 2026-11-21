@@ -67,6 +67,7 @@ from scope_recall.core.truth_connection import connect_truth_database
 from scope_recall.maintenance.shared import store_binding
 from scope_recall.runtime.running_code import live_records
 
+from ..host_registry import INSTALL_HOSTS
 from .backup import BackupError, backup_sqlite, exclusive_store, safe_path
 from .disaster_restore import DisasterRestoreError, apply_disaster_restore, plan_disaster_restore
 from .doctor import load_binding
@@ -418,7 +419,7 @@ def main(argv: list[str]) -> int:
     store.add_argument("--root", type=Path, help="a shared store's directory")
     parser.add_argument(
         "--host",
-        choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"),
+        choices=INSTALL_HOSTS,
         help="the host of --instance-root",
     )
     parser.add_argument("--snapshot", type=Path, required=True, help="a snapshot of this store that backup took")

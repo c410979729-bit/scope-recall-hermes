@@ -18,6 +18,7 @@ from ..adapters.hermes.provider import ScopeRecallHermesAdapter
 from ..contracts import ContractError
 from ..core.recall_log_writer import close_writers
 from ..core.writer_lease import TruthWriterBusyError
+from ..host_registry import HOSTS
 from ..runtime.instance import build_runtime_instance
 from ..runtime.instance_config import RuntimeInstanceConfig
 from ..runtime.worker_entry import credential_environment, run_worker
@@ -110,7 +111,7 @@ def _client(home: Path, host: str, session: str, prompt: str) -> dict:
     with closing(CodexHookHandler.from_home(str(home), host, prompt_budget=budget)) as handler:
         payload = (
             _antigravity_probe(home, session, prompt)
-            if host == "antigravity"
+            if HOSTS[host].remote_hook_wire == "antigravity"
             else dict(
                 hook_event_name="UserPromptSubmit",
                 session_id=session,
@@ -122,7 +123,7 @@ def _client(home: Path, host: str, session: str, prompt: str) -> dict:
             )
         )
         answer = handler.handle_payload(payload)
-        if host == "antigravity":
+        if HOSTS[host].remote_hook_wire == "antigravity":
             answer = antigravity.answer(answer, "PreInvocation")
         return _host_answer(answer, handler.diagnostics.delivery_reason, handler.diagnostics.last_reason)
 

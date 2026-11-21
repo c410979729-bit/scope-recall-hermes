@@ -515,3 +515,12 @@ def test_loopback_capture_shared_recall_and_stdio_shim(served):
     assert sum(row[1] == TEXT for row in rows(root)) == 1
     assert not list(config["state_dir"].rglob("*.sqlite3"))
     asyncio.run(protocol(["-m", "scope_recall.adapters.codex.remote_client", "mcp", "--config", str(config["config"])]))
+
+
+def test_hook_cli_rejects_antigravity_with_a_codex_manifest(tmp_path, capsys):
+    from scope_recall.adapters.clients import hook_entry
+
+    with pytest.raises(SystemExit) as rejected:
+        hook_entry.main(["--host", "antigravity", "--config", str(tmp_path / "codex-installation.json")])
+    assert rejected.value.code == 2
+    assert "--config is for a local Codex installation" in capsys.readouterr().err

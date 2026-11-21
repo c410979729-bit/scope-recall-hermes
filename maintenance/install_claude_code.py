@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ..host_registry import HOOK_TIMEOUTS as REMOTE_HOOK_TIMEOUTS
 from . import install_client
 from .install_client import (  # noqa: F401 -- install.py calls these on every host's module
     approve_local_platforms,
@@ -43,7 +44,7 @@ from .install_common import (
 HOST = "claude-code"
 #: The events recorded, and how long Claude Code waits for each.  A prompt waits for its
 #: recall (the entry's ``hook_processing_seconds``, at most 6 s) after the interpreter starts.
-HOOK_TIMEOUTS = {"SessionStart": 5, "UserPromptSubmit": 15, "Stop": 10, "SessionEnd": 10}
+HOOK_TIMEOUTS = REMOTE_HOOK_TIMEOUTS[HOST]
 #: The skills a Claude Code session gets.  ``scope-recall-setup`` stays out: installing and
 #: upgrading are operator procedures, not something a coding session is asked to do.
 CLAUDE_CODE_SKILLS = ("scope-recall-memory",)

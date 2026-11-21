@@ -8,7 +8,6 @@ configuration untouched; SQLite may create coordination sidecars for reads.
 
 from __future__ import annotations
 
-import importlib.metadata
 import json
 import os
 import sqlite3
@@ -27,6 +26,7 @@ from scope_recall.adapters.hermes.shared_entries import read_attachment
 from scope_recall.adapters.hermes.unbound_sessions import owner_sessions_unbound
 from scope_recall.adapters.host_memory import inspect_host_memory
 from scope_recall.core.recall_policy import RecallPolicy, embedding_space_id
+from scope_recall.host_registry import ENTRY_HOSTS, HOSTS
 from scope_recall.runtime.budget_reservations import reservation_headroom
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.model_budget import (
@@ -58,6 +58,7 @@ from .doctor_store import (
     check_vector_store,
 )
 from .import_progress import read_progress
+from .install import check_host_registration as check_host_registration
 from .install_common import RUNTIME_CONFIG_LIMIT
 
 #: Run as a file by the target interpreter, so an installed package that
@@ -73,16 +74,15 @@ def _hermes_data_dir(instance_root: Path) -> Path:
     return instance_root / "scope-recall"
 
 
-def _codex_config_path(instance_root: Path) -> Path:
-    """What a client binds with: a shared store's pointer, or a Codex installation of its own."""
-    pointer = _hermes_data_dir(instance_root) / "attachment.json"
-    return pointer if pointer.is_file() else instance_root / "codex-installation.json"
-
-
-def _hermes_config_path(instance_root: Path) -> Path:
-    """What a Hermes home binds with: a shared store's pointer, or its own manifest."""
-    pointer = _hermes_data_dir(instance_root) / "attachment.json"
-    return pointer if pointer.is_file() else _hermes_data_dir(instance_root) / "installation.json"
+def _config_path(host: str, instance: Path) -> Path:
+    """Use a shared pointer first, allowing a local manifest only where the host owns a store."""
+    profile = HOSTS[host]
+    pointer = _hermes_data_dir(instance) / "attachment.json"
+    if pointer.is_file() or profile.local_manifest is None:
+        return pointer
+    if profile.integration == "provider":
+        return pointer.with_name(Path(profile.local_manifest).name)
+    return instance / profile.local_manifest
 
 
 def _hermes_runtime_environment(instance_root: Path) -> Path | None:
@@ -134,7 +134,7 @@ def _check_hermes_runtime(report: DoctorReport, instance: Path, config: RuntimeI
 
     The inspecting interpreter can differ from that environment. An unreadable environment is reported without
     inferring whether its packages match the installation."""
-    if report.host != "hermes":
+    if HOSTS[report.host].integration != "provider":
         return
     environment = _hermes_runtime_environment(instance)
     if environment is None:
@@ -233,14 +233,20 @@ def probe_python_package(python: Path) -> dict[str, Any]:
 
 
 def load_binding(host: HostChoice, instance_root: Path):
-    if host == "hermes":
+    """Load a binding through the same adapter and account checks the host runs."""
+    profile = HOSTS[host]
+    if profile.integration == "provider":
         from scope_recall.adapters.hermes.shared_entries import load_binding_for_home
 
         manifest = load_binding_for_home(instance_root)
         return manifest.to_binding(), manifest.data_directory
 
-    path = _codex_config_path(instance_root)
-    config = load_shared_client(instance_root, host) if path.name == "attachment.json" else load_codex_config(path)
+    path = _config_path(host, instance_root)
+    config = (
+        load_codex_config(path)
+        if profile.workspace_mapping and path.name == profile.local_manifest
+        else load_shared_client(instance_root, host)
+    )
     return config.to_binding(), config.data_directory
 
 
@@ -419,71 +425,14 @@ def _check_running_code(report: DoctorReport, data_directory: Path) -> None:
     record_check(report, "running_code", "ok" if records else "no_records", str(len(records)))
 
 
-def check_host_registration(host: str, instance: Path, python_executable: Path | None = None) -> str:
-    """Check the installed host registration, returning pending when the host has no probe."""
-    if host == "hermes":
-        return _hermes_registration(instance, python_executable)
-    if host != "antigravity":
-        return "pending"
-    from . import install_antigravity
-    from .install_common import InstallError
-    from .install_receipt import load_receipt, validate_receipt_binding
-
-    try:
-        receipt = load_receipt(instance)
-        if receipt is None:
-            return "pending"
-        target = Path(receipt["target_plugin_dir"])
-        validate_receipt_binding(receipt, host=host, instance_root=instance, target_plugin_dir=target)
-        return install_antigravity.registration(target, instance)
-    except (InstallError, OSError, KeyError, TypeError, ValueError):
-        return "unknown"
-
-
-def _hermes_registration(instance: Path, python_executable: Path | None) -> str:
-    """Check the provider entry point in the target interpreter and its selection in the instance."""
-    if python_executable is not None:
-        script = "import importlib.metadata as m,json; print(json.dumps(any(e.name=='scope-recall' for e in m.entry_points(group='hermes_agent.memory_providers'))))"
-        try:
-            probe = subprocess.run(
-                [str(python_executable), "-I", "-B", "-c", script],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            if probe.returncode or json.loads(probe.stdout) is not True:
-                return "entry_point_missing"
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            return "unknown"
-    else:
-        try:
-            entries = importlib.metadata.entry_points(group="hermes_agent.memory_providers")
-            if not any(entry.name == "scope-recall" for entry in entries):
-                return "entry_point_missing"
-        except Exception:  # noqa: BLE001 - metadata lookups fail in host-specific ways.
-            return "unknown"
-    config = instance / "config.yaml"
-    if not config.is_file():
-        return "host_config_missing"
-    try:
-        import yaml
-
-        value = yaml.safe_load(config.read_text(encoding="utf-8"))
-        memory = value.get("memory", {}) if isinstance(value, dict) else {}
-        selected = memory.get("provider") if isinstance(memory, dict) else None
-    except (OSError, ValueError, yaml.YAMLError):
-        return "unknown"
-    return "registered" if selected == "scope-recall" else "not_selected"
-
-
 def _check_host_registration(report: DoctorReport, instance: Path, python_executable: Path | None) -> None:
     report.host_registration_status = check_host_registration(report.host, instance, python_executable)
-    report.hook_trust_status = "pending" if report.host == "codex" else "unknown"
+    hook_trust = HOSTS[report.host].hook_trust
+    report.hook_trust_status = "pending" if hook_trust else "unknown"
     record_check(report, "host_registration", report.host_registration_status)
     if report.host_registration_status not in {"registered", "pending"}:
         report.capability_gaps.append("host_registration_incomplete")
-    if report.host == "codex":
+    if hook_trust:
         record_check(report, "hook_trust", "pending")
 
 
@@ -533,7 +482,7 @@ def _check_current_package(report: DoctorReport) -> dict[str, Any]:
 
 def _check_binding(report: DoctorReport, instance: Path):
     """The adapter binding and its data directory; None when the instance has no usable one."""
-    config_path = _hermes_config_path(instance) if report.host == "hermes" else _codex_config_path(instance)
+    config_path = _config_path(report.host, instance)
     if not config_path.is_file():
         report.capability_gaps.append("installation_config_missing")
         record_check(report, "adapter_config", "missing")
@@ -563,7 +512,7 @@ def _check_audiences(report: DoctorReport, instance: Path) -> None:
     Such a row binds nothing, so every session on its route captures and recalls nothing while the CLI's
     route stays healthy.  Counted by platform, never named by user.
     """
-    if report.host != "hermes":
+    if HOSTS[report.host].integration != "provider":
         return
     from scope_recall.adapters.hermes.shared_entries import load_binding_for_home
 
@@ -599,7 +548,7 @@ def _check_local_sessions(report: DoctorReport, data_directory: Path) -> None:
     Such a session captures and recalls nothing, and the host shows no one the line the adapter writes in its log.
     Named by surface, never by who spoke.
     """
-    if report.host != "hermes":
+    if HOSTS[report.host].integration != "provider":
         return
     entry = report.shared_store.get("entry_id", "")
     unbound = owner_sessions_unbound(data_directory, entry_id=entry)
@@ -898,7 +847,7 @@ def _classify_status(report: DoctorReport) -> None:
 
 def _check_capture_authorization(report: DoctorReport, instance: Path, binding) -> None:
     """Report unsafe local grant metadata without changing the owner's authorization."""
-    if report.host != "codex" or binding.installation_kind != "local":
+    if not HOSTS[report.host].workspace_mapping or binding.installation_kind != "local":
         return
     from scope_recall.adapters.clients.ledger_state import authorization_problem
 
@@ -924,8 +873,9 @@ def run_doctor(
     recall_request_id: str | None = None,
     project_root: Path | str | None = None,
 ) -> DoctorReport:
-    if host not in ("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"):
-        raise ValueError("host must be 'hermes', 'codex', 'claude-code', 'workbuddy', 'dsh' or 'antigravity'")
+    """Report host package, binding, registration and store health without applying repairs."""
+    if host not in ENTRY_HOSTS:
+        raise ValueError("host must be one of " + ", ".join(ENTRY_HOSTS))
     instance = _require_absolute(Path(instance_root), "instance_root")
     python = Path(python_executable) if python_executable is not None else None
     # Imported here: both read sibling packages (runtime budgets, the Codex adapter's config), and
@@ -937,7 +887,7 @@ def run_doctor(
     report = DoctorReport(host=host, status="degraded")
     report.host_memory = inspect_host_memory(host, instance, project=Path(project_root or Path.cwd()))
     report.model_workload_per_100_turns = recommended_workload()
-    if host == "codex":
+    if HOSTS[host].workspace_mapping:
         report.project_copy_suggestions = project_suggestions(instance, Path(project_root or Path.cwd()))
 
     _check_host_registration(report, instance, python)

@@ -20,6 +20,8 @@ from scope_recall.adapters.clients.config import (
     load_shared_client,
 )
 from scope_recall.adapters.hermes.shared_entries import ATTACHMENT_FILENAME, attachment_path
+from scope_recall.host_registry import HOOK_TIMEOUTS as REMOTE_HOOK_TIMEOUTS
+from scope_recall.host_registry import HOSTS
 
 from . import install_client
 from .install_client import (  # noqa: F401 -- install.py calls these on every host's module
@@ -47,33 +49,13 @@ from .install_common import (
 )
 from .shared_run import HOME_LOCK_FILENAME
 
-CODEX_HOOK_EVENTS = frozenset(
-    {
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreModelRequest",
-        "PreToolUse",
-        "PostToolUse",
-        "Stop",
-        "Interrupt",
-        "SessionEnd",
-    }
-)
+CODEX_HOOK_EVENTS = HOSTS["codex"].events
 #: Seconds Codex waits for each hook (hooks.json).  Codex holds a prompt until its hook answers and allows 600 s
 #: unless told otherwise; SessionEnd and Interrupt allow at most 3.  These are ceilings, not waits: a hook
 #: answers as soon as its work is done, and a prompt's work is bounded by the entry's ``hook_processing_seconds``
 #: (6 s unless set lower), as Claude Code's is.  With 2 s, most of Codex's automatic recalls on a large store came
 #: back empty.  PostToolUse runs at every tool call and records one observation, so it keeps 2 s.
-HOOK_TIMEOUTS = {
-    "SessionStart": 5,
-    "UserPromptSubmit": 15,
-    "PostToolUse": 2,
-    "PreModelRequest": 5,
-    "PreToolUse": 2,
-    "Stop": 10,
-    "Interrupt": 3,
-    "SessionEnd": 3,
-}
+HOOK_TIMEOUTS = {**REMOTE_HOOK_TIMEOUTS["codex"], **dict(HOSTS["codex"].local_hook_timeouts)}
 WINDOWS_HOOK_LAUNCHER = "scope-recall-hook.cmd"
 
 

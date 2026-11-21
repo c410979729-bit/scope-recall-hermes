@@ -3,9 +3,11 @@ manifest-bound instance a receipt-backed uninstall verifies."""
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -49,6 +51,45 @@ from .install_common import (
 DEFAULT_AGENT_WORKSPACE = "hermes"
 DIST_HERMES = REPO_ROOT / "distribution" / "hermes"
 _CORE_PIN = re.compile(r'"hermes-scope-recall\[vectors\]==[^"]*"')
+
+
+def registration(instance: Path, python_executable: Path | None) -> str:
+    """Check the provider entry point in the target interpreter and its selection in the instance."""
+    if python_executable is not None:
+        script = (
+            "import importlib.metadata as m,json; "
+            "print(json.dumps(any(e.name=='scope-recall' "
+            "for e in m.entry_points(group='hermes_agent.memory_providers'))))"
+        )
+        try:
+            probe = subprocess.run(
+                [str(python_executable), "-I", "-B", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if probe.returncode or json.loads(probe.stdout) is not True:
+                return "entry_point_missing"
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return "unknown"
+    else:
+        try:
+            entries = importlib.metadata.entry_points(group="hermes_agent.memory_providers")
+            if not any(entry.name == "scope-recall" for entry in entries):
+                return "entry_point_missing"
+        except Exception:  # noqa: BLE001 - metadata lookups fail in host-specific ways.
+            return "unknown"
+    config = instance / "config.yaml"
+    if not config.is_file():
+        return "host_config_missing"
+    try:
+        value = yaml.safe_load(config.read_text(encoding="utf-8"))
+        memory = value.get("memory", {}) if isinstance(value, dict) else {}
+        selected = memory.get("provider") if isinstance(memory, dict) else None
+    except (OSError, ValueError, yaml.YAMLError):
+        return "unknown"
+    return "registered" if selected == "scope-recall" else "not_selected"
 
 
 def profile_identity(home: Path) -> str:

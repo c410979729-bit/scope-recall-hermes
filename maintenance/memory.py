@@ -13,6 +13,7 @@ from scope_recall.core.management_query import MemoryFilter
 from scope_recall.core.restore import InstallationMaintenance
 from scope_recall.core.storage import SQLiteStorage
 
+from ..host_registry import INSTALL_HOSTS
 from .restore import RestoreError, store_to_restore
 
 FORMAT = "scope-recall-management/1"
@@ -76,7 +77,7 @@ def open_management(args, *, initialize: bool = True):
 
 def _common(parser):
     parser.add_argument("--root", help="shared store root")
-    parser.add_argument("--host", choices=("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"))
+    parser.add_argument("--host", choices=INSTALL_HOSTS)
     parser.add_argument("--instance-root", help="host installation home for a store of its own")
     parser.add_argument("--json", action="store_true", help="emit the versioned JSON contract")
 

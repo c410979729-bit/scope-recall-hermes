@@ -20,12 +20,14 @@ from dataclasses import dataclass, field
 from functools import cache
 from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import yaml
 from scope_recall._version import __version__
 from scope_recall._version import manifest_version as _manifest_version
 from scope_recall.adapters.installation_receipt import RECEIPT_FILENAME as RECEIPT_FILENAME
+from scope_recall.host_registry import INSTALL_HOSTS
+from scope_recall.host_registry import HostChoice as HostChoice
 
 from .backup import first_link
 
@@ -53,7 +55,6 @@ SKILLS: dict[str, Path] = {
     "scope-recall-memory": Path(__file__).with_name("skills") / "scope-recall-memory" / "SKILL.md",
 }
 PACKAGE_VERSION = __version__
-HostChoice = Literal["hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"]
 
 BACKUP_DIRNAME = ".scope-recall-backups"
 #: What a store's runtime-config.json may weigh, for the shared commands that write it and the doctor that
@@ -363,19 +364,10 @@ def validate_plugin_name(name: str) -> str:
 
 
 def validate_host(host: str) -> HostChoice:
-    if host == "hermes":
-        return "hermes"
-    if host == "codex":
-        return "codex"
-    if host == "claude-code":
-        return "claude-code"
-    if host == "workbuddy":
-        return "workbuddy"
-    if host == "dsh":
-        return "dsh"
-    if host == "antigravity":
-        return "antigravity"
-    raise InstallError("host must be 'hermes', 'codex', 'claude-code', 'workbuddy', 'dsh' or 'antigravity'")
+    """Check that the host has a native installer before using its adapter."""
+    if host not in INSTALL_HOSTS:
+        raise InstallError("host must be one of " + ", ".join(INSTALL_HOSTS))
+    return host
 
 
 def manifest_version(version: str = PACKAGE_VERSION) -> str:

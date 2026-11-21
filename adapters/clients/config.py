@@ -34,6 +34,7 @@ from scope_recall.adapters.shared_entries import (
 from scope_recall.contracts import HOOK_CLIENT_HOSTS, ContractError, InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.entry_control import account_pin, current_account_pin
+from scope_recall.host_registry import HOSTS, REMOTE_HOSTS
 from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 
 from ..installation_identity import path_identity
@@ -226,7 +227,7 @@ def load_shared_client(home: Path | str, host: str) -> SharedClientConfig:
 
 def load_remote_client(home: Path | str, host: str) -> SharedClientConfig:
     """Bind a token-authorized entry without pretending the server is the remote person."""
-    if host not in HOOK_CLIENT_HOSTS:
+    if host not in REMOTE_HOSTS or HOSTS[host].integration != "hook":
         raise CodexConfigError("this host does not support a remote hook entry")
     return _load_shared_client(home, host, local=False)
 
@@ -269,7 +270,7 @@ def _load_shared_client(home: Path | str, host: str, *, local: bool) -> SharedCl
 
 def load_server_entry(home: Path | str, host: str) -> SharedClientConfig | InstallationManifest:
     """Verify the server-local entry without treating a Hermes gateway as a fixed local-owner client."""
-    if host != "hermes":
+    if host not in REMOTE_HOSTS or HOSTS[host].integration != "provider":
         return load_remote_client(home, host)
     path = Path(home).expanduser()
     if not path.is_absolute():

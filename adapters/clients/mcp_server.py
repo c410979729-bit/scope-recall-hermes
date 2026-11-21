@@ -26,7 +26,6 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field, StrictInt, StrictStr
 from scope_recall.contracts import (
-    READ_ONLY_CLIENT_HOSTS,
     ContractError,
     Origin,
     SourceEvent,
@@ -39,7 +38,7 @@ from scope_recall.core.handoff import tool_schemas as handoff_schemas
 from scope_recall.core.read_views import DEFAULT_BUDGET_TOKENS, DEFAULT_MAX_ITEMS
 from scope_recall.core.trace import TRACE_GUIDANCE, fence_trace_epoch
 
-from ..host_profiles import HOSTS
+from ...host_registry import HOSTS
 from ..runtime_wiring import FORGET_GUIDANCE, READ_VIEW_BUDGET_GUIDANCE, RECALL_CONTEXT_GUIDANCE, REVISE_GUIDANCE
 from ..tool_common import (
     FENCED_ENTITY,
@@ -74,10 +73,7 @@ _RECALL_BUDGET_GUIDANCE = (
     "If a smaller budget hits budget_token_cap or budget_packet_cap, retry once with budget_tokens=4096."
 )
 _BUDGET_CAP_GAPS = ("budget_token_cap", "budget_packet_cap")
-#: The request metadata a client binds a tool call to its conversation with.
-_THREAD_META = {host: profile.thread_meta for host, profile in HOSTS.items() if profile.thread_meta}
-#: Tools requiring a conversation binding. Revise and forget additionally fail
-#: closed because the host supplies no attested latest-message occurrence.
+#: Tools whose calls require attestation of a visible source occurrence.
 _MUTATIONS = frozenset({"propose_memory", "revise", "forget"})
 
 _READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -258,13 +254,12 @@ class CodexMCPServer:
         self._register_tools()
 
     def _register_tools(self) -> None:
+        profile = HOSTS[self.host]
         for name, description, hints in _TOOLS:
-            if self.host in READ_ONLY_CLIENT_HOSTS and hints.read_only_hint is not True:
+            if profile.integration == "mcp" and hints.read_only_hint is not True:
                 continue
-            if name in _MUTATIONS and self.host not in _THREAD_META:
-                # Claude Code, WorkBuddy and dsh name no conversation with a tool call, so each of these would be
-                # refused on every call: it is not offered.  The person makes such a change through an agent that names
-                # its conversation.
+            # A mutation must carry a native witness tying the exact tool call to a visible session.
+            if name in _MUTATIONS and not profile.native_write_witness:
                 continue
             self.server.tool(name=name, description=description, annotations=hints, structured_output=True)(
                 _refusals_said(getattr(self, name))
@@ -295,7 +290,7 @@ class CodexMCPServer:
 
     def _thread_id(self, ctx: Context) -> str | None:
         """Codex's reserved MCP thread metadata, or None when absent, malformed or not sent by this client."""
-        key = _THREAD_META.get(self.host)
+        key = HOSTS[self.host].thread_meta
         meta = getattr(ctx.request_context, "meta", None) or {}
         value = meta.get(key) if key is not None and isinstance(meta, dict) else None
         if not isinstance(value, str):

@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from ..adapters.installation_receipt import RECEIPT_FILENAME
+from ..host_registry import HOSTS, LOCAL_STORE_HOSTS
 from .backup import safe_path
 
 WORKFLOW = Path(__file__).with_name("AGENT_WORKFLOW.md")
@@ -22,7 +23,7 @@ def _selected_provider_without_binding(root: Path, host: str) -> bool:
     """
     if (root / RECEIPT_FILENAME).exists():
         return True
-    if host != "hermes":
+    if HOSTS[host].integration != "provider":
         return False
     path = root / "config.yaml"
     if not path.is_file():
@@ -41,7 +42,7 @@ def _selected_provider_without_binding(root: Path, host: str) -> bool:
 
 def _empty_home_route(root: Path, host: str, result: dict) -> dict:
     """A missing database is fresh only when no previous installation marker remains."""
-    manifests = [root / "scope-recall" / "installation.json", root / "codex-installation.json"]
+    manifests = [root / path for profile in HOSTS.values() if (path := profile.local_manifest) is not None]
     if any(path.exists() for path in manifests):
         return dict(
             result, route="repair_required", reason="manifest_without_database", safe_action="restore_verified_backup"
@@ -67,14 +68,14 @@ def planning_database_state(path: Path) -> str:
 
 def inspect_installation(home: str | Path, *, host: str = "hermes", database: str | Path | None = None) -> dict:
     """Classify a selected home read-only; damaged or custom legacy state never authorizes a new store."""
-    if host not in {"hermes", "codex"}:
+    if host not in LOCAL_STORE_HOSTS:
         raise ValueError("unsupported host")
+    profile = HOSTS[host]
+    assert profile.local_manifest is not None and profile.local_data is not None
     root = safe_path(home)
-    candidates = (
-        [root / "scope-recall" / "memory.sqlite3", root / "lancepro" / "memory.sqlite3"]
-        if host == "hermes"
-        else [root / "data" / "memory.sqlite3"]
-    )
+    candidates = [root / profile.local_data / "memory.sqlite3"]
+    if profile.integration == "provider":
+        candidates.append(root / "lancepro" / "memory.sqlite3")
     databases = [p for p in candidates if p.exists()]
     if database is not None:
         # Host configuration can select a nonstandard legacy location. An
@@ -117,7 +118,7 @@ def inspect_installation(home: str | Path, *, host: str = "hermes", database: st
             safe_action="keep_original_and_restore_backup",
         )
     if {"source_events", "instance_meta"} <= tables:
-        manifest = root / ("scope-recall/installation.json" if host == "hermes" else "codex-installation.json")
+        manifest = root / profile.local_manifest
         if not manifest.is_file():
             return dict(
                 result,

@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Doctor checks the read-only shared-store binding for Cherry Studio.
+
 ## [4.0.5]
 
 ### Added

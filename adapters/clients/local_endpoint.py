@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from ..._version import __version__
+from ...host_registry import HOOK_CLIENT_HOSTS
 from ...runtime.instance_config import RESIDENT_RECALL_MINUTES_BOUNDS
 from ...runtime.validation import strict_int
 from ...runtime.worker_launch import detached_creationflags
@@ -69,9 +70,7 @@ MAX_CONCURRENT = 8
 #: prove itself in time would otherwise be left out for 30 s.
 ADVERTISE_SECONDS = 2.0
 #: Default library residence after the last client activity; entry configurations can opt out explicitly.
-RESIDENT_DEFAULT_MINUTES: dict[str, int] = dict.fromkeys(
-    ("codex", "claude-code", "workbuddy", "dsh", "antigravity"), 120
-)
+RESIDENT_DEFAULT_MINUTES: dict[str, int] = dict.fromkeys(HOOK_CLIENT_HOSTS, 120)
 #: Minimum interval between two worker attempts to launch or replace the library service.
 RESIDENT_START_EVERY_SECONDS = 60.0
 _NONCE = "X-Scope-Recall-Nonce"

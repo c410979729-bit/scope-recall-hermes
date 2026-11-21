@@ -17,12 +17,12 @@ from scope_recall.contracts import CLIENT_HOSTS as CLIENT_HOSTS
 from scope_recall.contracts import ENTRY_HOSTS as ENTRY_HOSTS
 from scope_recall.contracts import (
     ENTRY_ID,
-    READ_ONLY_CLIENT_HOSTS,
     InstanceBinding,
     TrustedContext,
 )
 from scope_recall.core.entry_control import account_pin, current_account_pin
 from scope_recall.core.storage import SQLiteStorage
+from scope_recall.host_registry import HOSTS
 
 from .audiences import (
     LOCAL_USER_ID,
@@ -215,7 +215,7 @@ def _entry_view(store: Path, payload: dict[str, Any], record: Mapping[str, Any])
     if not home.is_absolute():
         raise HermesIdentityError("shared store entry home must be absolute")
     fields = {name: check(record.get(name)) for name, check in REQUIRED_FIELDS}
-    if record["host"] in READ_ONLY_CLIENT_HOSTS and any(row["writable_scope_ids"] for row in fields["audiences"]):
+    if HOSTS[record["host"]].integration == "mcp" and any(row["writable_scope_ids"] for row in fields["audiences"]):
         raise HermesIdentityError("a read-only MCP entry cannot hold writable scopes")
     manifest = InstallationManifest(
         schema_version=SCHEMA_VERSION,
@@ -374,7 +374,7 @@ def client_entry_record(
         agent_workspace="default",
         allowed_scope_ids=sorted(set(allowed_scope_ids)),
         writable_scope_ids=sorted(set(writable_scope_ids)),
-        capture_scope_id="" if host in READ_ONLY_CLIENT_HOSTS else capture_scope_id,
+        capture_scope_id="" if HOSTS[host].integration == "mcp" else capture_scope_id,
         kind="owner_private",
     )
     record: dict[str, Any] = {

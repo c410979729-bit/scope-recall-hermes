@@ -46,6 +46,7 @@ from typing import Any, Callable
 from ..._version import __version__
 from ...contracts import ContractError
 from ...core.private import calibrated_event_time, parse_recording_command
+from ...host_registry import HOSTS, REMOTE_HOSTS
 from ...runtime.remote_clock import private_metadata
 from ...runtime.worker_entry import host_process_credential_environment
 from ...runtime.worker_launch import RUNTIME_CONFIG_FILENAME
@@ -180,6 +181,9 @@ def write_server_config(home: Path, host: str, *, listen: str, port: int, token_
 
 
 def load_server_config(home: Path, host: str) -> RemoteServerConfig:
+    """Load a server binding for a registered remote transport."""
+    if host not in REMOTE_HOSTS:
+        raise RemoteServerError("host does not support remote entries")
     try:
         raw = json.loads(config_path(home).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -590,7 +594,7 @@ def _checked_body(config, body):
     state["event_decisions"] = decisions
     state["full_event_decisions"] = full_decisions
     filtered, state = eligible_body(body, state, config.host)
-    if config.host == "antigravity":
+    if HOSTS[config.host].remote_hook_wire == "antigravity":
         return filtered, _private_drop(state, body["payload"].get("hook_event_name")), state["private_rules"]
     refused = state["recall_blocked"] or (
         state["capture_blocked"] and body["payload"].get("hook_event_name") != "UserPromptSubmit"
@@ -603,7 +607,7 @@ class RemoteRequestTooLarge(RemoteServerError):
 
 
 def _hook_body(config: RemoteServerConfig, encoding: str | None, raw: bytes) -> dict:
-    if config.host == "hermes" and encoding == "gzip":
+    if HOSTS[config.host].integration == "provider" and encoding == "gzip":
         decoder = zlib.decompressobj(31)
         try:
             raw = decoder.decompress(raw, HERMES_MAX_FACT_BYTES + 1)
@@ -643,7 +647,7 @@ def build_app(
         stamp=lambda: file_stamp(config.home / "scope-recall" / RUNTIME_CONFIG_FILENAME, *entry_files(config.home)),
     )
     atexit.register(kept.close)
-    if warm and config.host != "hermes":
+    if warm and HOSTS[config.host].integration == "hook":
         kept.warm()
     app = tools_server.streamable_http_app(
         streamable_http_path="/mcp",
@@ -833,9 +837,7 @@ def main(argv: list[str] | None = None, *, app_factory=build_app) -> int:
     run = sub.add_parser("serve", help="serve an entry to its client on another machine")
     for command in (setup, run):
         command.add_argument("--home", required=True, help="absolute home of the client's entry, on this machine")
-        command.add_argument(
-            "--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh", "antigravity", "hermes")
-        )
+        command.add_argument("--host", required=True, choices=REMOTE_HOSTS)
     setup.add_argument("--listen", required=True, help="this machine's private (tailnet) address")
     setup.add_argument("--port", required=True, type=int)
     setup.add_argument("--token-sha256", required=True, help="what remote_client token printed on the client")

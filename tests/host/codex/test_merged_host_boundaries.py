@@ -11,7 +11,7 @@ from scope_recall.adapters import host_identity
 from scope_recall.adapters.clients import CodexHookHandler, remote_server
 from scope_recall.adapters.clients.config import load_shared_client
 from scope_recall.adapters.clients.identity import resolve_runtime_audience, trusted_context
-from scope_recall.adapters.clients.mcp_server import _THREAD_META, CodexMCPServer
+from scope_recall.adapters.clients.mcp_server import CodexMCPServer
 from scope_recall.adapters.shared_entries import attach_shared_record, client_entry_record
 from scope_recall.contracts import ContractError
 from scope_recall.core.capture_filters import strip_private_content, without_private

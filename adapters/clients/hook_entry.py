@@ -18,7 +18,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from ...contracts import HOOK_CLIENT_HOSTS
+from ...host_registry import HOOK_CLIENT_HOSTS, HOSTS
 from ...runtime.worker_entry import host_process_credential_environment
 from . import antigravity
 from .boundary import EMPTY_ANSWER
@@ -29,12 +29,12 @@ from .hook_answer import emit_result
 
 def _handle(handler, raw: bytes, host: str, event: str | None):
     """Adapt native wire data outside the shared entry's process lifecycle."""
-    if host == "antigravity":
+    if HOSTS[host].remote_hook_wire == "antigravity":
         return antigravity.answer(handler.handle_bytes(antigravity.normalize_bytes(raw, event or "")), event or "")
     return handler.handle_bytes(raw)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scope Recall Codex hook adapter")
     where = parser.add_mutually_exclusive_group(required=True)
     where.add_argument("--config", type=Path, help="Absolute path to codex-installation.json")
@@ -60,6 +60,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--event", choices=tuple(antigravity.EVENTS), help="native Antigravity event")
     args = parser.parse_args(argv)
+    if args.config is not None and not HOSTS[args.host].workspace_mapping:
+        parser.error("--config is for a local Codex installation; use --home for an attached entry")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Read one bounded hook event and return the host's native reply."""
+    args = _parse_args(argv)
     # Start the trusted wall-clock budget before configuration/runtime loading;
     # model or hook payload fields never participate in this timestamp.
     hook_started_at = time.monotonic()

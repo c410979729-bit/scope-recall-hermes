@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from ..host_registry import HOOK_TIMEOUTS as REMOTE_HOOK_TIMEOUTS
 from . import install_client
 from .install_client import (  # noqa: F401 -- install.py calls these on every host's module
     approve_local_platforms,
@@ -60,7 +61,7 @@ HOOK_WORK_SECONDS = 6
 START_SECONDS = 4
 #: The events recorded, and how many seconds WorkBuddy waits for each (60 unless a hook says otherwise).  WorkBuddy
 #: blocks a prompt whose hook runs past its wait, so each wait covers the start and the work: the claude-code host's.
-HOOK_TIMEOUTS = {"UserPromptSubmit": 15, "Stop": 10, "SessionEnd": 10}
+HOOK_TIMEOUTS = REMOTE_HOOK_TIMEOUTS[HOST]
 #: What the plan says once, whatever changed: a running WorkBuddy may write settings.json itself, and it starts a new
 #: MCP server only once the user approves it.
 RESTART_NOTE = (

@@ -79,3 +79,23 @@ def test_selected_legacy_provider_without_its_database_is_preserved_for_repair(t
     result = inspect_installation(home, host="hermes")
     assert result["route"] == "repair_required"
     assert result["reason"] == "selected_provider_without_binding"
+
+
+def test_host_registry_matches_protocol_and_setup_choices():
+    from scope_recall import contracts, host_registry
+    from scope_recall.maintenance import setup
+
+    assert contracts.ENTRY_HOSTS is host_registry.ENTRY_HOSTS
+    assert contracts.HOOK_CLIENT_HOSTS is host_registry.HOOK_CLIENT_HOSTS
+    assert contracts.READ_ONLY_CLIENT_HOSTS == ("cherry-studio",)
+    assert set(host_registry.HOOK_TIMEOUTS) == set(contracts.HOOK_CLIENT_HOSTS)
+    assert host_registry.REMOTE_RECORD_HOSTS == {"codex", "claude-code", "workbuddy", "antigravity"}
+    for host, profile in host_registry.HOSTS.items():
+        assert set(host_registry.HOOK_TIMEOUTS.get(host, ())) <= profile.events
+        assert bool(profile.native_write_witness) == bool(profile.thread_meta)
+        assert (profile.local_manifest is None) == (profile.local_data is None)
+        assert (host in setup.HOST_DIRECTORIES) == (host in host_registry.INSTALL_HOSTS)
+    assert setup.parser().parse_args(["--host", "antigravity"]).host == ["antigravity"]
+    assert host_registry.HOSTS["antigravity"].remote_hook_wire == "antigravity"
+    assert host_registry.HOSTS["antigravity"].integration == "hook"
+    assert "cherry-studio" not in host_registry.REMOTE_HOSTS

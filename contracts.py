@@ -14,6 +14,19 @@ from typing import Literal, NotRequired, TypedDict, cast, get_args
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from .host_registry import (
+    CLIENT_HOSTS as CLIENT_HOSTS,
+)
+from .host_registry import (
+    ENTRY_HOSTS as ENTRY_HOSTS,
+)
+from .host_registry import (
+    HOOK_CLIENT_HOSTS as HOOK_CLIENT_HOSTS,
+)
+from .host_registry import (
+    READ_ONLY_CLIENT_HOSTS as READ_ONLY_CLIENT_HOSTS,
+)
+
 Origin = Literal[
     "human_direct",
     "assistant_visible",
@@ -636,11 +649,6 @@ INSTALLATION_KINDS = frozenset({"local", "shared"})
 #: model-supplied; ``local`` is what every row of a store that predates entries carries.
 ENTRY_ID = re.compile(r"[a-z][a-z0-9-]{1,31}")
 
-# Shared manifests and runtime configurations use these same host identifiers. Only hook clients may capture.
-HOOK_CLIENT_HOSTS = ("codex", "claude-code", "workbuddy", "dsh", "antigravity")
-READ_ONLY_CLIENT_HOSTS = ("cherry-studio",)
-CLIENT_HOSTS = (*HOOK_CLIENT_HOSTS, *READ_ONLY_CLIENT_HOSTS)
-ENTRY_HOSTS = ("hermes", *CLIENT_HOSTS)
 #: What one local binding can carry.
 MAX_BINDING_SCOPES = 128
 #: What one shared binding can carry.  A shared store's worker binds every scope

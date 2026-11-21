@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from scope_recall.adapters.clients import CodexHookHandler
+from scope_recall.adapters.clients import CodexHookHandler, local_endpoint, mcp_entry
 from scope_recall.adapters.clients.config import CodexConfigError, load_shared_client
 from scope_recall.adapters.hermes.installation import build_installation_manifest
 from scope_recall.adapters.shared_entries import attach_shared_entry, entry_grants
@@ -154,3 +154,84 @@ def test_cherry_studio_first_in_an_empty_store_keeps_a_later_writer_independent(
     shared.attach(host="codex", instance_root=next_home, root=store, entry_id="writer", display_name="Writer")
     writer = load_shared_client(next_home, "codex")
     assert writer.audience.capture_scope_id in client.audience.allowed_scope_ids
+
+
+def test_doctor_reads_cherry_attachment_without_falling_back_to_codex(tmp_path, capsys):
+    store, home = tmp_path / "TEST-store", tmp_path / "TEST-cherry"
+    shared.init_shared(root=store, agent_id="TEST-agent", test_mode=True)
+    shared.attach(host="cherry-studio", instance_root=home, root=store, entry_id="reader", display_name="Reader")
+    command = ["doctor", "--host", "cherry-studio", "--instance-root", str(home)]
+    assert cli.main(command) in (0, 1)
+    report = json.loads(capsys.readouterr().out)
+    assert report["binding_ok"]
+    assert report["shared_store"]["entry_id"] == "reader"
+    assert not any(check["name"] in {"hook_trust", "capture_authorization"} for check in report["checks"])
+
+    shared.detach(instance_root=home)
+    (home / "codex-installation.json").write_text("{}", encoding="utf-8")
+    assert cli.main(command) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert not report["binding_ok"]
+    assert "installation_config_missing" in report["capability_gaps"]
+
+
+def test_cherry_mcp_starts_with_or_without_declared_embedding_credentials(tmp_path, monkeypatch, capsys):
+    store, home = tmp_path / "TEST-store", tmp_path / "TEST-cherry"
+    shared.init_shared(root=store, agent_id="TEST-agent", test_mode=True)
+    key = "SCOPE_RECALL_TEST_CHERRY_EMBED"
+    route = tmp_path / "TEST-embedding-route.json"
+    route.write_text(
+        json.dumps(
+            {
+                "binding": {
+                    "agent_id": "TEST-agent",
+                    "installation_id": "TEST-routes",
+                    "data_directory": str(tmp_path),
+                    "scope_ids": ["TEST-source"],
+                },
+                "allowed_scope_ids": ["TEST-source"],
+                "session_id": "TEST-routes",
+                "auxiliary": {
+                    "external_embedding": True,
+                    "external_consolidation": False,
+                    "embedding": {
+                        "model": "TEST-embedding",
+                        "endpoint": "https://example.test/v1/embeddings",
+                        "dimensions": 64,
+                        "dialect": "openai",
+                        "credential_env": key,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    shared.attach(
+        host="cherry-studio",
+        instance_root=home,
+        root=store,
+        entry_id="reader",
+        display_name="Reader",
+        runtime_config_from=route,
+    )
+    env_file = tmp_path / "TEST-embedding.env"
+    tool_sessions = []
+
+    def opened(server):
+        tool_sessions.append((server.name, os.environ.get(key)))
+
+    def no_resident(*args):
+        pytest.fail("A read-only MCP connector must not start a hook resident")
+
+    monkeypatch.setattr(mcp_entry, "run_stdio", opened)
+    monkeypatch.setattr(local_endpoint, "request_recall", no_resident)
+    monkeypatch.setenv(key, "TEST-previous")
+    monkeypatch.delenv(key)
+    args = ["--host", "cherry-studio", "--home", str(home), "--env-file", str(env_file)]
+    assert mcp_entry.main(args) == 0
+    assert "credential environment unavailable" in capsys.readouterr().err
+    env_file.write_text(f"{key}=TEST-placeholder\nTEST_UNDECLARED_CHERRY=TEST-other\n", encoding="utf-8")
+    assert mcp_entry.main(args) == 0
+    assert tool_sessions == [("scope-recall-cherry-studio", None), ("scope-recall-cherry-studio", "TEST-placeholder")]
+    assert "TEST_UNDECLARED_CHERRY" not in os.environ
+    assert "TEST-placeholder" not in capsys.readouterr().err

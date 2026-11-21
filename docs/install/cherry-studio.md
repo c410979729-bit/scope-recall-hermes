@@ -18,8 +18,10 @@ scope-recall attach --host cherry-studio --instance-root "<absolute-cherry-entry
 scope-recall grants --instance-root "<absolute-cherry-entry>"
 ```
 
-Check the returned allowed scopes. The writable list and capture target are empty. To start with an empty store,
-run `scope-recall init-shared --root "<absolute-store>"`, then attach without `--grants-like`. The new entry
+Check the returned allowed scopes. The writable list and capture target are empty. Use
+`scope-recall doctor --host cherry-studio --instance-root "<absolute-cherry-entry>"` to check the entry binding and its store.
+
+To start with an empty store, run `scope-recall init-shared --root "<absolute-store>"`, then attach without `--grants-like`. The new entry
 can search the owner's scope once another authorized host records something there.
 
 ## Connect in Cherry Studio

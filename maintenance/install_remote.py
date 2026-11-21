@@ -15,7 +15,8 @@ from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..adapters.clients.remote_client import HOOK_TIMEOUTS, RemoteClientError, absolute_path, load_client_config
+from ..adapters.clients.remote_client import RemoteClientError, absolute_path, load_client_config
+from ..host_registry import HOOK_TIMEOUTS, HOSTS
 from . import install_antigravity as antigravity
 from . import install_dsh as dsh
 from . import install_workbuddy as workbuddy
@@ -76,17 +77,11 @@ def hermes_files(config: dict[str, Any], home: Path) -> dict[Path, str]:
 def plugin_files(config: dict[str, Any], plugin_dir: Path) -> dict[Path, str]:
     """The plugin that sends this client's hooks and MCP calls to its entry's server."""
     host = config["host"]
-    if host == "hermes":
+    profile = HOSTS[host]
+    if profile.remote_install == "provider":
         return hermes_files(config, plugin_dir)
-    if host == "antigravity":
-        raise RemoteClientError("Antigravity uses native settings, not a plugin directory")
-    if host == "dsh":
-        raise RemoteClientError("a dsh client has no plugin directory: install merges its native rows into dsh's home")
-    if host == "workbuddy":
-        raise RemoteClientError(
-            "a WorkBuddy client has no plugin: install merges its hooks and server into "
-            "WorkBuddy's own settings (workbuddy_files)"
-        )
+    if profile.remote_install != "plugin":
+        raise RemoteClientError(f"{host} uses native settings, not a plugin directory")
     author, description = plugin_metadata()
     token = config["token_file"].read_text(encoding="utf-8").strip()
     argv = _hook_argv(config)
@@ -259,27 +254,34 @@ def _hermes_backups(config: dict, home: Path, files: dict[Path, str] | dict[Path
     return backups
 
 
+def _antigravity_files(config: dict[str, Any], home: Path, remove: bool) -> dict[Path, bytes]:
+    return antigravity.files(home, config["config"], Path(sys.executable), remote=True, remove=remove)
+
+
+_MERGED_INSTALLERS = {
+    "antigravity-settings": _antigravity_files,
+    "dsh-patch": lambda config, home, remove: dsh.remote_files(config, home, Path(sys.executable)),
+    "workbuddy-settings": lambda config, home, remove: workbuddy_files(config, home),
+}
+
+
 def install(config: dict[str, Any], plugin_dir: Path, *, remove: bool = False) -> dict[str, list[str]]:
     """Write the plugin, or merge WorkBuddy/dsh's native files after copying changed files to ``backups``."""
-    if remove and config["host"] != "antigravity":
+    layout = HOSTS[config["host"]].remote_install
+    merge = layout in _MERGED_INSTALLERS
+    if remove and layout != "antigravity-settings":
         raise RemoteClientError("native remote uninstall is supported for Antigravity only")
     if not remove and not config["token_file"].exists():
         raise RemoteClientError("no token yet: run remote_client token first")
     files: dict[Path, str] | dict[Path, bytes]
     backups = []
-    if config["host"] in ("workbuddy", "dsh", "antigravity"):
+    if layout is not None and merge:
         if not plugin_dir.is_dir():
             raise RemoteClientError(
                 f"{plugin_dir} does not exist: name {config['host']}'s home, or start that host once"
             )
         try:
-            files = (
-                dsh.remote_files(config, plugin_dir, Path(sys.executable))
-                if config["host"] == "dsh"
-                else antigravity.files(plugin_dir, config["config"], Path(sys.executable), remote=True, remove=remove)
-                if config["host"] == "antigravity"
-                else workbuddy_files(config, plugin_dir)
-            )
+            files = _MERGED_INSTALLERS[layout](config, plugin_dir, remove)
         except InstallError as exc:
             raise RemoteClientError(str(exc)) from None
         kept = config["state_dir"] / "backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -291,12 +293,12 @@ def install(config: dict[str, Any], plugin_dir: Path, *, remove: bool = False) -
                 Path(backups[-1]).chmod(0o600)
     else:
         files = plugin_files(config, plugin_dir)
-    if config["host"] == "hermes":
+    if layout == "provider":
         backups = _hermes_backups(config, plugin_dir, files)
     written = []
     for path, content in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        if config["host"] in ("workbuddy", "dsh", "antigravity"):
+        if merge:
             _write_private(path, content)
         else:
             pending = path.with_name(path.name + ".tmp")
@@ -306,7 +308,7 @@ def install(config: dict[str, Any], plugin_dir: Path, *, remove: bool = False) -
                 pending.write_text(content, encoding="utf-8", newline="")
             os.replace(pending, path)
         written.append(str(path))
-    if config["host"] in ("workbuddy", "dsh"):
+    if layout in {"workbuddy-settings", "dsh-patch"}:
         _keep_private(config, plugin_dir)
     config["state_dir"].mkdir(parents=True, exist_ok=True)
     return {"written": written, "backups": [str(path) for path in backups]}

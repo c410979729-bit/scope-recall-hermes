@@ -708,16 +708,35 @@ def antigravity_record_path(value: object, session_id: str) -> Path | None:
     return path if path.resolve().parts[-4:] == suffix else None
 
 
-PARSERS = {"claude-code": said, "workbuddy": workbuddy_said, "codex": codex_said, "antigravity": antigravity_said}
+def _workbuddy_file(payload: dict, session_id: str) -> Path | None:
+    return workbuddy_record_path(payload.get("transcript_path"), session_id, record_id=payload.get("agent_id"))
+
+
+# File grammars stay here. The registry associates each host with its native format.
+_FILE_FORMATS = {
+    "claude-code": (said, lambda payload, session: record_path(payload.get("transcript_path"), session)),
+    "workbuddy": (workbuddy_said, _workbuddy_file),
+    "codex": (codex_said, lambda payload, session: codex_record_path(payload.get("transcript_path"), session)),
+    "antigravity": (
+        antigravity_said,
+        lambda payload, session: antigravity_record_path(payload.get("transcript_path"), session),
+    ),
+}
+PARSERS = {
+    host: _FILE_FORMATS[profile.record_format][0]
+    for host, profile in HOSTS.items()
+    if profile.record_format in _FILE_FORMATS
+}
+_RECORD_PROFILES = {parser: HOSTS[host] for host, parser in PARSERS.items()}
 
 
 def host_record_path(host: str, payload: dict, session_id: str) -> Path | None:
     """Resolve the host's own record identically for local and remote capture."""
-    value = payload.get("transcript_path")
-    if host == "workbuddy":
-        return workbuddy_record_path(value, session_id, record_id=payload.get("agent_id"))
-    resolver = {"codex": codex_record_path, "antigravity": antigravity_record_path}.get(host, record_path)
-    return resolver(value, session_id)
+    profile = HOSTS.get(host)
+    format_ = _FILE_FORMATS.get(profile.record_format) if profile and profile.record_format else None
+    if format_ is not None:
+        return format_[1](payload, session_id)
+    return record_path(payload.get("transcript_path"), session_id)
 
 
 class RecordPage(list[tuple[int, Said | None]]):
@@ -771,7 +790,7 @@ def read(
     A final line without its newline is still being written. Its offset and context wait for the next read.
     """
     lines = RecordPage(offset, directory)
-    profile = next((HOSTS[host] for host, parser in PARSERS.items() if parser is rows), None)
+    profile = _RECORD_PROFILES.get(rows)
     with path.open("rb") as handle:
         handle.seek(offset)
         position = offset

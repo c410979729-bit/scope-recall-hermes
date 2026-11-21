@@ -19,7 +19,7 @@ from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
-from ...contracts import CLIENT_HOSTS, HOOK_CLIENT_HOSTS
+from ...host_registry import CLIENT_HOSTS, HOSTS
 from ...runtime.worker_entry import host_process_credential_environment
 from ..host_identity import owner_subjects
 from .config import CodexConfigError, CodexInstallationConfig, SharedClientConfig, load_codex_config, load_shared_client
@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.config is not None:
-            if args.host != "codex":
+            if not HOSTS[args.host].workspace_mapping:
                 raise ValueError("--config is for a local Codex installation; use --home for an attached entry")
             if not args.workspace:
                 raise ValueError("--workspace is required with --config")
@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
                     current=capture_owner_principal(config).to_payload(),
                 ),
             )
-            if runtime_config is None and config.host in HOOK_CLIENT_HOSTS:
+            if runtime_config is None and HOSTS[config.host].integration == "hook":
                 from .local_endpoint import request_recall
 
                 request_recall(config.home, config.host)

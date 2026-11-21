@@ -29,7 +29,7 @@ def repo(tmp_path):
     root = tmp_path / "repo"
     write(root, "adapters/hermes/boundary.py", 'HEAD = "[host]"\nHEADS = (HEAD, "[other]")\n')
     write(root, "adapters/hermes/hooks.py", '_OBSERVERS = dict(HOSTS["hermes"].hook_observers)\n')
-    write(root, "adapters/host_profiles.py", 'HOSTS = {"hermes": HostProfile(hook_observers=(("pre", "observe"),))}\n')
+    write(root, "host_registry.py", 'HOSTS = {"hermes": HostProfile(hook_observers=(("pre", "observe"),))}\n')
     write(root, "adapters/hermes/provider.py", "class Provider:\n    def sync_turn(self): pass\n")
     write(root, "adapters/hermes/tool_surface.py", "class Tools:\n    def handle_tool_call(self): pass\n")
     write(root, "adapters/hermes/protocol.py", "class Protocol:\n    def initialize(self): pass\n")
@@ -167,9 +167,7 @@ def test_diff_ignores_added_comments_and_does_not_pair_ambiguous_edits(host, rep
 def test_changed_boundary_or_registration_invalidates_recorded_definitions(host, repo):
     old = take(host, repo, 'x = "[host]"')
     write(repo, "adapters/hermes/boundary.py", 'HEAD = "[replacement]"\n')
-    write(
-        repo, "adapters/host_profiles.py", 'HOSTS = {"hermes": HostProfile(hook_observers=(("other", "observe"),))}\n'
-    )
+    write(repo, "host_registry.py", 'HOSTS = {"hermes": HostProfile(hook_observers=(("other", "observe"),))}\n')
     output = surface.diff(old, take(host, repo, 'x = "[host]"'))
     assert "INVENTORY STALE: boundary marker definitions" in output
     assert "INVENTORY STALE: registered hooks" in output

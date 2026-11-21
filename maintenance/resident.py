@@ -12,6 +12,8 @@ import json
 import time
 from pathlib import Path
 
+from ..host_registry import HOOK_CLIENT_HOSTS
+
 #: How long ``stop`` waits for a stopped server to let go of the entry's lock.
 STOP_WAIT_SECONDS = 5.0
 
@@ -20,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="scope-recall resident")
     parser.add_argument("action", choices=("status", "stop"))
     parser.add_argument("--home", required=True, help="absolute home of a client attached to a shared store")
-    parser.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy", "dsh", "antigravity"))
+    parser.add_argument("--host", required=True, choices=HOOK_CLIENT_HOSTS)
     args = parser.parse_args(argv)
     try:
         home = Path(args.home).expanduser()
