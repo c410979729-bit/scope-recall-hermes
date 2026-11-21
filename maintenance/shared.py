@@ -445,7 +445,16 @@ def attach(
     return _attach_locked(root, target, grants_from, runtime_config_from, grants_like, capture_like)
 
 
-def _attach_locked(root, target, grants_from, runtime_config_from, grants_like, capture_like, *, review=False):
+def _attach_locked(
+    root: Path,
+    target: dict[str, Any],
+    grants_from: Path | InstallationManifest | Callable | None,
+    runtime_config_from: Path | None,
+    grants_like: tuple[str, ...],
+    capture_like: str | None,
+    *,
+    review: bool = False,
+):
     """Apply an attachment, rechecking the CLI's implicit decision under both locks."""
     host, instance_root, entry_id = target["host"], target["home"], target["entry_id"]
     display_name, now, python = target["display_name"], target["attached_at"], target["python_executable"]
