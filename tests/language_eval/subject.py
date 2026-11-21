@@ -29,7 +29,7 @@ def capabilities():
     semantic = importlib.util.find_spec("scope_recall.core.semantic_proposals") is not None
     from scope_recall.core.consolidate import ConsolidationWorkFence
 
-    discards = "rejected_claims" in ConsolidationWorkFence.__dataclass_fields__
+    discards = bool({"rejected_items", "rejected_claims"} & ConsolidationWorkFence.__dataclass_fields__.keys())
     return dict(
         proposal_discards="applicable" if discards else "not_applicable",
         evidence_positions="applicable" if positions else "not_applicable",

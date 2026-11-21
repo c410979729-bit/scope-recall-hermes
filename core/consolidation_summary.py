@@ -223,7 +223,25 @@ def mark_partial(conn, work_id, detail, now):
     )
 
 
+_UNSUPPORTED_SUMMARY_FIELDS = {
+    "resume": frozenset(
+        {
+            "goal_authority",
+            "resume_authority",
+            "resume_text_support",
+            "resume_qualifier_omitted",
+            "next_step_authority",
+            "next_step_support",
+            "next_step_qualifier_omitted",
+            "work_goal_unconfirmed",
+        }
+    ),
+    "reference": frozenset({"reference_mention"}),
+}
+
+
 def apply_summary(tx, fence, kind, proposal, scope_id, now):
+    """Omit unsupported worker summaries after rolling back their local effects."""
     apply = tx.episodes.apply_resume if kind == "resume" else tx.references.apply
     if fence is None:
         return apply(proposal, scope_id, now)
@@ -237,7 +255,7 @@ def apply_summary(tx, fence, kind, proposal, scope_id, now):
         item = apply(proposal, scope_id, now)
     except ContractError as exc:
         conn.execute("ROLLBACK TO consolidation_summary")
-        if exc.code not in {"DERIVATION_INVALID", "INPUT_INVALID"}:
+        if exc.code != "DERIVATION_INVALID" or exc.field not in _UNSUPPORTED_SUMMARY_FIELDS[kind]:
             raise
         mark_partial(conn, fence.work_id, kind + "_qualification_failed", now)
         record_error_detail(

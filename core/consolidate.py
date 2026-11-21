@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..contracts import ContractError, validate_evidence_positions
+from ..contracts import ContractError, proposal_value_in_evidence, validate_evidence_positions
 from .adoption_dedup import is_bound_duplicate
 from .adoption_schedule import schedule_adoptions
 from .candidate_lifecycle import CandidateSnapshot, candidate_model_subject
@@ -19,6 +19,7 @@ from .consolidation_chunks import ChunkedSource, ConsolidationChunk
 from .consolidation_summary import apply_summary, mark_partial, stage_fragment, validate_fragment
 from .episodes import source_origin, source_watermark
 from .evidence_quote import resolve_evidence_quotes
+from .evidence_support import support_for_contents
 from .failure_retry import validation_feedback as safe_feedback
 from .language_resources import model_consolidation_schema, prompt_text
 from .mutate import Mutation, MutationReceipt, apply_claim_frames, validate_claims
@@ -36,6 +37,15 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class RejectedProposal:
+    """Diagnostic metadata for one omitted model item."""
+
+    stage: str
+    code: str
+    field: str
+
+
+@dataclass(frozen=True)
 class ConsolidationWorkFence:
     work_id: int
     lease_token: int
@@ -48,7 +58,7 @@ class ConsolidationWorkFence:
     skipped_source_refs: frozenset[str] = frozenset()
     pending_sources: tuple[tuple[str, int, int], ...] = ()
     chunk: ConsolidationChunk | None = None
-    rejected_claims: tuple[str, ...] = ()
+    rejected_items: tuple[RejectedProposal, ...] = ()
 
 
 def _model_source_principal(source) -> dict[str, str] | None:
@@ -405,41 +415,63 @@ def _fence_consolidation(tx, value, fence: ConsolidationWorkFence, *, now: str) 
     return []
 
 
-def _drop_claims(tx, fence: ConsolidationWorkFence, fields: list[str] | tuple[str, ...], now: str) -> str:
-    """Record each rejected claim field without losing accepted siblings.
-
-    A page carries the reason to the whole message's outcome; a whole-message
-    result is partial whenever it leaves out an ungrounded claim.
-    """
+def _record_rejections(tx, fence: ConsolidationWorkFence, rejected: list[RejectedProposal], now: str) -> list[str]:
+    """Count dropped items in the same transaction that publishes their siblings."""
     conn = tx._check(write=True)
-    for field in fields:
+    first_by_stage = {}
+    for item in rejected:
         record_error_detail(
-            conn, fence.work_id, fence.lease_token, now=now, stage="claim", code="DERIVATION_INVALID", field=field
+            conn, fence.work_id, fence.lease_token, now=now, stage=item.stage, code=item.code, field=item.field
         )
+        first_by_stage.setdefault(item.stage, item.field)
+    fields = list(first_by_stage.values())
     if fence.chunk is None:
-        mark_partial(conn, fence.work_id, fields[0], now)
-    return fields[0]
+        for field in fields:
+            mark_partial(conn, fence.work_id, field, now)
+    return fields
+
+
+def _unproven_model_claim(proposal, contents) -> bool:
+    """Use an exact literal or a bound verdict to distinguish an unsupported item."""
+    verdict = support_for_contents(proposal, contents)
+    if verdict is not None:
+        if verdict.state == "unsupported":
+            return True
+        if verdict.state != "unavailable" or verdict.failure_code is not None:
+            # A paraphrase, an uncertain judgement or a capability failure
+            # still follows Core's existing qualification and candidate rules.
+            return False
+    return not proposal_value_in_evidence(proposal, (span["quote"] for span in proposal["evidence_spans"]))
 
 
 def accept_consolidation(
     storage, clock, context, value, *, scope_id, remaining_seconds=1.0, work_fence: ConsolidationWorkFence | None = None
 ):
+    """Publish accepted claims, summaries and work outcomes atomically."""
     with storage.write(context, remaining_seconds=remaining_seconds) as tx:
         now = clock.utc_now()
         mark = 0
         dropped: list[str] = []
+        rejected: list[RejectedProposal] = []
         if work_fence is not None:
             dropped = _fence_consolidation(tx, value, work_fence, now=now)
-            if work_fence.rejected_claims:
-                dropped.append(_drop_claims(tx, work_fence, work_fence.rejected_claims, now))
+            rejected.extend(work_fence.rejected_items)
             mark = claim_versions_mark(tx)
         items, claim_refs = [], set()
         ungrounded: list[int] | None = [] if work_fence is not None else None
         try:
-            result = validate_claims(tx, value, scope_id, ungrounded_values=ungrounded)
-            if ungrounded and work_fence is not None:
-                dropped.append(_drop_claims(tx, work_fence, ["evidence_value"] * len(ungrounded), now))
+            contents: dict[tuple[str, int], str] = {}
+            result = validate_claims(
+                tx, value, scope_id, ungrounded_values=ungrounded, contents=contents if work_fence is not None else None
+            )
+            if work_fence is not None:
+                rejected.extend(
+                    RejectedProposal("claim", "DERIVATION_INVALID", "evidence_value") for _ in ungrounded or ()
+                )
             for proposal in ordinary_proposals(tx, result):
+                if work_fence is not None and _unproven_model_claim(proposal, contents):
+                    rejected.append(RejectedProposal("claim", "DERIVATION_INVALID", "evidence_value"))
+                    continue
                 applied = apply_claim_frames(tx, proposal, scope_id, now)
                 claim_refs.update(item.ref for item in applied)
                 items.extend(applied)
@@ -454,6 +486,8 @@ def accept_consolidation(
         # silently ordered against the newer head instead of re-derived.
         if work_fence is not None and claims_changed(tx, work_fence.dependencies, until=mark, claim_refs=claim_refs):
             raise ContractError("VERSION_CONFLICT", "memory_epoch")
+        if work_fence is not None and rejected:
+            dropped.extend(_record_rejections(tx, work_fence, rejected, now))
         if work_fence is not None and work_fence.chunk is not None:
             result = stage_fragment(tx, result, work_fence, now, dropped=dropped)
 

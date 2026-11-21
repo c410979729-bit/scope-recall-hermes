@@ -538,10 +538,18 @@ def _check_forget_request(payload: dict) -> None:
 
 def _check_consolidation_result(payload: dict, *, indexed_errors: bool = False) -> None:
     for index, claim in enumerate(payload["claim_proposals"]):
-        start, end = claim["valid_from"], claim["valid_to"]
-        if start is not None and end is not None and datetime.fromisoformat(end) <= datetime.fromisoformat(start):
-            field = f"claim_proposals[{index}].valid_interval" if indexed_errors else "valid_interval"
-            raise ContractError("DERIVATION_INVALID", field)
+        _check_claim_interval(claim, index if indexed_errors else None)
+    _check_reference_resolutions(payload, indexed_errors=indexed_errors)
+
+
+def _check_claim_interval(claim: dict, index: int | None) -> None:
+    start, end = claim["valid_from"], claim["valid_to"]
+    if start is not None and end is not None and datetime.fromisoformat(end) <= datetime.fromisoformat(start):
+        field = f"claim_proposals[{index}].valid_interval" if index is not None else "valid_interval"
+        raise ContractError("DERIVATION_INVALID", field)
+
+
+def _check_reference_resolutions(payload: dict, *, indexed_errors: bool) -> None:
     for index, binding in enumerate(payload["reference_proposals"]):
         if binding["resolution"] == "resolved" and binding["resolved_ref"] not in binding["candidate_refs"]:
             field = f"reference_proposals[{index}].resolved_ref" if indexed_errors else "resolved_ref"
@@ -592,15 +600,20 @@ def _offending_field(error, *, indexed: bool = False) -> str:
     return str(error.validator or "schema")
 
 
-def validate_payload(name: str, value: str | bytes | dict, *, indexed_errors: bool = False) -> dict:
-    """Validate a payload; model repair may opt into indexed error paths."""
+def _schema_validator(name: str) -> Draft202012Validator:
     if name not in _SCHEMAS:
         raise ContractError("INPUT_INVALID", "schema_name")
-    payload = decode_payload(value)
     schema = json.loads((Path(__file__).parent / "contracts" / f"{name}.schema.json").read_text(encoding="utf-8"))
     checker = FormatChecker()
     checker.checks("date-time")(_utc_time)
-    error = next(Draft202012Validator(schema, format_checker=checker).iter_errors(payload), None)
+    return Draft202012Validator(schema, format_checker=checker)
+
+
+def validate_payload(name: str, value: str | bytes | dict, *, indexed_errors: bool = False) -> dict:
+    """Validate a payload; model repair may opt into indexed error paths."""
+    validator = _schema_validator(name)
+    payload = decode_payload(value)
+    error = next(validator.iter_errors(payload), None)
     if error is not None:
         raise ContractError("INPUT_INVALID", _offending_field(error, indexed=indexed_errors))
     check = _CROSS_FIELD_CHECKS.get(name)
@@ -609,6 +622,51 @@ def validate_payload(name: str, value: str | bytes | dict, *, indexed_errors: bo
     elif check is not None:
         check(payload)
     return payload
+
+
+def partition_consolidation_items(
+    value: dict, *, align_claim: Callable[[dict, int], bool] | None = None
+) -> dict[tuple[str, int], ContractError]:
+    """Find malformed claim and resume items in a decoded model envelope.
+
+    Envelope shape, array limits and reference proposals keep their strict
+    contract. The aligner sees only schema-checked claims. Alignment may update
+    transport-escaped fields, so their final shape is checked as well.
+    """
+    validator = _schema_validator("consolidation_result")
+    schema = cast(dict, validator.schema)
+    optional_items = ("claim_proposals", "resume_proposals")
+    properties = {
+        name: dict(spec, items=True) if name in optional_items else spec for name, spec in schema["properties"].items()
+    }
+    error = next(validator.evolve(schema=dict(schema, properties=properties)).iter_errors(value), None)
+    if error is not None:
+        raise ContractError("INPUT_INVALID", _offending_field(error, indexed=True))
+    _check_reference_resolutions(value, indexed_errors=True)
+
+    rejected = {}
+    for collection in optional_items:
+        item_schema = schema["properties"][collection]["items"]
+        for index, item in enumerate(value[collection]):
+            key = (collection, index)
+            try:
+                _validate_model_item(validator, item_schema, item, collection, index)
+                if collection == "claim_proposals":
+                    _check_claim_interval(item, index)
+                    if align_claim is not None and align_claim(item, index):
+                        _validate_model_item(validator, item_schema, item, collection, index)
+            except ContractError as exc:
+                if exc.code not in {"INPUT_INVALID", "DERIVATION_INVALID"}:
+                    raise
+                rejected[key] = exc
+    return rejected
+
+
+def _validate_model_item(validator, schema, item, collection, index) -> None:
+    error = next(validator.descend(item, schema, path=index), None)
+    if error is not None:
+        error.path.appendleft(collection)
+        raise ContractError("INPUT_INVALID", _offending_field(error, indexed=True))
 
 
 @dataclass(frozen=True)

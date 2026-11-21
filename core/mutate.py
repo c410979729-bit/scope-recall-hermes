@@ -87,9 +87,17 @@ class MutationReceipt:
     durability: str = "persisted"
 
 
-def validate_claims(tx, value, scope_id: str, *, ungrounded_values: list[int] | None = None):
+def validate_claims(
+    tx,
+    value,
+    scope_id: str,
+    *,
+    ungrounded_values: list[int] | None = None,
+    contents: dict[tuple[str, int], str] | None = None,
+):
     """``ungrounded_values``: a worker's list to receive the claims left out because no cited source carries
-    their value (``contracts.validate_proposal_references``); omitted, such a claim refuses the proposal."""
+    their value (``contracts.validate_proposal_references``); omitted, such a claim refuses the proposal.
+    ``contents`` receives the checked source text when publication needs to match prepared support receipts."""
     tx._scope(scope_id)
     result = validate_payload("consolidation_result", value)
     # Text by text, as written: a quote copies its source verbatim, and the source was admitted as written.
@@ -122,7 +130,10 @@ def validate_claims(tx, value, scope_id: str, *, ungrounded_values: list[int] | 
     # the host-facing proposal surface all come through here.  Spans naming
     # anything outside this map are left untouched and the strict checks that
     # follow reject them.
-    resolve_evidence_quotes(result, {(s.ref, s.revision): s.content for s in snapshots})
+    source_text = {(s.ref, s.revision): s.content for s in snapshots}
+    resolve_evidence_quotes(result, source_text)
+    if contents is not None:
+        contents.update(source_text)
     return validate_proposal_references(result, tuple(snapshots), tx.context, ungrounded_values=ungrounded_values)
 
 

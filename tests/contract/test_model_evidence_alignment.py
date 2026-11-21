@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 from scope_recall.contracts import ContractError, validate_evidence_positions
-from scope_recall.core.consolidate import consolidation_messages
+from scope_recall.core.consolidate import RejectedProposal, consolidation_messages
 from scope_recall.core.consolidation_chunks import ChunkedSource, ConsolidationChunk
 from scope_recall.core.evidence_quote import align_claim_evidence
 from scope_recall.core.worker_consolidation import decode_consolidation_result
@@ -53,6 +53,7 @@ def test_window_offsets_and_repeated_quotes_prefer_the_authorized_window(app):
         ("TEST-project 配色 蓝色。", "TEST-project\t配色\n  蓝色。"),
         ("TEST ＡＢＣ ﬁnish。", "TEST ABC finish。"),
         ("TEST café。", "TEST cafe\u0301。"),
+        ('TEST 配色 "蓝色" .', "TEST 配色  “蓝色”。"),
     ],
 )
 def test_normalized_quote_maps_back_to_the_literal_source(app, quote, content):
@@ -66,18 +67,27 @@ def test_normalized_quote_maps_back_to_the_literal_source(app, quote, content):
     )
 
 
-def test_repeated_quote_uses_first_match_unless_a_valid_hint_selects_another(app):
+def test_repeated_quote_requires_a_verified_occurrence_or_longer_anchor(app):
     core, ctx = app
     quote = "TEST-project 配色蓝色。"
-    source = capture(core, ctx, quote + quote)
-    for hint in (None, len(quote)):
-        proposal = draft(source)
-        span = proposal["evidence_spans"][0]
-        span["quote"] = quote
-        if hint is not None:
-            span.update(start=hint, end=hint + len(quote))
-        result = decode_consolidation_result(json.dumps(consolidation_payload(source, claims=[proposal])), (source,))
-        assert result["claim_proposals"][0]["evidence_spans"][0]["start"] == (hint or 0)
+    source = capture(core, ctx, quote + "TEST 后续决定：" + quote)
+    start = source.event["content"].rindex(quote)
+    proposal = draft(source, quote_override=quote)
+    span = proposal["evidence_spans"][0]
+    rejected = []
+
+    def decode():
+        raw = json.dumps(consolidation_payload(source, claims=[proposal]))
+        return decode_consolidation_result(raw, (source,), rejected_items=rejected)["claim_proposals"]
+
+    assert decode() == []
+    assert rejected == [RejectedProposal("claim", "DERIVATION_INVALID", "claim_proposals[0].evidence_spans[0].quote")]
+    span.update(start=start, end=start + len(quote))
+    assert decode()[0]["evidence_spans"][0]["start"] == start
+    span.pop("start")
+    span.pop("end")
+    span["quote"] = "TEST 后续决定：" + quote
+    assert decode()[0]["evidence_spans"][0]["start"] == len(quote)
 
 
 @pytest.mark.parametrize("version", [None, "wrong", 9])
@@ -152,7 +162,7 @@ def test_quote_without_letters_or_digits_is_rejected_even_when_judged_supported(
         align_claim_evidence(bad, {(source.ref, source.revision): source}, index=0)
 
 
-def test_acceptance_failure_retries_with_the_field_and_same_budget(worker_app):
+def test_malformed_envelope_retries_with_the_field_and_same_budget(worker_app):
     core, ctx, clock = worker_app
     source = capture(core, ctx, "TEST-project 配色蓝色。")
     proposal = draft(source, subject="TEST-project", predicate="配色", value="蓝色")
@@ -162,17 +172,18 @@ def test_acceptance_failure_retries_with_the_field_and_same_budget(worker_app):
             self.calls += 1
             feedback = kwargs.get("validation_feedback")
             self.feedbacks.append(feedback)
-            repaired = feedback == {"code": "INPUT_INVALID", "field": "claim_proposals[0].value_text"}
-            return json.dumps(
-                consolidation_payload(*sources, claims=[dict(proposal, value_text="蓝色" if repaired else [])])
-            )
+            repaired = feedback == {"code": "INPUT_INVALID", "field": "claim_proposals"}
+            payload = consolidation_payload(*sources, claims=[proposal])
+            if not repaired:
+                payload["claim_proposals"] = {"invalid": [proposal]}
+            return json.dumps(payload)
 
     model = RepairModel(None)
     core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=20)
     clock.advance(seconds=65, iso="2026-09-06T12:01:05Z")
     core.drain_worker(ctx, consolidation=model, max_items=2, remaining_seconds=20)
     assert model.calls == 2
-    assert model.feedbacks == [None, {"code": "INPUT_INVALID", "field": "claim_proposals[0].value_text"}]
+    assert model.feedbacks == [None, {"code": "INPUT_INVALID", "field": "claim_proposals"}]
     with sqlite3.connect(core.storage.path) as conn:
         assert conn.execute("SELECT count(*) FROM claims").fetchone()[0] == 1
 
@@ -187,17 +198,23 @@ def test_schema_failure_reports_the_proposal_index(app):
     assert failure.value.field == "claim_proposals[0].value_text"
 
 
-def test_repair_keeps_original_indices_after_dropping_bad_evidence(app):
+def test_item_rejections_keep_original_indices_after_dropping_bad_evidence(app):
     core, ctx = app
     source = capture(core, ctx, "TEST-project 配色蓝色。")
     bad_quote = draft(source)
     bad_quote["evidence_spans"][0]["quote"] = "TEST 不在原文中的片段。"
     bad_shape = dict(draft(source), value_text=[])
-    with pytest.raises(ContractError) as failure:
-        decode_consolidation_result(
-            json.dumps(consolidation_payload(source, claims=[bad_quote, bad_shape])), (source,), rejected_evidence=[]
-        )
-    assert failure.value.field == "claim_proposals[1].value_text"
+    rejected = []
+    decoded = decode_consolidation_result(
+        json.dumps(consolidation_payload(source, claims=[bad_quote, bad_shape, draft(source)])),
+        (source,),
+        rejected_items=rejected,
+    )
+    assert [proposal["value_text"] for proposal in decoded["claim_proposals"]] == ["蓝色"]
+    assert rejected == [
+        RejectedProposal("claim", "DERIVATION_INVALID", "claim_proposals[0].evidence_spans[0].quote"),
+        RejectedProposal("claim", "INPUT_INVALID", "claim_proposals[1].value_text"),
+    ]
 
 
 def test_serialized_quote_transport_recovery_also_ignores_bad_offsets(app):
@@ -340,10 +357,12 @@ def test_normalized_intervals_never_slice_inside_a_character_expansion(app, raw,
             align_claim_evidence(claim, {(source.ref, source.revision): source}, index=0)
         rejected = []
         result = decode_consolidation_result(
-            json.dumps(consolidation_payload(source, claims=[claim])), (source,), rejected_evidence=rejected
+            json.dumps(consolidation_payload(source, claims=[claim])), (source,), rejected_items=rejected
         )
         assert result["claim_proposals"] == []
-        assert rejected == ["claim_proposals[0].evidence_spans[0].quote"]
+        assert rejected == [
+            RejectedProposal("claim", "DERIVATION_INVALID", "claim_proposals[0].evidence_spans[0].quote")
+        ]
         from test_claims import accept
 
         with pytest.raises(ContractError, match="evidence_quote"):
@@ -363,7 +382,7 @@ def test_normalized_search_continues_after_an_incomplete_expansion():
     assert quote_interval(quote, raw) == (start, len(raw))
 
 
-def test_unlocated_envelope_quote_stays_untrusted_until_publication(app):
+def test_unlocated_quote_is_refused_with_sources_and_during_publication(app):
     from test_claims import accept
 
     core, ctx = app
@@ -371,15 +390,31 @@ def test_unlocated_envelope_quote_stays_untrusted_until_publication(app):
     claim = draft(source)
     claim["evidence_spans"][0]["quote"] = "TEST invented quote"
     raw = json.dumps(consolidation_payload(source, claims=[claim]))
-    decoded = decode_consolidation_result(raw, (source,))
-    assert decoded["claim_proposals"][0]["evidence_spans"][0] == claim["evidence_spans"][0]
+    with pytest.raises(ContractError, match=r"evidence_spans\[0\].quote"):
+        decode_consolidation_result(raw, (source,))
+    decoded = decode_consolidation_result(raw)
     with pytest.raises(ContractError, match="evidence_quote"):
         accept(core, ctx, decoded["claim_proposals"][0])
     rejected = []
-    assert decode_consolidation_result(raw, (source,), rejected_evidence=rejected)["claim_proposals"] == []
-    assert rejected == ["claim_proposals[0].evidence_spans[0].quote"]
+    assert decode_consolidation_result(raw, (source,), rejected_items=rejected)["claim_proposals"] == []
+    assert rejected == [RejectedProposal("claim", "DERIVATION_INVALID", "claim_proposals[0].evidence_spans[0].quote")]
     with core.storage.read(ctx) as tx:
         assert tx._check().execute("SELECT count(*) FROM claim_versions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "quote"),
+    [
+        ("TEST 色调  蓝色。 TEST 色调\t蓝色．", "TEST 色调 蓝色."),
+        ("TEST 版本为 3.11。", "TEST 版本为 3 .11."),
+        ("TEST 配色不是蓝色。", "TEST 配色是蓝色."),
+        ("TEST 要启用蓝色？", "TEST 要启用蓝色."),
+    ],
+)
+def test_equivalent_anchors_reject_ambiguity_and_changed_assertions(content, quote):
+    from scope_recall.core.evidence_quote import quote_interval
+
+    assert quote_interval(quote, content) is None
 
 
 @pytest.mark.parametrize("field", ["source_ref", "source_revision"])

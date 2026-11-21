@@ -10,12 +10,13 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Protocol
 
-from ..contracts import ContractError, decode_payload, utc_instant, validate_payload
+from ..contracts import ContractError, decode_payload, partition_consolidation_items, utc_instant, validate_payload
 from . import private
 from .adoption_work import adoption_checkpoint, process_adoption
 from .candidate_lifecycle import candidate_model_subject
 from .consolidate import (
     ConsolidationWorkFence,
+    RejectedProposal,
     accept_consolidation,
     candidate_evaluation_messages,
     consolidation_messages,
@@ -26,7 +27,7 @@ from .consolidation_summary import resume_seed
 from .entry_control import sources_paused, sources_paused_now
 from .episodes import source_origin, source_watermark
 from .evidence_question import DERIVATION_ROOT_ORIGINS, NO_DERIVATION_ROOT_REASON
-from .evidence_quote import align_claim_evidence
+from .evidence_quote import QuoteAnchors, align_claim_evidence
 from .evidence_support import using_support
 from .failure_policy import failure_category
 from .semantic_proposals import prepare_publication
@@ -180,10 +181,11 @@ def _root_only_sources(tx, sources: tuple[StoredSource, ...]) -> tuple[StoredSou
     return tuple(roots)
 
 
-def _requote(claim: dict, span: dict, content: str) -> None:
+def _requote(claim: dict, span: dict, content: str) -> bool:
     """A quote of a serialized JSON value, re-escaped once (with the claim's fields that held it) when exactly that
     escaped span is stored."""
     quote = span["quote"]
+    changed = False
     if quote not in content:
         # The model may quote the decoded value of serialized JSON.
         # Re-escape once only when that exact, unique stored span
@@ -195,11 +197,12 @@ def _requote(claim: dict, span: dict, content: str) -> None:
                 fragment = claim.get(field)
                 if isinstance(fragment, str) and fragment in quote and fragment not in encoded:
                     claim[field] = json.dumps(fragment, ensure_ascii=False)[1:-1]
+                    changed = True
+    return changed
 
 
 def _undecorate_claim(claim: dict, source_text: dict) -> None:
-    """One claim's transport decoration taken off, in place: empty kind fields the claim is not of, offset times,
-    null locations, and quotes of serialized JSON values."""
+    """Normalize optional transport decoration before checking item shape."""
     for kind_field in ("procedure", "intention", "alias"):
         if claim.get("kind") != kind_field and claim.get(kind_field) in (None, {}):
             claim.pop(kind_field, None)
@@ -210,14 +213,17 @@ def _undecorate_claim(claim: dict, source_text: dict) -> None:
     if not isinstance(spans, list):
         return
     for span in spans:
-        if isinstance(span, dict) and span.get("location") is None and "location" in span:
-            del span["location"]
-        if isinstance(span, dict):
-            _bare_source_ref(span, source_text)
-        if not isinstance(span, dict) or not isinstance(span.get("quote"), str):
+        if not isinstance(span, dict):
             continue
-        content = source_text.get((span.get("source_ref"), span.get("source_revision")), "")
-        _requote(claim, span, content)
+        if span.get("location") is None:
+            span.pop("location", None)
+        _bare_source_ref(span, source_text)
+        start, end = span.get("start"), span.get("end")
+        if source_text and (type(start) is not int or type(end) is not int or not 0 <= start < end):
+            # Unverified positions are hints. Normalize only complete,
+            # plausible pairs before validating shape and finding the anchor.
+            span.pop("start", None)
+            span.pop("end", None)
 
 
 def _bare_source_ref(span: dict, source_text: dict) -> None:
@@ -231,20 +237,6 @@ def _bare_source_ref(span: dict, source_text: dict) -> None:
     bare, separator, suffix = ref.rpartition("@")
     if separator and suffix == str(revision) and (bare, revision) in source_text:
         span["source_ref"] = bare
-
-
-def _validate_aligned_result(value, indices):
-    """Keep repair fields in the original response's array after per-claim rejection."""
-    try:
-        return validate_payload("consolidation_result", value, indexed_errors=True)
-    except ContractError as exc:
-        for kept, original in enumerate(indices):
-            prefix = f"claim_proposals[{kept}]"
-            if exc.field.startswith(prefix):
-                raise ContractError(
-                    exc.code, exc.field.replace(prefix, f"claim_proposals[{original}]", 1), exc.hint
-                ) from exc
-        raise
 
 
 def _restore_request_fields(value, sources, episode_ref, candidate):
@@ -275,28 +267,14 @@ def _restore_request_fields(value, sources, episode_ref, candidate):
 
 
 def decode_consolidation_result(
-    raw: str, sources=(), *, rejected_evidence: list[str] | None = None, episode_ref=None, candidate=None
+    raw: str, sources=(), *, rejected_items: list[RejectedProposal] | None = None, episode_ref=None, candidate=None
 ) -> dict:
-    """Decode the model envelope without relaxing the consolidation contract.
+    """Decode bounded model JSON and restore request-owned metadata.
 
-    Some OpenAI-compatible gateways/models still wrap a JSON-object response in
-    a single ``json`` code fence despite ``response_format=json_object``.  The
-    fence is transport decoration, so accepting it is safe only when it is the
-    complete outer envelope.  Likewise, ``location`` is an optional evidence
-    field; a model's ``null`` for it has exactly the same meaning as omission,
-    and a ``valid_from``/``valid_to`` written with a numeric offset names the
-    same instant as its UTC form (see ``contracts.utc_instant``).  All other shape,
-    source, quote, and authority checks remain in the existing validators below.
-
-    Missing or null proposal arrays mean no proposals. Other array types and all
-    items retain strict validation. Request metadata, candidate identity and source
-    positions are filled by code. With
-    ``rejected_evidence``, unlocatable claims are omitted and their indexed
-    fields collected there. Without it, unlocatable quotes in supplied sources remain
-    untrusted envelope data; live publication validates them before any write.
-    Candidate requests and unavailable source versions retain indexed refusals.
-    Omitting sources retains envelope-only decoding; publication always
-    validates evidence against live authorized source versions.
+    Ordinary worker batches may omit malformed claims and resumes, reporting
+    each original index. Candidate evaluation keeps its single-verdict
+    contract. Callers asking only for an envelope still get strict shape
+    validation. Publication rechecks all accepted evidence against live data.
     """
     if type(raw) is not str:
         raise ValueError("consolidation_result_not_text")
@@ -311,28 +289,53 @@ def decode_consolidation_result(
     source_text = {(s.ref, s.revision): s.event["content"] for s in sources}
     available = {(s.ref, s.revision): s for s in sources}
     claims = value.get("claim_proposals")
-    indices = []
     if isinstance(claims, list):
-        kept = []
-        for index, claim in enumerate(claims):
-            if not isinstance(claim, dict):
-                kept.append(claim)
-                indices.append(index)
-                continue
-            _undecorate_claim(claim, source_text)
-            try:
-                if available:
-                    align_claim_evidence(claim, available, index=index)
-            except ContractError as exc:
-                if rejected_evidence is not None:
-                    rejected_evidence.append(exc.field)
-                    continue
-                if candidate is not None or not exc.field.endswith(".quote"):
-                    raise
-            kept.append(claim)
-            indices.append(index)
-        value["claim_proposals"] = kept
-    return _validate_aligned_result(value, indices)
+        for claim in claims:
+            if isinstance(claim, dict):
+                _undecorate_claim(claim, source_text)
+    anchors = {key: QuoteAnchors(content) for key, content in source_text.items()}
+    align = (
+        partial(_align_model_claim, available=available, source_text=source_text, anchors=anchors)
+        if available
+        else None
+    )
+    if rejected_items is None or candidate is not None:
+        value = validate_payload("consolidation_result", value, indexed_errors=True)
+        if align is not None:
+            changed = False
+            for index, claim in enumerate(value["claim_proposals"]):
+                if align(claim, index):
+                    changed = True
+            if changed:
+                return validate_payload("consolidation_result", value, indexed_errors=True)
+        return value
+    malformed = partition_consolidation_items(value, align_claim=align)
+    value["claim_proposals"] = _keep_model_items(value, "claim_proposals", "claim", malformed, rejected_items)
+    value["resume_proposals"] = _keep_model_items(value, "resume_proposals", "summary", malformed, rejected_items)
+    return value
+
+
+def _keep_model_items(value, collection, stage, malformed, rejected_items):
+    """Keep valid items in input order and count each rejected item once."""
+    kept = []
+    for index, proposal in enumerate(value[collection]):
+        error = malformed.get((collection, index))
+        if error is None:
+            kept.append(proposal)
+        else:
+            rejected_items.append(RejectedProposal(stage, error.code, error.field))
+    return kept
+
+
+def _align_model_claim(claim, index, *, available, source_text, anchors) -> bool:
+    """Locate quotes in the source versions the model actually received."""
+    changed = False
+    for span in claim["evidence_spans"]:
+        content = source_text.get((span["source_ref"], span["source_revision"]))
+        if content is not None and _requote(claim, span, content):
+            changed = True
+    align_claim_evidence(claim, available, index=index, anchors=anchors)
+    return changed
 
 
 @dataclass(frozen=True)
@@ -575,8 +578,8 @@ def _process_ordinary(storage, clock, context, item, prepared, *, model, started
     except Exception as exc:
         return finish(*model_failure(exc))
     try:
-        rejected_evidence: list[str] = []
-        value = decode_consolidation_result(raw, roots, rejected_evidence=rejected_evidence, episode_ref=episode_ref)
+        rejected_items: list[RejectedProposal] = []
+        value = decode_consolidation_result(raw, roots, rejected_items=rejected_items, episode_ref=episode_ref)
         verdicts = prepare_publication(
             storage,
             context,
@@ -609,7 +612,7 @@ def _process_ordinary(storage, clock, context, item, prepared, *, model, started
         skipped_source_refs=frozenset(f"{s.ref}@{s.revision}" for s in batch) - allowed_refs,
         pending_sources=pending_sources,
         chunk=chunk,
-        rejected_claims=tuple(rejected_evidence),
+        rejected_items=tuple(rejected_items),
     )
     try:
         with using_support(verdicts):

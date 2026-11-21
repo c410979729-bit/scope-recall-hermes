@@ -424,6 +424,7 @@ class Episodes:
         return state_from_sources(sources, has_goal=True, previous=current.state)
 
     def apply_resume(self, proposal, scope_id, now):
+        """Apply a grounded resume to its single live episode and advance its coverage."""
         conn, ctx = self.tx._check(write=True), self.tx.context
         sources, ref = self._resume_sources(proposal, scope_id)
         current = self.get(ref)
@@ -431,13 +432,14 @@ class Episodes:
             raise ContractError("SOURCE_MISSING")
         if proposal["episode_ref"] not in {None, ref}:
             raise ContractError("DERIVATION_INVALID", "episode_membership")
+        # Check artifact ownership even when the optional work goal does not qualify.
+        self._require_artifact_evidence(proposal, sources)
         qualify_resume(proposal, sources)
         if not ctx.task_anchor and not supported_work_goal(proposal, sources):
             raise ContractError("DERIVATION_INVALID", "work_goal_unconfirmed")
         payload = dict(proposal, episode_ref=ref)
         if current.resume == payload:
             return current
-        self._require_artifact_evidence(payload, sources)
         revision = current.revision + 1
         processed = self._processed_sequence(ref, current.revision, set(payload["evidence_refs"]))
         state = self._resume_state(ref, sources, current)

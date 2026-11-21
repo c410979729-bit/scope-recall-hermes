@@ -8,19 +8,15 @@ always a substring of what is stored, and the byte-strict ``in`` checks in
 ``core/claim_storage.py``, ``core/consolidate.py`` and the alias path in
 ``core/mutate.py`` reject it as ``evidence_span`` / ``fragment_evidence``.
 
-Model evidence is aligned through exact text, JSON escapes, then NFKC and
-collapsed whitespace. Stored evidence always uses the original substring.
-
-Resolution is monotone.  Rung 1 is exactly the plain substring rule, so
-nothing that passes it can fail here.  Every later rung returns a slice
-of the stored content itself, which is why the callers stay byte-strict: by
-the time they run, the quote already *is* a literal substring.
+Model evidence uses an exact occurrence or an unambiguous short quote anchor.
+Canonical forms locate the raw slice and never become the stored evidence.
 """
 
 from __future__ import annotations
 
 import json
 import unicodedata
+from functools import cached_property
 
 from ..contracts import ContractError, nfkc_letters_and_digits
 
@@ -133,8 +129,11 @@ def resolve_evidence_quotes(value: dict, contents: dict) -> int:
     return resolved
 
 
+_PUNCTUATION = str.maketrans({"。": ".", "‘": "'", "’": "'", "“": '"', "”": '"'})
+
+
 def _normalized_origin(content: str) -> tuple[str, list[tuple[int, int]]]:
-    """Map normalized characters, including composed marks, back to raw intervals."""
+    """Map typographic equivalents back to complete raw character intervals."""
     characters: list[str] = []
     origins: list[tuple[int, int]] = []
     index = 0
@@ -142,49 +141,90 @@ def _normalized_origin(content: str) -> tuple[str, list[tuple[int, int]]]:
         end = index + 1
         while end < len(content) and unicodedata.category(content[end]).startswith("M"):
             end += 1
+            if end - index > 64:
+                # Pathological combining runs cannot be short quote anchors.
+                return "", []
         # Adjacent Hangul jamo compose without a combining-mark category.
         while end < len(content) and unicodedata.normalize("NFKC", content[index:end] + content[end]) != (
             unicodedata.normalize("NFKC", content[index:end]) + unicodedata.normalize("NFKC", content[end])
         ):
             end += 1
-        for char in unicodedata.normalize("NFKC", content[index:end]):
+        for char in unicodedata.normalize("NFKC", content[index:end]).translate(_PUNCTUATION):
             if char.isspace():
                 char = " "
                 if characters and characters[-1] == " ":
                     origins[-1] = (origins[-1][0], end)
                     continue
+            # A space before a sentence terminator is typographic. An
+            # internal dot in a version, domain or decimal keeps its spacing.
+            if (
+                char in ".!?"
+                and characters
+                and characters[-1] == " "
+                and (content[index] == "。" or end == len(content) or content[end].isspace())
+            ):
+                characters.pop()
+                origins.pop()
             characters.append(char)
             origins.append((index, end))
         index = end
     return "".join(characters), origins
 
 
+class QuoteAnchors:
+    """Resolve unique short anchors within one authorized source or source window."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    @cached_property
+    def _normalized(self) -> tuple[str, list[tuple[int, int]]]:
+        return _normalized_origin(self.content)
+
+    def locate(self, quote: str) -> tuple[int, int] | None:
+        """Prefer literal text, then complete JSON escapes, then typography."""
+        if not quote or len(quote) > 4096:
+            return None
+        decoded = _json_decoded(quote) if "\\" in quote else None
+        for literal in (quote, decoded):
+            if not literal:
+                continue
+            start = self.content.find(literal)
+            if start >= 0:
+                return (start, start + len(literal)) if self.content.find(literal, start + 1) < 0 else None
+        return self._locate_normalized(decoded or quote)
+
+    def _locate_normalized(self, quote: str) -> tuple[int, int] | None:
+        needle, _ = _normalized_origin(quote)
+        needle = needle.strip()
+        if not needle:
+            return None
+        normalized, origins = self._normalized
+        match = None
+        start = normalized.find(needle)
+        # Bound the work on repeated compatibility expansions that cannot
+        # themselves supply an interval. A second valid hit is ambiguous.
+        for _ in range(8):
+            if start < 0:
+                return match
+            end = start + len(needle)
+            if (start == 0 or origins[start - 1] != origins[start]) and (
+                end == len(origins) or origins[end - 1] != origins[end]
+            ):
+                interval = origins[start][0], origins[end - 1][1]
+                if match is not None or interval[1] - interval[0] > 4096:
+                    return None
+                match = interval
+            start = normalized.find(needle, start + 1)
+        return None
+
+
 def quote_interval(quote: str, content: str) -> tuple[int, int] | None:
-    """Find exact or transport-decoded text first, then width/whitespace equivalence.
-
-    Repeated quotes use the first occurrence. A separately verified model hint
-    can select a later occurrence; approximate offsets never choose one.
-    """
-    stored = resolve_quote(quote, content)
-    if stored is not None:
-        start = content.find(stored)
-        return start, start + len(stored)
-    normalized, origins = _normalized_origin(content)
-    needle, _ = _normalized_origin(quote)
-    needle = needle.strip()
-    start = normalized.find(needle) if needle else -1
-    while start >= 0:
-        interval = origins[start][0], origins[start + len(needle) - 1][1]
-        # A normalized hit may cut through one character's expansion. Only the
-        # complete mapped substring may establish equivalence with the quote.
-        restored, _ = _normalized_origin(content[slice(*interval)])
-        if restored == needle:
-            return interval
-        start = normalized.find(needle, start + 1)
-    return None
+    """Return the exact Unicode interval selected by one unambiguous anchor."""
+    return QuoteAnchors(content).locate(quote)
 
 
-def align_claim_evidence(claim: dict, sources: dict, *, index: int) -> None:
+def align_claim_evidence(claim: dict, sources: dict, *, index: int, anchors: dict | None = None) -> None:
     """Bind model quotes to authorized source versions; offsets are optional hints.
 
     A window's content is searched before any omitted text and intervals are
@@ -215,7 +255,10 @@ def align_claim_evidence(claim: dict, sources: dict, *, index: int) -> None:
             and content[start - offset : end - offset] == quote
         ):
             continue
-        interval = quote_interval(quote, content) if quote else None
+        if anchors is None:
+            interval = quote_interval(quote, content)
+        else:
+            interval = anchors[(source.ref, source.revision)].locate(quote)
         if interval is None:
             raise ContractError("DERIVATION_INVALID", f"claim_proposals[{index}].evidence_spans[{span_index}].quote")
         start, end = interval
@@ -228,9 +271,10 @@ def _located_evidence(proposal, contents):
         located = dict(span)
         content = contents.get((span["source_ref"], span["source_revision"]))
         if "start" not in span and "end" not in span and content is not None:
-            interval = quote_interval(span["quote"], content)
-            if interval is not None:
-                located.update(start=interval[0], end=interval[1])
+            quote = resolve_quote(span["quote"], content)
+            if quote is not None:
+                start = content.index(quote)
+                located.update(start=start, end=start + len(quote))
         spans.append(located)
     return spans
 
