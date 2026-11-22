@@ -9,6 +9,10 @@
 
 ### Fixed
 
+- Session and task summaries wait for complete sources, retire superseded pages and resume when the source becomes available. Pages with excess verified quotes retain a quote from each represented source within the claim's evidence limit. Expired worker leases cannot publish summary or entity changes.
+- Entity checks skip outdated candidates and retain supported names when another name lacks evidence. Checks wait for a fact to take effect and retire when it expires. Failed checks record the stage and field that prevented publication.
+- Installed packages include the reflection prompt and the memory-management schema.
+- Worker leases start after acquiring the write lock, and long-message consolidation shares its remaining lease between extraction and evidence checks, leaving time to save a page or record a timeout.
 - Doctor checks the read-only shared-store binding for Cherry Studio.
 - Consolidation keeps valid facts when another proposal fails validation. Repeated literal quotes use the indicated occurrence or the first one. A typographic match must be unique.
 - Long tool output is indexed from its beginning and end. The full text stays available as evidence.

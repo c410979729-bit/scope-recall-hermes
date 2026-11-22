@@ -39,9 +39,9 @@ from .worker_consolidation import (
 from .worker_outcomes import (
     FINALIZE_MARGIN_SECONDS,
     budget_left,
-    embedding_prepare_budget,
     finalize_work,
     hold_for_private_mode,
+    provider_prepare_budget,
 )
 from .worker_projection import (
     EmbedGroupFailure,
@@ -457,7 +457,7 @@ def _embed_group(storage, clock, context, group: tuple, embed, started: float, b
             group,
             embed=embed,
             started=started,
-            budget=embedding_prepare_budget(clock, started, budget),
+            budget=provider_prepare_budget(clock, started, budget),
         )
     except EmbedGroupFailure as exc:
         failure, prepared_group = exc, exc.prepared
@@ -558,8 +558,9 @@ def _refresh_briefs(storage, clock, context, started, budget):
 
 
 def _claim_idle(storage, clock, context, config, allowed, fresh_lane, started, budget):
-    """Discover one reflection group only after the ordinary queue has no available work."""
+    """Return a claim and its monotonic start, after obtaining the writer lock."""
     with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+        lease_started = clock.monotonic()
         claim = partial(
             tx.work.claim_next,
             config.owner_id,
@@ -576,7 +577,7 @@ def _claim_idle(storage, clock, context, config, allowed, fresh_lane, started, b
         if not items and config.reflection_capable and "consolidate" in allowed:
             if queue_reflections(tx, now=clock.utc_now(), enabled=True):
                 items = claim()
-        return items
+        return items, lease_started
 
 
 def drain_worker(
@@ -606,7 +607,6 @@ def drain_worker(
         storage, clock, context, config, allowed, started, budget, entity_model=consolidation
     )
     processors = {
-        "consolidate": partial(process_consolidate, model=consolidation),
         "embed": partial(process_embed, embed=embed),
         "evaluate_candidate": partial(process_candidate_evaluation, evaluator=candidate),
         "rebuild_projection": partial(
@@ -634,17 +634,22 @@ def drain_worker(
         # any pass, a one-claim pass included, and the oldest work keeps moving
         # however busy the chat is.  A default runtime pass (120 s, 45 s
         # requests) fits two model requests, so each such pass reaches the lane.
-        claimed_at = clock.monotonic()
-        claimed = _claim_idle(storage, clock, context, config, allowed, len(receipts) % 2 == 1, started, budget)
-        if not claimed:
+        group, lease_started = _claim_idle(
+            storage, clock, context, config, allowed, len(receipts) % 2 == 1, started, budget
+        )
+        if not group:
             break
-        item = claimed[0]
-        group: tuple = (item,)
+        item = group[0]
         prepared_group, published_group, recorded = {}, {}, {}
         # A valid positive lease keeps a request window even when shorter than the ordinary finalize margin.
         lease_end = min(
             budget,
-            claimed_at - started + config.lease_seconds,
+            lease_started - started + config.lease_seconds,
+        )
+        processors["consolidate"] = partial(
+            process_consolidate,
+            model=consolidation,
+            ordinary_budget=lease_end,
         )
         if item.work_type == "embed" and embed is not None:
             # Embedding is one request per source; asking for the pass's other
@@ -686,7 +691,7 @@ def drain_worker(
         # vector would be paid for and dropped as stale.
         rest = [member for member in group if member.work_id not in recorded]
         for index, member in enumerate(rest):
-            member_budget = min(budget, lease_end) if member.work_type == "rebuild_projection" else budget
+            member_budget = lease_end if member.work_type == "rebuild_projection" else budget
             if member.work_type == "embed":
                 if budget_left(started, clock, lease_end) <= _group_request_floor(budget, config.lease_seconds):
                     _release_group(storage, clock, context, rest[index:], "lease_ending", started, budget)

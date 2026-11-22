@@ -25,13 +25,13 @@ from .worker_outcomes import (
     budget_left,
     deadline_result,
     derivation_changed,
-    embedding_prepare_budget,
     epoch_changed,
     finalize_work,
     hold_for_entry_state,
     hold_for_private_mode,
     mark_obsolete,
     port_failure,
+    provider_prepare_budget,
     read_derivation_fence,
     stale_result,
     work_result,
@@ -561,7 +561,7 @@ def process_embed(
             with private.using_outbound_check(
                 lambda: _embed_blocked(storage, clock, context, (subject,), kind.keyword)
             ):
-                request_end = embedding_prepare_budget(clock, started, budget)
+                request_end = provider_prepare_budget(clock, started, budget)
                 prepared = prepare(subject, remaining_seconds=budget_left(started, clock, request_end))
         except Exception as exc:
             return finish(*port_failure(exc), error_detail=_refusal_field(exc))

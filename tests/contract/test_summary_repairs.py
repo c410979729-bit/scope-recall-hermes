@@ -41,10 +41,10 @@ class FirstSentenceModel:
         )
 
 
-@pytest.mark.parametrize("failure", ["summary_grounding", "evidence_spans", "summary_invalid"])
+@pytest.mark.parametrize("failure", ["summary_grounding", "summary_capacity", "summary_invalid"])
 def test_summary_validation_failure_records_field_on_every_attempt(app, failure):
     core, ctx = app
-    text = " ".join(f"TEST sentence {i}." for i in range(17))
+    text = " ".join(f"TEST sentence {i}." for i in range(33))
     capture(core, ctx, text)
 
     class InvalidSummary:
@@ -52,7 +52,7 @@ def test_summary_validation_failure_records_field_on_every_attempt(app, failure)
             source = json.loads(messages[-1]["content"])["sources"][0]
             if failure == "summary_invalid":
                 return "{"
-            sentences = ["invented"] if failure == "summary_grounding" else [f"TEST sentence {i}." for i in range(17)]
+            sentences = ["invented"] if failure == "summary_grounding" else [f"TEST sentence {i}." for i in range(33)]
             return {
                 "sentences": [
                     dict(text=s, source_ref=source["ref"], source_revision=source["revision"]) for s in sentences
@@ -82,6 +82,60 @@ def test_summary_validation_failure_records_field_on_every_attempt(app, failure)
     assert tuple(group) == ("partial", failure)
     assert work[0] == "failed"
     assert len(details) == 3 and all(row[0] == group[1] for row in details)
+
+
+def test_overfull_grounded_summary_keeps_each_source_and_the_unquoted_original(app):
+    core, ctx = app
+    quotes = [f"TEST sentence {i}." for i in range(17)]
+    first = capture(core, ctx, " ".join(quotes))
+    second = capture(core, ctx, "TEST final decision.")
+
+    class ManyQuotes:
+        calls = 0
+
+        def judge(self, messages, *, remaining_seconds):
+            self.calls += 1
+            assert "最多共16句" in messages[0]["content"]
+            selected = [dict(text=text, source_ref=first.ref, source_revision=first.revision) for text in quotes]
+            selected.append(dict(text="TEST final decision.", source_ref=second.ref, source_revision=second.revision))
+            return dict(sentences=selected)
+
+    model = ManyQuotes()
+    build(core, ctx, model)
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        group = conn.execute("SELECT state,covered_units,total_units FROM summary_groups").fetchone()
+        assert group["state"] == "complete" and group["covered_units"] == group["total_units"]
+        ref, rev = conn.execute("SELECT claim_ref,claim_revision FROM summary_parts").fetchone()
+        spans = tx.claims.version(ref, rev).payload["evidence_spans"]
+        assert [span["quote"] for span in spans] == [*quotes[:15], "TEST final decision."]
+        assert tx.source(first.ref, first.revision).event["content"] == " ".join(quotes)
+    assert model.calls == 1
+
+
+def test_expanded_quotes_share_character_and_span_capacity_across_sources(app):
+    core, ctx = app
+    rows = []
+    for label, count, width in (("A", 9, 80), ("B", 8, 80), ("C", 1, 230)):
+        quotes = [f"TEST-{label}-{i}" for i in range(count)]
+        sentences = [text.ljust(width - 1, "x") + "." for text in quotes]
+        source = capture(core, ctx, " ".join(sentences))
+        rows.extend((source, text) for text in quotes)
+
+    class ShortQuotes:
+        def judge(self, messages, *, remaining_seconds):
+            return dict(
+                sentences=[
+                    dict(text=text, source_ref=source.ref, source_revision=source.revision) for source, text in rows
+                ]
+            )
+
+    build(core, ctx, ShortQuotes())
+    with core.storage.read(ctx) as tx:
+        ref, rev = tx._check().execute("SELECT claim_ref,claim_revision FROM summary_parts").fetchone()
+        spans = tx.claims.version(ref, rev).payload["evidence_spans"]
+        assert {span["source_ref"] for span in spans} == {source.ref for source, _ in rows}
+        assert len(spans) == 16 and len("\n".join(span["quote"] for span in spans)) <= 1536
 
 
 @pytest.mark.parametrize("partial,total,alert", [(19, 19, False), (20, 200, False), (20, 199, True)])
@@ -218,6 +272,425 @@ def rendered_conversation(core, ctx, query="昨天做了什么"):
         encoding="utf-8",
     )
     return packet, prepared.canonical_text or ""
+
+
+@pytest.mark.parametrize("legacy_failed", [False, True])
+def test_existing_summary_job_waits_for_a_missing_later_source(app, legacy_failed):
+    from scope_recall.core.summary_storage import close_session, next_summary_due, queue_summaries
+    from scope_recall.core.worker import WorkerConfig, drain_worker
+
+    core, ctx = app
+    capture(core, ctx, "TEST-project first result.", when="2026-09-05T10:00:00Z")
+    late = capture(core, ctx, "TEST-project incomplete result.", key="TEST-late-gap", when="2026-09-05T11:00:00Z")
+    with core.storage.write(ctx) as tx:
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        assert queue_summaries(tx, now=core.clock.now) == 1
+        tx._check().execute("UPDATE source_events SET capture_gaps_json='[\"TEST-gap\"]' WHERE event_id=?", (late.ref,))
+        tx._check().execute("UPDATE work_items SET state='done' WHERE work_type!='rebuild_projection'")
+        if legacy_failed:
+            tx._check().execute("UPDATE summary_groups SET state='partial',failure='summary_source'")
+            work_id = (
+                tx._check()
+                .execute(
+                    "UPDATE work_items SET state='failed',attempt=3,last_error_code='SOURCE_MISSING' "
+                    "WHERE work_type='rebuild_projection' RETURNING work_id"
+                )
+                .fetchone()[0]
+            )
+            retry = tx.work.operator_retry_failed((work_id,), now=core.clock.now, operation_id="TEST-summary")
+            assert retry[0].disposition == "requeued"
+
+    model = FirstSentenceModel()
+    result = drain_worker(
+        core.storage,
+        core.clock,
+        ctx,
+        config=WorkerConfig("TEST-summary", summary_capable=True),
+        consolidation=model,
+        remaining_seconds=30,
+    )
+    assert result.failed == 0 and not model.pages
+    for _ in range(2):
+        with core.storage.write(ctx) as tx:
+            assert queue_summaries(tx, now=core.clock.now) == 0
+        with core.storage.read(ctx) as tx:
+            conn = tx._check()
+            assert tuple(conn.execute("SELECT state,failure,generation FROM summary_groups").fetchone()) == (
+                "partial",
+                "source_unavailable",
+                1,
+            )
+            assert conn.execute("SELECT state FROM work_items WHERE work_type='rebuild_projection'").fetchone()[0] == (
+                "obsolete"
+            )
+            assert next_summary_due(tx, now=core.clock.now) is None
+    _packet, rendered = rendered_conversation(core, ctx)
+    assert "TEST-project first result." in rendered
+
+    capture(core, ctx, "TEST-project recovered result.", key="TEST-late-gap", revision=2, when="2026-09-05T11:00:00Z")
+    build(core, ctx, model)
+    assert len(model.pages) == 1
+    assert [source["revision"] for source in model.pages[0]] == [1, 2]
+
+
+@pytest.mark.parametrize("change", ["revision", "capture_gap"])
+def test_summary_publish_reconciles_source_changes_during_the_model_call(app, change):
+    from scope_recall.core.summary_storage import close_session
+
+    core, ctx = app
+    source = capture(core, ctx, "TEST-project old result.", key="TEST-summary-revise")
+
+    class RevisingSummary(FirstSentenceModel):
+        def judge(self, messages, *, remaining_seconds):
+            answer = super().judge(messages, remaining_seconds=remaining_seconds)
+            if len(self.pages) == 1 and change == "revision":
+                capture(core, ctx, "TEST-project new result.", key="TEST-summary-revise", revision=2)
+                with core.storage.write(ctx) as tx:
+                    close_session(tx, ctx.session_id, now=core.clock.now)
+            elif change == "capture_gap":
+                with core.storage.write(ctx) as tx:
+                    tx._check().execute(
+                        "UPDATE source_events SET capture_gaps_json='[\"TEST-gap\"]' WHERE event_id=?", (source.ref,)
+                    )
+            return answer
+
+    model = RevisingSummary()
+    assert build(core, ctx, model).failed == 0
+    revised = change == "revision"
+    assert [page[0]["revision"] for page in model.pages] == ([1, 2] if revised else [1])
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        states = conn.execute("SELECT state FROM work_items WHERE work_type='rebuild_projection' ORDER BY work_id")
+        assert [row[0] for row in states] == (["obsolete", "done"] if revised else ["obsolete"])
+        assert tuple(conn.execute("SELECT state,generation,failure FROM summary_groups").fetchone()) == (
+            ("complete", 2, None) if revised else ("partial", 1, "source_unavailable")
+        )
+        assert conn.execute("SELECT coverage_json FROM summary_parts WHERE generation=1").fetchone()[0] == "[]"
+
+
+def test_summary_stale_worker_cannot_send_or_settle_a_page_after_it_was_released(app, monkeypatch):
+    from scope_recall.core import worker_summaries
+    from scope_recall.core.summary_storage import close_session, queue_summaries
+
+    core, ctx = app
+    capture(core, ctx, "TEST-project current result.")
+    with core.storage.write(ctx) as tx:
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        assert queue_summaries(tx, now=core.clock.now) == 1
+        kinds = frozenset({"rebuild_projection"})
+        (original,) = tx.work.claim_next("TEST-original", core.clock.now, lease_seconds=1, allowed_work_types=kinds)
+    original_guard = worker_summaries._outbound_blocked
+
+    def reclaimed_before_send(storage, clock, context, item, sources):
+        clock.now = "2026-09-06T12:00:02Z"
+        with storage.write(context) as tx:
+            (replacement,) = tx.work.claim_next(
+                "TEST-replacement", clock.now, lease_seconds=60, allowed_work_types=kinds
+            )
+        assert replacement.work_id == original.work_id
+        assert replacement.lease_token > original.lease_token
+        return original_guard(storage, clock, context, item, sources)
+
+    monkeypatch.setattr(worker_summaries, "_outbound_blocked", reclaimed_before_send)
+    model = FirstSentenceModel()
+    disposition, _, state = worker_summaries.process_summary(
+        core.storage, core.clock, ctx, original, model=model, started=core.clock.monotonic(), budget=10
+    )
+    assert (disposition, state) == ("stale", "leased") and not model.pages
+    with core.storage.read(ctx) as tx:
+        assert tuple(tx._check().execute("SELECT state,generation,covered_units FROM summary_groups").fetchone()) == (
+            "pending",
+            1,
+            0,
+        )
+
+
+def test_summary_lease_expiring_during_publication_rolls_back_the_page(app, monkeypatch):
+    from scope_recall.core import worker_summaries
+    from scope_recall.core.summary_storage import close_session, queue_summaries
+
+    core, ctx = app
+    capture(core, ctx, "TEST-project current result.")
+    with core.storage.write(ctx) as tx:
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        assert queue_summaries(tx, now=core.clock.now) == 1
+        (item,) = tx.work.claim_next(
+            "TEST-summary", core.clock.now, lease_seconds=1, allowed_work_types=frozenset({"rebuild_projection"})
+        )
+    store_excerpt = worker_summaries.store_excerpt_claim
+
+    def store_under_expiring_lease(*args, **kwargs):
+        saved = store_excerpt(*args, **kwargs)
+        core.clock.now = "2026-09-06T12:00:02Z"
+        return saved
+
+    monkeypatch.setattr(worker_summaries, "store_excerpt_claim", store_under_expiring_lease)
+    model = FirstSentenceModel()
+    disposition, _, state = worker_summaries.process_summary(
+        core.storage, core.clock, ctx, item, model=model, started=core.clock.monotonic(), budget=10
+    )
+    assert (disposition, state) == ("stale", "leased") and len(model.pages) == 1
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        assert tuple(conn.execute("SELECT state,covered_units FROM summary_groups").fetchone()) == ("pending", 0)
+        assert conn.execute("SELECT coverage_json FROM summary_parts").fetchone()[0] == "[]"
+        assert tx.claims.version(item.subject_ref, item.subject_revision).reason == "summary_pending"
+
+
+def test_summary_lease_expiring_during_error_reconciliation_leaves_no_failure(app, monkeypatch):
+    from scope_recall.core import worker_summaries
+    from scope_recall.core.summary_storage import close_session, queue_summaries
+
+    core, ctx = app
+    capture(core, ctx, "TEST-project current result.")
+    with core.storage.write(ctx) as tx:
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        assert queue_summaries(tx, now=core.clock.now) == 1
+        (item,) = tx.work.claim_next(
+            "TEST-summary", core.clock.now, lease_seconds=1, allowed_work_types=frozenset({"rebuild_projection"})
+        )
+    reconcile = worker_summaries._reconcile_job
+
+    def reconcile_under_expiring_lease(*args, **kwargs):
+        outcome = reconcile(*args, **kwargs)
+        core.clock.now = "2026-09-06T12:00:02Z"
+        return outcome
+
+    class InvalidSummary:
+        def judge(self, messages, *, remaining_seconds):
+            return "{"
+
+    monkeypatch.setattr(worker_summaries, "_reconcile_job", reconcile_under_expiring_lease)
+    disposition, _, state = worker_summaries.process_summary(
+        core.storage, core.clock, ctx, item, model=InvalidSummary(), started=core.clock.monotonic(), budget=10
+    )
+    assert (disposition, state) == ("stale", "leased")
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        assert tuple(conn.execute("SELECT state,failure FROM summary_groups").fetchone()) == ("pending", None)
+        assert conn.execute("SELECT count(*) FROM work_error_details").fetchone()[0] == 0
+
+
+def test_new_open_task_retires_a_legacy_summary_page_without_a_model_call(app):
+    from scope_recall.core.summary_storage import close_session, queue_summaries
+
+    core, ctx = app
+    capture(core, ctx, "TEST-project earlier finished result.")
+    with core.storage.write(ctx) as tx:
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        assert queue_summaries(tx, now=core.clock.now) == 1
+    task = replace(ctx, task_anchor="TEST-in-progress")
+    capture(core, task, "Continue TEST-project and run its checks.")
+
+    model = FirstSentenceModel()
+    assert build(core, ctx, model).failed == 0 and not model.pages
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        assert tuple(conn.execute("SELECT state,generation FROM summary_groups WHERE kind='session'").fetchone()) == (
+            "open_task",
+            1,
+        )
+        assert conn.execute("SELECT state FROM work_items WHERE work_type='rebuild_projection'").fetchone()[0] == (
+            "obsolete"
+        )
+
+
+@pytest.mark.parametrize("legacy_state,legacy_failure", [("pending", None), ("partial", "summary_sources")])
+def test_summary_scheduler_recovers_a_generation_with_no_live_work(app, legacy_state, legacy_failure):
+    from scope_recall.core.summary_storage import close_session, next_summary_due, queue_summaries
+
+    core, ctx = app
+    capture(core, ctx, "TEST-project available source.")
+    with core.storage.write(ctx) as tx:
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        assert queue_summaries(tx, now=core.clock.now) == 1
+        tx._check().execute("UPDATE summary_groups SET state=?,failure=?", (legacy_state, legacy_failure))
+        tx._check().execute("UPDATE work_items SET state='obsolete' WHERE work_type='rebuild_projection'")
+    with core.storage.read(ctx) as tx:
+        assert next_summary_due(tx, now=core.clock.now) == core.clock.now
+
+    model = FirstSentenceModel()
+    assert build(core, ctx, model).failed == 0
+    assert len(model.pages) == 1
+    with core.storage.read(ctx) as tx:
+        assert tuple(tx._check().execute("SELECT state,generation,failure FROM summary_groups").fetchone()) == (
+            "complete",
+            2,
+            None,
+        )
+
+
+@pytest.mark.parametrize(
+    "change", ["restored", "version", "anchor_revoked", "open_task", "reclosed", "unchanged", "model"]
+)
+def test_summary_scheduler_reconciles_only_legacy_failed_source_pages_with_changed_authority(app, change):
+    from scope_recall.core.summary_storage import close_session, next_summary_due, queue_summaries
+
+    core, ctx = app
+    source = capture(core, ctx, "TEST-project first result.", key="TEST-legacy-summary")
+    with core.storage.write(ctx) as tx:
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        assert queue_summaries(tx, now=core.clock.now) == 1
+    if change == "version":
+        capture(core, ctx, "TEST-project changed result.", key="TEST-legacy-summary", revision=2)
+    elif change == "open_task":
+        capture(core, replace(ctx, task_anchor="TEST-open-repair"), "Continue TEST-project and run its checks.")
+    code, field = {
+        "version": ("VERSION_CONFLICT", "summary_sources"),
+        "open_task": ("VERSION_CONFLICT", "summary_sources"),
+        "reclosed": ("VERSION_CONFLICT", "summary_sources"),
+        "model": ("DERIVATION_INVALID", "summary_grounding"),
+    }.get(change, ("SOURCE_MISSING", "summary_source"))
+    with core.storage.write(ctx) as tx:
+        conn = tx._check()
+        close_session(tx, ctx.session_id, now=core.clock.now)
+        conn.execute(
+            "UPDATE summary_groups SET state=?,failure=? WHERE kind='session'",
+            ("open_task" if change in {"open_task", "reclosed"} else "partial", field),
+        )
+        conn.execute(
+            "UPDATE work_items SET state='failed',attempt=3,last_error_code=? WHERE work_type='rebuild_projection'",
+            (code,),
+        )
+        if change == "unchanged":
+            conn.execute("UPDATE source_events SET capture_gaps_json='[\"TEST-gap\"]' WHERE event_id=?", (source.ref,))
+        if change == "anchor_revoked":
+            conn.execute("UPDATE source_events SET read_blocked=1 WHERE event_id=?", (source.ref,))
+            conn.execute("UPDATE claims SET read_blocked=1")
+            work_id = conn.execute("SELECT work_id FROM work_items WHERE work_type='rebuild_projection'").fetchone()[0]
+            retry = tx.work.operator_retry_failed((work_id,), now=core.clock.now, operation_id="TEST-revoked")
+            assert (retry[0].disposition, retry[0].reason) == ("rejected", "claim_revision_stale_or_deleted")
+    changed = change not in {"unchanged", "model"}
+    with core.storage.read(ctx) as tx:
+        # Discovery can still need to process the new revision or open task.
+        if change != "model":
+            assert next_summary_due(tx, now=core.clock.now) == (core.clock.now if changed else None)
+
+    model = FirstSentenceModel()
+    assert build(core, ctx, model).failed == 0
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        states = conn.execute("SELECT state FROM work_items WHERE work_type='rebuild_projection' ORDER BY work_id")
+        completed = change in {"restored", "version", "reclosed"}
+        assert [row[0] for row in states] == (
+            ["obsolete", "done"] if completed else ["obsolete" if changed else "failed"]
+        )
+        state = "complete" if completed else "open_task" if change == "open_task" else "partial"
+        failure = (
+            None if state in {"complete", "open_task"} else "source_coverage" if change == "anchor_revoked" else field
+        )
+        assert tuple(
+            conn.execute("SELECT state,generation,failure FROM summary_groups WHERE kind='session'").fetchone()
+        ) == (
+            state,
+            2 if completed else 1,
+            failure,
+        )
+    assert len(model.pages) == int(completed)
+
+
+def test_summary_wakeup_reaches_recovered_source_after_a_page_of_unchanged_gaps(app):
+    from scope_recall.core.summary_storage import close_session, next_summary_due, queue_summaries
+
+    core, ctx = app
+    for index in range(65):
+        session = replace(ctx, session_id=f"TEST-recovery-{index}")
+        source = capture(core, session, "TEST-project result.")
+        with core.storage.write(session) as tx:
+            close_session(tx, session.session_id, now=core.clock.now)
+    with core.storage.write(ctx) as tx:
+        tx._check().execute("UPDATE source_events SET capture_gaps_json='[\"TEST-gap\"]'")
+        for _ in range(2):
+            assert queue_summaries(tx, now=core.clock.now) == 0
+    with core.storage.read(ctx) as tx:
+        assert next_summary_due(tx, now=core.clock.now) is None
+    with core.storage.write(ctx) as tx:
+        tx._check().execute("UPDATE source_events SET capture_gaps_json='[]' WHERE event_id=?", (source.ref,))
+    with core.storage.read(ctx) as tx:
+        assert next_summary_due(tx, now=core.clock.now) == core.clock.now
+    with core.storage.write(ctx) as tx:
+        assert sum(queue_summaries(tx, now=core.clock.now) for _ in range(2)) == 1
+        assert dict(tx._check().execute("SELECT state,count(*) FROM summary_groups GROUP BY state")) == {
+            "partial": 64,
+            "pending": 1,
+        }
+    with core.storage.read(ctx) as tx:
+        assert next_summary_due(tx, now=core.clock.now) is None
+
+
+def test_summary_wakeup_does_not_scan_unrelated_failed_work_for_each_group(app):
+    from scope_recall.core.summary_storage import next_summary_due
+
+    core, ctx = app
+    scope = sorted(ctx.allowed_scope_ids)[0]
+    with core.storage.write(ctx) as tx:
+        conn = tx._check()
+        conn.executemany(
+            "INSERT INTO summary_groups(group_key,kind,subject_ref,scope_id,project_id,branch_id,entry_id,"
+            "last_activity,state) VALUES(?,'session',?,?,?,?,?,?,'open_task')",
+            [
+                (f"TEST-group-{i}", f"TEST-session-{i}", scope, ctx.project_id, ctx.branch_id, "TEST", core.clock.now)
+                for i in range(48)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO work_items(work_type,subject_ref,subject_revision,scope_id,state,available_at,"
+            "last_error_code) VALUES('rebuild_projection',?,1,?,'failed',?,'SOURCE_MISSING')",
+            [(f"TEST-unrelated-{i}", scope, core.clock.now) for i in range(512)],
+        )
+        steps = 0
+
+        def count_steps():
+            nonlocal steps
+            steps += 100
+            return 0
+
+        conn.set_progress_handler(count_steps, 100)
+        try:
+            assert next_summary_due(tx, now=core.clock.now) is None
+        finally:
+            conn.set_progress_handler(None, 0)
+        # Probing each group's own pages is linear in the groups, regardless of failures elsewhere.
+        assert steps < 40_000, steps
+
+
+def test_summary_replacement_retires_only_prior_failed_source_pages(app):
+    from scope_recall.core.summary_storage import close_session, queue_summaries
+
+    core, ctx = app
+    for revision in (1, 2):
+        capture(core, ctx, f"TEST-project result {revision}.", key="TEST-summary-history", revision=revision)
+        with core.storage.write(ctx) as tx:
+            close_session(tx, ctx.session_id, now=core.clock.now)
+            assert queue_summaries(tx, now=core.clock.now) == 1
+    with core.storage.write(ctx) as tx:
+        conn = tx._check()
+        work_ids = [
+            row[0] for row in conn.execute("SELECT work_id FROM work_items WHERE work_type='rebuild_projection'")
+        ]
+        assert len(work_ids) == 2
+        prior_errors = [
+            ("operator_retry:TEST-prior|VERSION_CONFLICT", "summary_sources", work_ids[0]),
+            ("DERIVATION_INVALID", "summary_grounding", work_ids[1]),
+        ]
+        for code, field, work_id in prior_errors:
+            conn.execute("UPDATE work_items SET state='failed',last_error_code=? WHERE work_id=?", (code, work_id))
+            conn.execute(
+                "INSERT INTO work_error_details(work_id,lease_token,stage,error_code,error_field,recorded_at) "
+                "VALUES(?,0,'process',?,?,?)",
+                (work_id, code, field, core.clock.now),
+            )
+    capture(core, ctx, "TEST-project new result.", key="TEST-summary-history", revision=3)
+    assert build(core, ctx).failed == 0
+    with core.storage.read(ctx) as tx:
+        rows = tx._check().execute(
+            "SELECT state,last_error_code FROM work_items WHERE work_type='rebuild_projection' ORDER BY work_id"
+        )
+        assert [tuple(row) for row in rows] == [
+            ("obsolete", "authority_revoked"),
+            ("failed", "DERIVATION_INVALID"),
+            ("done", None),
+        ]
 
 
 @pytest.mark.parametrize("role,limit", [("user", 1000), ("assistant", 600), ("tool", 300)])

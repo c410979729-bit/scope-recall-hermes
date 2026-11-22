@@ -35,10 +35,8 @@ def language_rules(name: str) -> dict:
     return _decode(json.loads(_resource_text(f"{name}.json")))
 
 
-@lru_cache(maxsize=8)
-def prompt_text(name: str) -> str:
-    """Return an allowlisted prompt template; callers supply authorized input separately."""
-    if name not in {
+PROMPT_NAMES = frozenset(
+    {
         "consolidation",
         "candidate",
         "fragment",
@@ -49,7 +47,14 @@ def prompt_text(name: str) -> str:
         "session_summary",
         "importance",
         "reflection",
-    }:
+    }
+)
+
+
+@lru_cache(maxsize=len(PROMPT_NAMES))
+def prompt_text(name: str) -> str:
+    """Return an allowlisted prompt template; callers supply authorized input separately."""
+    if name not in PROMPT_NAMES:
         raise ValueError("unknown prompt")
     return _resource_text(f"{name}.txt").rstrip("\r\n")
 

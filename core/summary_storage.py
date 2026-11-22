@@ -9,13 +9,46 @@ from datetime import datetime, timedelta
 from ..contracts import ContractError
 from . import private
 from .claims import canonical_time
+from .failure_policy import failure_kind
 from .handoff import close_drafts
 from .language_resources import language_rules
 from .recall_scope import QueryScope
 from .summary_parts import queue_summary_part, reuse_completed_parts
-from .summary_validity import group_members, group_signature, members_in_scope, open_task, summary_live
+from .summary_validity import (
+    group_members,
+    group_signature,
+    members_in_scope,
+    open_task,
+    summary_live,
+    summary_source_failure,
+)
 
 IDLE_SECONDS = 1800
+# Each group has few pages. Keep the page first so SQLite uses the unique work identity
+# instead of scanning every failed work item in the store for each group.
+_PAGE_WORK = """CROSS JOIN work_items w ON w.subject_ref=p.claim_ref AND w.subject_revision=p.claim_revision
+    AND w.work_type='rebuild_projection' AND w.scope_id=g.scope_id
+    AND w.project_id IS g.project_id AND w.branch_id IS g.branch_id"""
+_NO_RESUMABLE_PAGE = f"""NOT EXISTS(SELECT 1 FROM summary_parts p {_PAGE_WORK}
+    WHERE p.group_key=g.group_key AND p.generation=g.generation AND p.coverage_json='[]'
+    AND w.state IN ('pending','leased','failed'))"""
+_RECOVERABLE_GROUP = f"""(g.state='pending' OR (g.state='partial' AND g.failure IN (
+    'source_coverage','source_unavailable','summary_source','summary_sources','source_revision')))
+    AND {_NO_RESUMABLE_PAGE}"""
+# Only the current empty page can make a legacy group eligible. Old generations
+# may be retired during replacement if their own last error proves the cause.
+_ERROR_DETAIL = """LEFT JOIN work_error_details d ON d.detail_id=(
+    SELECT detail_id FROM work_error_details WHERE work_id=w.work_id AND lease_token=w.lease_token
+    AND stage='process' ORDER BY detail_id DESC LIMIT 1)"""
+_ERROR_FIELD = "COALESCE(d.error_field, CASE WHEN p.generation=g.generation THEN g.failure END)"
+_LEGACY_SOURCE_FAILURE = f"""w.state='failed' AND p.coverage_json='[]' AND (
+    ((lower(w.last_error_code)='source_missing' OR lower(w.last_error_code) LIKE '%|source_missing')
+        AND {_ERROR_FIELD} IN ('summary_source','source_unavailable','source_coverage'))
+    OR ((lower(w.last_error_code)='version_conflict' OR lower(w.last_error_code) LIKE '%|version_conflict')
+        AND {_ERROR_FIELD} IN ('summary_sources','source_revision')))"""
+_LEGACY_ERROR = f"""(SELECT w.last_error_code FROM summary_parts p {_PAGE_WORK} {_ERROR_DETAIL}
+    WHERE p.group_key=g.group_key AND p.generation=g.generation AND {_LEGACY_SOURCE_FAILURE}
+    LIMIT 1)"""
 
 
 def previous_conversation_scope(tx, query, *, now):
@@ -89,15 +122,6 @@ def note_source(tx, source, *, now, historical=False):
             "state=CASE WHEN ? THEN state ELSE 'waiting' END",
             (key, *values, now, int(historical), int(historical)),
         )
-        if historical:
-            # Safety review can restore sources after a part could not even be
-            # queued. Retry only source failures; model failures keep their
-            # existing retry budget and complete summaries remain readable.
-            tx._check().execute(
-                "UPDATE summary_groups SET state='waiting',signature='',failure=NULL WHERE group_key=? "
-                "AND state='partial' AND failure IN ('source_coverage','source_unavailable','summary_source')",
-                (key,),
-            )
 
 
 def close_session(tx, session_id, *, now):
@@ -136,18 +160,104 @@ def _discover(tx, limit):
         conn.execute("UPDATE summary_backfill SET position=? WHERE audience=?", (rows[-1][0], audience))
 
 
-def _ended(tx, group, now):
+def summary_wait_state(tx, group, now):
+    """Return the state a group must wait in, or None when it has ended."""
     if group["kind"] == "task":
         episode = tx.episodes.get(group["subject_ref"])
-        return episode is not None and episode.state == "completed" and not episode.suppressed
+        return None if episode is not None and episode.state == "completed" and not episode.suppressed else "open_task"
     if open_task(tx, group):
-        return False
+        return "open_task"
     if group["closed"]:
-        return True
+        return None
     last, current = canonical_time(group["last_activity"]), canonical_time(now)
     if last is None or current is None:
+        return "waiting"
+    idle = datetime.fromisoformat(current) - datetime.fromisoformat(last)
+    return None if idle >= timedelta(seconds=IDLE_SECONDS) else "waiting"
+
+
+def set_summary_state(tx, group, state, failure=None):
+    """Update the current generation's scheduling state without discarding its coverage."""
+    tx._check(write=True).execute(
+        "UPDATE summary_groups SET state=?,failure=? WHERE group_key=? AND generation=?",
+        (state, failure, group["group_key"], group["generation"]),
+    )
+
+
+def _retire_failed_source_pages(tx, group, *, replacing=False):
+    """Settle only identified failed pages in this group, leaving live leases to their owners."""
+    generation = "p.generation<=g.generation" if replacing else "p.generation=g.generation"
+    tx._check(write=True).execute(
+        "UPDATE work_items SET state='obsolete',last_error_code='authority_revoked',lease_owner=NULL,lease_until=NULL "
+        "WHERE state='failed' AND work_id IN ("
+        f"SELECT w.work_id FROM summary_groups g JOIN summary_parts p ON p.group_key=g.group_key {_PAGE_WORK} "
+        f"{_ERROR_DETAIL} WHERE g.group_key=? AND g.generation=? AND {generation} AND {_LEGACY_SOURCE_FAILURE})",
+        (group["group_key"], group["generation"]),
+    )
+
+
+def schedule_summary_generation(tx, previous, members, signature, *, now):
+    """Start one generation for validated inputs and reuse the previous generation's safe coverage."""
+    group = dict(
+        previous,
+        generation=previous["generation"] + 1,
+        manifest_json=json.dumps(members),
+        state="pending",
+        total_units=sum(m["total"] for m in members),
+        covered_units=0,
+        next_offset=0,
+        signature=signature,
+    )
+    conn = tx._check(write=True)
+    _retire_failed_source_pages(tx, previous, replacing=True)
+    conn.execute(
+        "UPDATE summary_groups SET generation=?,manifest_json=?,state='pending',total_units=?,covered_units=0,"
+        "next_offset=0,signature=?,failure=NULL WHERE group_key=?",
+        (group["generation"], group["manifest_json"], group["total_units"], signature, group["group_key"]),
+    )
+    try:
+        group = reuse_completed_parts(tx, previous, group, now=now)
+        if group["state"] != "complete":
+            ordinal = conn.execute(
+                "SELECT COALESCE(max(ordinal),-1)+1 FROM summary_parts WHERE group_key=? AND generation=?",
+                (group["group_key"], group["generation"]),
+            ).fetchone()[0]
+            queue_summary_part(tx, group, ordinal, now)
+    except ContractError as exc:
+        if exc.code not in {"SOURCE_MISSING", "ACCESS_DENIED", "VERSION_CONFLICT"}:
+            raise
+        set_summary_state(tx, group, "partial", "summary_part_unavailable")
         return False
-    return datetime.fromisoformat(current) - datetime.fromisoformat(last) >= timedelta(seconds=IDLE_SECONDS)
+    return True
+
+
+def _scheduling_page(tx, position, *, include_complete):
+    """Return one audience-scoped page of groups that can make scheduling progress."""
+    ctx = tx.context
+    normal_states = "('waiting','complete')" if include_complete else "('waiting')"
+    return (
+        tx._check()
+        .execute(
+            f"SELECT g.rowid AS position,{_NO_RESUMABLE_PAGE} AS no_work,{_LEGACY_ERROR} AS legacy_error,g.* "
+            "FROM summary_groups g WHERE g.rowid>? AND g.scope_id IN ("
+            + ",".join("?" for _ in ctx.allowed_scope_ids)
+            + f") AND g.project_id IS ? AND g.branch_id IS ? AND (g.state IN {normal_states} OR ("
+            + _RECOVERABLE_GROUP
+            + ") OR (g.state IN ('pending','partial','open_task') AND legacy_error IS NOT NULL)) "
+            "ORDER BY g.rowid LIMIT 64",
+            (position, *sorted(ctx.allowed_scope_ids), ctx.project_id, ctx.branch_id),
+        )
+        .fetchall()
+    )
+
+
+def _legacy_changed(group, signature, failure):
+    """Find proven authority changes without consuming the legacy page's retry budget."""
+    return group["legacy_error"] is not None and (
+        group["state"] == "open_task"
+        or signature != group["signature"]
+        or (failure is None and failure_kind(group["legacy_error"]) == "source_missing")
+    )
 
 
 def queue_summaries(tx, *, now, limit=128, enabled=True):
@@ -165,72 +275,50 @@ def queue_summaries(tx, *, now, limit=128, enabled=True):
     conn = tx._check(write=True)
     conn.execute("INSERT OR IGNORE INTO summary_backfill(audience) VALUES(?)", (audience,))
     position = conn.execute("SELECT position FROM summary_backfill WHERE audience=?", (audience,)).fetchone()[0]
-    rows = conn.execute(
-        "SELECT rowid AS position,* FROM summary_groups WHERE rowid>? AND scope_id IN ("
-        + ",".join("?" for _ in ctx.allowed_scope_ids)
-        + ") AND project_id IS ? AND branch_id IS ? AND state IN ('waiting','complete') ORDER BY rowid LIMIT 64",
-        (position, *sorted(ctx.allowed_scope_ids), ctx.project_id, ctx.branch_id),
-    ).fetchall()
-    conn.execute(
-        "UPDATE summary_backfill SET position=? WHERE audience=?", (rows[-1]["position"] if rows else 0, audience)
-    )
-    queued = 0
+    rows = _scheduling_page(tx, position, include_complete=True)
+    if position and not rows:
+        rows = _scheduling_page(tx, 0, include_complete=True)
+    queued, position = 0, 0
     for row in rows:
-        if row["kind"] == "task" or open_task(tx, row):
-            if not _ended(tx, row, now):
-                tx._check().execute(
-                    "UPDATE summary_groups SET state='open_task' WHERE group_key=?", (row["group_key"],)
-                )
-                continue
-        if queued == 8 or not _ended(tx, row, now):
-            continue
-        members = group_members(tx, row)
-        if not members or len(members) > 2048 or any(m["read_blocked"] or m["suppressed"] for m in members):
-            tx._check().execute(
-                "UPDATE summary_groups SET state='partial',failure='source_coverage' WHERE group_key=?",
-                (row["group_key"],),
-            )
-            continue
-        signature = group_signature(tx, members)
-        if row["signature"] == signature:
-            if row["total_units"] > 0 and row["covered_units"] == row["total_units"]:
-                tx._check().execute("UPDATE summary_groups SET state='complete' WHERE group_key=?", (row["group_key"],))
-            continue
-        group = dict(
-            row,
-            generation=row["generation"] + 1,
-            manifest_json=json.dumps(members),
-            state="pending",
-            total_units=sum(m["total"] for m in members),
-            covered_units=0,
-            next_offset=0,
-            signature=signature,
-        )
-        tx._check(write=True).execute(
-            "UPDATE summary_groups SET generation=?,manifest_json=?,state='pending',total_units=?,covered_units=0,"
-            "next_offset=0,signature=?,failure=NULL WHERE group_key=?",
-            (group["generation"], group["manifest_json"], group["total_units"], signature, group["group_key"]),
-        )
-        try:
-            group = reuse_completed_parts(tx, row, group, now=now)
-            if group["state"] != "complete":
-                ordinal = (
-                    tx._check()
-                    .execute(
-                        "SELECT COALESCE(max(ordinal),-1)+1 FROM summary_parts WHERE group_key=? AND generation=?",
-                        (group["group_key"], group["generation"]),
-                    )
-                    .fetchone()[0]
-                )
-                queue_summary_part(tx, group, ordinal, now)
-        except ContractError:
-            tx._check().execute(
-                "UPDATE summary_groups SET state='partial',failure='source_unavailable' WHERE group_key=?",
-                (row["group_key"],),
-            )
-        else:
-            queued += 1
+        if queued == 8:
+            break
+        position = row["position"]
+        queued += _queue_group(tx, row, now)
+    conn.execute("UPDATE summary_backfill SET position=? WHERE audience=?", (position, audience))
     return queued
+
+
+def _queue_group(tx, group, now):
+    """Reconcile one group, then defer it or prepare one new generation."""
+    wait_state = summary_wait_state(tx, group, now)
+    if wait_state == "open_task":
+        if group["legacy_error"] is not None:
+            _retire_failed_source_pages(tx, group)
+        set_summary_state(tx, group, wait_state)
+        return False
+    if wait_state is not None and group["legacy_error"] is None:
+        return False
+    members = group_members(tx, group)
+    signature = group_signature(tx, members)
+    if group["state"] == "complete" and group["signature"] == signature:
+        return False
+    failure = summary_source_failure(tx, members)
+    changed = _legacy_changed(group, signature, failure)
+    if group["legacy_error"] is not None and not changed:
+        return False
+    if wait_state is not None or failure is not None:
+        if changed:
+            _retire_failed_source_pages(tx, group)
+        state = wait_state or "partial"
+        if (group["state"], group["failure"]) != (state, failure):
+            set_summary_state(tx, group, state, failure)
+    elif group["signature"] == signature and 0 < group["covered_units"] == group["total_units"]:
+        if changed:
+            _retire_failed_source_pages(tx, group)
+        set_summary_state(tx, group, "complete")
+    elif changed or group["signature"] != signature or group["no_work"]:
+        return schedule_summary_generation(tx, group, members, signature, now=now)
+    return False
 
 
 def summarized_rows(tx, context, rows, *, limit):
@@ -346,24 +434,35 @@ def next_summary_due(tx, *, now):
         .fetchone()
     ):
         return now
-    groups = (
-        tx._check()
-        .execute(
-            "SELECT * FROM summary_groups WHERE state='waiting' AND scope_id IN ("
-            + scopes
-            + ") AND project_id IS ? AND branch_id IS ? ORDER BY last_activity LIMIT 64",
-            params,
-        )
-        .fetchall()
-    )
-    due = []
-    for group in groups:
-        if _ended(tx, group, now):
-            due.append(now)
-        elif group["kind"] == "session" and not open_task(tx, group):
-            stamp = canonical_time(group["last_activity"])
-            if stamp:
-                due.append(
-                    (datetime.fromisoformat(stamp) + timedelta(seconds=IDLE_SECONDS)).isoformat().replace("+00:00", "Z")
-                )
-    return min(due, default=None)
+    # Stable gaps cannot hide a later actionable group or schedule another
+    # drain by themselves. Read the partition in bounded pages and stop on
+    # the first group that could advance now.
+    position, due = 0, None
+    while rows := _scheduling_page(tx, position, include_complete=False):
+        for group in rows:
+            group_due = _group_due(tx, group, now)
+            if group_due == now:
+                return now
+            if group_due is not None:
+                due = group_due if due is None else min(due, group_due)
+        position = rows[-1]["position"]
+    return due
+
+
+def _group_due(tx, group, now):
+    wait_state = summary_wait_state(tx, group, now)
+    if group["legacy_error"] is not None:
+        if wait_state == "open_task":
+            return now
+        members = group_members(tx, group)
+        signature = group_signature(tx, members)
+        failure = summary_source_failure(tx, members)
+        return now if _legacy_changed(group, signature, failure) else None
+    if wait_state is None:
+        if group["state"] == "waiting" or summary_source_failure(tx, group_members(tx, group)) is None:
+            return now
+    elif wait_state == "waiting":
+        stamp = canonical_time(group["last_activity"])
+        if stamp:
+            return (datetime.fromisoformat(stamp) + timedelta(seconds=IDLE_SECONDS)).isoformat().replace("+00:00", "Z")
+    return None

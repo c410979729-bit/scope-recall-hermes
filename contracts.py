@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
+from functools import cache
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast, get_args
 
@@ -617,6 +618,15 @@ def _schema_validator(name: str) -> Draft202012Validator:
     checker = FormatChecker()
     checker.checks("date-time")(_utc_time)
     return Draft202012Validator(schema, format_checker=checker)
+
+
+@cache
+def claim_evidence_span_limit() -> int:
+    """Return the stored claim's evidence capacity for locally assembled proposals."""
+    schema = _schema_validator("consolidation_result").schema
+    assert isinstance(schema, dict)
+    claims = schema["properties"]["claim_proposals"]
+    return claims["items"]["properties"]["evidence_spans"]["maxItems"]
 
 
 def validate_payload(name: str, value: str | bytes | dict, *, indexed_errors: bool = False) -> dict:

@@ -6,17 +6,25 @@ import json
 from dataclasses import replace
 from functools import partial
 
-from ..contracts import ContractError
+from ..contracts import ContractError, claim_evidence_span_limit
 from . import private
 from .consolidation_chunks import ChunkedSource, ConsolidationChunk, source_chunk
 from .consolidation_summary import grounded_sentences
 from .entry_control import entry_fence, paused_since, sources_paused
+from .failure_policy import BUDGET_PAUSE_ERRORS, PROVIDER_RECHECK
 from .failure_retry import validation_feedback
 from .language_resources import prompt_text
 from .resume_compaction import resume_evidence_refs
 from .source_qualification import sentence_bounds
 from .summary_parts import queue_summary_part, store_excerpt_claim, unprocessed_ranges, update_progress
-from .summary_validity import group_members, group_signature, obsolete_ranges
+from .summary_storage import schedule_summary_generation, set_summary_state, summary_wait_state
+from .summary_validity import (
+    group_members,
+    group_signature,
+    obsolete_ranges,
+    require_summary_source,
+    summary_source_failure,
+)
 from .worker_outcomes import (
     budget_left,
     defer_model_pass,
@@ -53,8 +61,9 @@ def summary_messages(sources, *, episode_ref=None):
             )
         )
     body = dict(sources=records, task=episode_ref)
+    instructions = prompt_text("session_summary").replace("{max_sentences}", str(claim_evidence_span_limit()))
     messages = [
-        dict(role="system", content=prompt_text("session_summary")),
+        dict(role="system", content=instructions),
         dict(role="user", content=json.dumps(body, ensure_ascii=False)),
     ]
     if sum(len(m["content"].encode()) for m in messages) > 12000:
@@ -107,10 +116,7 @@ def _read_page(tx, group, episode):
     sources, task, omitted = [], None, False
     for index, start, end in unprocessed_ranges(tx, group):
         member = members[index]
-        source = tx.source(member["ref"], member["revision"])
-        if source is None or source.suppressed or source.capture_gaps:
-            raise ContractError("SOURCE_MISSING", "summary_source")
-        tx.claims.require_live_source(source.ref, source.revision)
+        source = require_summary_source(tx, member["ref"], member["revision"])
         content = source.event["content"]
         mask = list(content)
         for a, b in blocked.get((source.ref, source.revision), ()):
@@ -179,25 +185,35 @@ def _job(tx, item):
         .execute(
             "SELECT g.*,p.ordinal,p.claim_ref,p.claim_revision FROM summary_parts p JOIN "
             "summary_groups g USING(group_key) "
-            "WHERE p.claim_ref=? AND p.claim_revision=? AND p.generation=g.generation AND p.coverage_json='[]'",
-            (item.subject_ref, item.subject_revision),
+            "WHERE p.claim_ref=? AND p.claim_revision=? AND p.generation=g.generation AND p.coverage_json='[]' "
+            "AND g.state!='complete' AND g.scope_id=? AND g.project_id IS ? AND g.branch_id IS ?",
+            (item.subject_ref, item.subject_revision, item.scope_id, item.project_id, item.branch_id),
         )
         .fetchone()
     )
 
 
-def _outbound_blocked(storage, clock, context, sources, group):
+def _require_job(tx, item, now):
+    """Bind one leased page to the ended group and its current, eligible inputs."""
+    if not tx.work._verify_lease(*item.lease, now=now):
+        raise ContractError("ACCESS_DENIED", "lease_stale")
+    group = _job(tx, item)
+    if group is None or summary_wait_state(tx, group, now) is not None:
+        raise ContractError("VERSION_CONFLICT", "summary_sources")
+    members = group_members(tx, group)
+    if group["signature"] != group_signature(tx, members):
+        raise ContractError("VERSION_CONFLICT", "summary_sources")
+    if summary_source_failure(tx, members) is not None:
+        raise ContractError("SOURCE_MISSING", "summary_source")
+    return group
+
+
+def _outbound_blocked(storage, clock, context, item, sources):
     """Recheck deletion, authorization and source versions at each transport boundary, beside private intervals."""
     with storage.read(context, remaining_seconds=1.0) as tx:
-        if group["signature"] != group_signature(tx, group_members(tx, group)):
-            raise ContractError("VERSION_CONFLICT", "summary_sources")
+        _require_job(tx, item, clock.utc_now())
         if sources_paused(tx, sources):
             raise ContractError("ACCESS_DENIED", "entry_state:paused")
-        for previous in sources:
-            source = tx.source(previous.ref, previous.revision)
-            tx.claims.require_live_source(previous.ref, previous.revision)
-            if source is None or source.suppressed or source.capture_gaps:
-                raise ContractError("SOURCE_MISSING", "summary_source")
     return private.outbound_blocked(storage, clock, context, sources=sources)
 
 
@@ -218,16 +234,14 @@ def _process_summary_page(storage, clock, context, item, *, model, started, budg
     finish = partial(finalize_work, storage, clock, context, item, started=started, budget=budget)
     try:
         with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
-            group = _job(tx, item)
-            if group is None:
-                return finish("obsolete", "SOURCE_MISSING")
+            group = _require_job(tx, item, clock.utc_now())
             episode = tx.episodes.get(group["subject_ref"]) if group["kind"] == "task" else None
             sources, coverage, task, hint_omitted = _read_page(tx, group, episode)
             originals = {(s.ref, s.revision): tx.source(s.ref, s.revision).event["content"] for s in sources}
             blocked = obsolete_ranges(tx, json.loads(group["manifest_json"]))
             entries = entry_fence(tx, sources)
         entry_paused = any(state == "paused" for state, _version in entries.values())
-        guard = partial(_outbound_blocked, storage, clock, context, sources, group)
+        guard = partial(_outbound_blocked, storage, clock, context, item, sources)
         if entry_paused or guard():
             hold = hold_for_entry_state if entry_paused else hold_for_private_mode
             return hold(storage, clock, context, item, started=started, budget=budget)
@@ -241,23 +255,9 @@ def _process_summary_page(storage, clock, context, item, *, model, started, budg
                     remaining_seconds=budget_left(started, clock, budget),
                 )
             value = json.loads(raw) if isinstance(raw, str) else raw
-            sentences, spans = grounded_sentences(value, submitted, originals=originals, blocked=blocked)
-            # Whole-sentence expansion must not turn text beyond the displayed
-            # prefix into an excerpt that suppresses the unshown original.
-            limits = {}
-            for source in submitted:
-                window = getattr(source, "consolidation_window", None)
-                start = window.start if window else 0
-                end = window.end if window else len(source.event["content"])
-                limits[(source.ref, source.revision)] = (start, min(end, SUMMARY_SOURCE_LIMITS[source.event["role"]]))
-            accepted = [
-                (sentence, span)
-                for sentence, span in zip(sentences, spans, strict=True)
-                if limits[(span["source_ref"], span["source_revision"])][0] <= span["start"]
-                and span["end"] <= limits[(span["source_ref"], span["source_revision"])][1]
-            ]
-            sentences = [sentence for sentence, _span in accepted]
-            spans = [span for _sentence, span in accepted]
+            sentences, spans = grounded_sentences(
+                value, submitted, originals=originals, blocked=blocked, display_limits=SUMMARY_SOURCE_LIMITS
+            )
         return _publish_summary(
             storage,
             clock,
@@ -268,24 +268,78 @@ def _process_summary_page(storage, clock, context, item, *, model, started, budg
             budget=budget,
         )
     except (ContractError, ValueError, TypeError) as exc:
-        if getattr(exc, "field", None) == "entry_state:paused":
-            return hold_for_entry_state(storage, clock, context, item, started=started, budget=budget)
-        code = getattr(exc, "code", None) or "DERIVATION_INVALID"
-        failure = validation_feedback(code, getattr(exc, "field", None) or "summary_invalid")["field"]
-        with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
-            if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
-                return stale_result(tx, item)
-            current = _job(tx, item)
-            if current is None:
-                return work_result(tx.work.mark_obsolete(*item.lease, now=clock.utc_now()))
-            tx._check().execute(
-                "UPDATE summary_groups SET state='partial',failure=? WHERE group_key=? AND generation=? "
-                "AND state IN ('pending','partial')",
-                (failure, current["group_key"], current["generation"]),
-            )
-        return finish("retry", code, error_detail=failure)
+        return _summary_error(storage, clock, context, item, exc, started=started, budget=budget)
     except (OSError, RuntimeError, TimeoutError) as exc:
         return finish(*model_failure(exc))
+
+
+def _reconcile_job(tx, clock, item, group):
+    """Retire a stale page under its lease and advance only an ended, fully available group."""
+    if group is None:
+        return work_result(tx.work.mark_obsolete(*item.lease, now=clock.utc_now()))
+    wait_state = summary_wait_state(tx, group, clock.utc_now())
+    members, signature, failure = None, None, None
+    if wait_state is None:
+        members = group_members(tx, group)
+        failure = summary_source_failure(tx, members)
+        if failure is None:
+            signature = group_signature(tx, members)
+            if signature == group["signature"]:
+                return None
+    outcome = tx.work.mark_obsolete(*item.lease, now=clock.utc_now())
+    if outcome.disposition == "obsolete":
+        if wait_state is not None:
+            set_summary_state(tx, group, wait_state)
+        elif failure is not None:
+            set_summary_state(tx, group, "partial", failure)
+        else:
+            assert members is not None and signature is not None
+            schedule_summary_generation(tx, group, members, signature, now=clock.utc_now())
+    return work_result(outcome)
+
+
+def _summary_error(storage, clock, context, item, exc, *, started, budget):
+    """Reconcile source changes before counting an ordinary model or output failure."""
+    field = getattr(exc, "field", None)
+    if field == "entry_state:paused":
+        return hold_for_entry_state(storage, clock, context, item, started=started, budget=budget)
+    code = getattr(exc, "code", None) or "DERIVATION_INVALID"
+    failure = validation_feedback(code, field or "summary_invalid")["field"]
+    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+        if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
+            return stale_result(tx, item)
+        current = _job(tx, item)
+        reconciled = _reconcile_job(tx, clock, item, current)
+        if reconciled is not None:
+            return reconciled
+        if field in {"summary_source", "summary_sources", "lease_stale"}:
+            # The authority recovered between snapshots. Take a new input
+            # snapshot without spending an attempt on the aborted request.
+            return work_result(
+                tx.work.defer_without_attempt(
+                    *item.lease, now=clock.utc_now(), error_code="summary_source_changed", seconds=1
+                )
+            )
+        now = clock.utc_now()
+        if code in BUDGET_PAUSE_ERRORS:
+            outcome = tx.work.defer_without_attempt(
+                *item.lease, now=now, error_code=code, seconds=PROVIDER_RECHECK.delay()
+            )
+        else:
+            outcome = tx.work.fail(*item.lease, now=now, error_code=code, recoverable=True)
+        if outcome.disposition != "stale":
+            set_summary_state(tx, current, "partial", failure)
+            record_error_detail(
+                tx._check(),
+                item.work_id,
+                item.lease_token,
+                now=now,
+                stage="process",
+                code=code,
+                field=failure,
+                retain=True,
+            )
+        return work_result(outcome, error_code=code)
 
 
 def _publish_summary(storage, clock, context, item, prepared, *, started, budget):
@@ -300,8 +354,9 @@ def _publish_summary(storage, clock, context, item, prepared, *, started, budget
                 error_code="entry_paused",
             )
         current = _job(tx, item)
-        if current is None or current["signature"] != group_signature(tx, group_members(tx, current)):
-            return work_result(tx.work.mark_obsolete(*item.lease, now=clock.utc_now()))
+        reconciled = _reconcile_job(tx, clock, item, current)
+        if reconciled is not None:
+            return reconciled
         head = tx.claims.version(item.subject_ref, item.subject_revision)
         if hint_omitted:
             record_error_detail(
@@ -322,7 +377,11 @@ def _publish_summary(storage, clock, context, item, prepared, *, started, budget
         updated = update_progress(tx, group)
         if updated["state"] != "complete":
             queue_summary_part(tx, updated, group["ordinal"] + 1, clock.utc_now())
-        return work_result(tx.work.complete(*item.lease, now=clock.utc_now()))
+        outcome = tx.work.complete(*item.lease, now=clock.utc_now())
+        if outcome.disposition != "completed":
+            # Roll back the page and its successor if the writer ran past the lease.
+            raise ContractError("ACCESS_DENIED", "lease_stale")
+        return work_result(outcome)
 
 
 def is_summary_job(tx, item):

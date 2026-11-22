@@ -76,14 +76,18 @@ def prepare_support(value, sources, judge, *, candidates=(), remaining_seconds=1
 
 def judgement_result(raw, candidates):
     """Validate the shared support/action decision against only the supplied versions."""
-    result = json.loads(raw)
+    return validate_judgement(json.loads(raw), candidates)
+
+
+def validate_judgement(result, candidates):
+    """Check a decoded verdict's symbols and exact candidate version."""
     if not isinstance(result, dict) or set(result) != {"support", "action", "target_ref", "target_revision"}:
         raise ContractError("DERIVATION_INVALID", "support_verdict")
-    if result["support"] not in {"supported", "unsupported", "uncertain"} or result["action"] not in {
+    if result["support"] not in ("supported", "unsupported", "uncertain") or result["action"] not in (
         "new",
         "update",
         "duplicate",
-    }:
+    ):
         raise ContractError("DERIVATION_INVALID", "support_verdict")
     if result["action"] != "new" and (
         type(result["target_ref"]) is not str or type(result["target_revision"]) is not int

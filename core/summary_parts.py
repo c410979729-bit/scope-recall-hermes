@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 
-from ..contracts import ContractError, validate_payload
+from ..contracts import validate_payload
 from . import lineage
 from .claims import Qualification
 from .consolidation_summary import grounded_sentences
-from .summary_validity import obsolete_ranges
+from .summary_validity import obsolete_ranges, require_summary_source
 
 
 def unprocessed_ranges(tx, group):
@@ -40,7 +40,7 @@ def update_progress(tx, group):
     next_offset = gaps[0][0] if gaps else len(members)
     state = "pending" if gaps else "complete"
     tx._check(write=True).execute(
-        "UPDATE summary_groups SET covered_units=?,next_offset=?,state=? WHERE group_key=?",
+        "UPDATE summary_groups SET covered_units=?,next_offset=?,state=?,failure=NULL WHERE group_key=?",
         (covered, next_offset, state, group["group_key"]),
     )
     return dict(group, covered_units=covered, next_offset=next_offset, state=state)
@@ -50,9 +50,7 @@ def queue_summary_part(tx, group, ordinal, now):
     """Create one ordinary claim-backed work item for the first unprocessed input."""
     members = json.loads(group["manifest_json"])
     member = members[group["next_offset"]]
-    source = tx.source(member["ref"], member["revision"])
-    if source is None or source.suppressed:
-        raise ContractError("SOURCE_MISSING", "summary_source")
+    source = require_summary_source(tx, member["ref"], member["revision"])
     proposal = dict(
         kind="fact",
         subject="summary:" + group["group_key"] + ":" + str(ordinal),
@@ -85,10 +83,7 @@ def store_excerpt_claim(tx, group, head, sentences, spans, coverage, *, now):
     """Publish safe quotes, or an unreadable processed part when none remains."""
     roles = {}
     for ref, revision, _start, _end, _total in coverage:
-        source = tx.source(ref, revision)
-        tx.claims.require_live_source(ref, revision)
-        if source is None or source.suppressed or source.capture_gaps:
-            raise ContractError("SOURCE_MISSING", "summary_source")
+        source = require_summary_source(tx, ref, revision)
         roles[(ref, revision)] = source.event["role"]
     text = "\n".join(
         f"{roles[(span['source_ref'], span['source_revision'])]}: {sentence}"

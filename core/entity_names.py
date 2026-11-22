@@ -192,6 +192,15 @@ def reserve_names(tx, item, now):
     return 0.0
 
 
+def release_names(tx, item):
+    """Clear pending name reservations in the same write transaction that ends their work lease."""
+    tx._check(write=True).execute(
+        "UPDATE entity_names SET work_id=NULL WHERE work_id=? AND status='pending' AND name_id IN "
+        "(SELECT name_id FROM entity_name_mentions WHERE claim_ref=? AND claim_revision=?)",
+        (item.work_id, item.subject_ref, item.subject_revision),
+    )
+
+
 def checked(tx, source, name, target=None, alias=None):
     """Pin one name's decision to its evidence endpoints without overriding an owner's withdrawal."""
     tx._check(write=True).execute(

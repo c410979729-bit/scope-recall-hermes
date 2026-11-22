@@ -443,7 +443,12 @@ def test_entity_provider_rechecks_expiry_after_evidence_reads(app, monkeypatch, 
     assert checking_provider and not model.calls
 
 
-def test_expired_worker_cannot_mark_its_reclaimed_mention_ineligible(app):
+@pytest.mark.parametrize(
+    ("code", "field"), [("ACCESS_DENIED", "authority_revoked"), ("DERIVATION_INVALID", "entity_decision")]
+)
+def test_expired_worker_cannot_retire_its_reclaimed_mention_or_release_its_reservation(app, code, field):
+    from scope_recall.core.entity_names import reserve_names
+
     core, ctx = app
     source = named_fact(core, ctx, "TEST-Ricecake", "home")
     projection = frozenset({"rebuild_projection"})
@@ -461,8 +466,9 @@ def test_expired_worker_cannot_mark_its_reclaimed_mention_ineligible(app):
                 renewed = tx.work.claim_next(
                     "TEST-renewed", core.clock.utc_now(), lease_seconds=60, allowed_work_types=projection
                 )[0]
+                assert reserve_names(tx, renewed, core.clock.utc_now()) == 0
             assert renewed.work_id == original.work_id and renewed.lease_token > original.lease_token
-            raise ContractError("ACCESS_DENIED", "authority_revoked")
+            raise ContractError(code, field)
 
     result = process_rebuild_projection(
         core.storage, core.clock, ctx, original, model=LateRefusal(), started=core.clock.monotonic(), budget=10
@@ -472,13 +478,16 @@ def test_expired_worker_cannot_mark_its_reclaimed_mention_ineligible(app):
         row = (
             tx._check()
             .execute(
-                "SELECT m.usable,v.entity_resolved FROM entity_name_mentions m JOIN claim_versions v "
-                "ON v.claim_id=m.claim_ref AND v.revision=m.claim_revision WHERE m.claim_ref=?",
+                "SELECT m.usable,v.entity_resolved,n.work_id FROM entity_name_mentions m JOIN claim_versions v "
+                "ON v.claim_id=m.claim_ref AND v.revision=m.claim_revision JOIN entity_names n USING(name_id) "
+                "WHERE m.claim_ref=?",
                 (source.ref,),
             )
             .fetchone()
         )
-        assert tuple(row) == (1, 0)
+        assert tuple(row) == (1, 0, original.work_id)
+        details = tx._check().execute("SELECT 1 FROM work_error_details WHERE work_id=?", (original.work_id,))
+        assert details.fetchone() is None
 
 
 def test_candidate_evidence_matches_a_name_before_sentence_punctuation(app):

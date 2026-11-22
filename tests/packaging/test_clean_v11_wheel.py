@@ -167,6 +167,23 @@ def test_clean_v11_wheel_exact_allowlist(built_wheel: Path) -> None:
     assert f"Version: {allowlist['package_version']}" in metadata
 
 
+def test_pyproject_package_data_globs_are_all_allowlisted() -> None:
+    """Every file matched by pyproject package-data must be in the wheel allowlist."""
+    allowlist = _load_allowlist()
+    allowed = set(allowlist["python_modules"]) | set(allowlist["package_data"])
+    patterns = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"][
+        "package-data"
+    ]["scope_recall"]
+    unlisted: dict[str, list[str]] = {}
+    for pattern in patterns:
+        matched = sorted(path.relative_to(REPO_ROOT).as_posix() for path in REPO_ROOT.glob(pattern) if path.is_file())
+        assert matched, f"package-data pattern matched nothing: {pattern!r}"
+        missing = [rel for rel in matched if rel not in allowed]
+        if missing:
+            unlisted[pattern] = missing
+    assert not unlisted, f"package-data files omitted from v11-module-allowlist.json: {unlisted}"
+
+
 def test_vector_dependencies_keep_legacy_reader_optional(built_wheel: Path) -> None:
     """NumPy serves the base backend; legacy readers stay optional and native wheels exclude Android."""
     with zipfile.ZipFile(built_wheel) as archive:
@@ -445,15 +462,16 @@ import json
 from importlib.resources import files
 from pathlib import Path
 from scope_recall.core.consolidate import consolidation_messages
-from scope_recall.core.language_resources import prompt_text
+from scope_recall.core.language_resources import PROMPT_NAMES, prompt_text
 from scope_recall.core.source_records import StoredSource
 import scope_recall
 
 root = files("scope_recall")
+for name in PROMPT_NAMES:
+    assert prompt_text(name)
 names = ("consolidation", "candidate", "fragment", "repair", "support", "merge",
          "entity", "importance", "session_summary")
 for name in names:
-    assert prompt_text(name)
     examples = json.loads(root.joinpath(f"prompts/{name}.examples.json").read_text(encoding="utf-8"))
     assert examples and all("input" in item and "expected" in item for item in examples)
 for name in ("credentials", "query_time", "aliases"):
@@ -464,13 +482,14 @@ source = StoredSource("TEST-source", 1, "TEST-scope", "TEST-session", None, None
 messages = consolidation_messages((source,), budget=64000)
 assert json.loads(messages[-1]["content"])["sources"][0]["content"] == "I prefer deep blue."
 assert "{schema}" not in messages[0]["content"] and '"properties"' in messages[0]["content"]
-print(json.dumps({"prompts": len(names), "examples": len(names), "formatted": True,
+print(json.dumps({"prompts": sorted(PROMPT_NAMES), "examples": len(names), "formatted": True,
                   "package": str(Path(scope_recall.__file__).resolve())}))
 """
     result = _run_clean_child(installed_venv["python"], cwd=_outside_repo_cwd(), args=["-c", script])
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
     report = json.loads(result.stdout)
-    assert report["prompts"] == report["examples"] == 9
+    assert set(report["prompts"]) == {p.stem for p in (REPO_ROOT / "prompts").glob("*.txt")}
+    assert report["examples"] == 9
     assert report["formatted"]
     assert not Path(report["package"]).is_relative_to(REPO_ROOT)
 

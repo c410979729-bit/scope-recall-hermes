@@ -61,9 +61,18 @@ def entity_messages(source, sources, candidates, *, names=None):
     payload = deepcopy(source.payload)
     if names is not None:
         payload["entity_names"] = [name for name in names if name != payload["subject"]]
+        candidates = tuple(dict(item, payload=payload) if item["ref"] == source.ref else item for item in candidates)
     messages = support_messages(payload, sources, candidates)
     messages[0]["content"] = prompt_text("entity")
     return messages
+
+
+def entity_name_evidenced(source, name):
+    """Require a surface name to be declared and appear literally in the source fact's evidence."""
+    return name == source.payload["subject"] or (
+        name in source.payload.get("entity_names", [])
+        and any(name in span["quote"] for span in source.payload["evidence_spans"])
+    )
 
 
 def publish_entity_merge(tx, source, target, decision: SupportVerdict, *, now: str, name=None, only_unmerged=False):
@@ -88,15 +97,11 @@ def publish_entity_merge(tx, source, target, decision: SupportVerdict, *, now: s
     if current.payload != source.payload or destination.payload != target.payload:
         raise ContractError("VERSION_CONFLICT", "entity")
     name = source.payload["subject"] if name is None else name
+    if not entity_name_evidenced(source, name):
+        raise ContractError("DERIVATION_INVALID", "entity_name")
     if name == target.payload["subject"]:
         checked(tx, source, name, target)
         return None
-    if name != source.payload["subject"] and name not in source.payload.get("entity_names", []):
-        raise ContractError("DERIVATION_INVALID", "entity_name")
-    if name != source.payload["subject"] and not any(
-        name in span["quote"] for span in source.payload["evidence_spans"]
-    ):
-        raise ContractError("DERIVATION_INVALID", "entity_name")
     proposal = _alias_proposal(source, target, name)
     # Alias evidence must satisfy the same public contract as extracted claims.
     validate_payload(

@@ -21,9 +21,19 @@ from .failure_retry import validation_feedback
 FINALIZE_MARGIN_SECONDS = 5.0
 
 
-def embedding_prepare_budget(clock, started: float, budget: float) -> float:
-    """Reserve publication and bookkeeping time inside the same effective embedding deadline."""
+def provider_prepare_budget(clock, started: float, budget: float) -> float:
+    """Reserve publication and bookkeeping time inside the item's effective deadline."""
     return budget - min(FINALIZE_MARGIN_SECONDS, budget_left(started, clock, budget) / 2)
+
+
+def call_model_before_deadline(call, clock, started: float, budget: float, /, *args, remaining_seconds=None, **kwargs):
+    """Cap each outbound call at the same deadline, including a second call for the same item."""
+    left = budget_left(started, clock, budget)
+    if remaining_seconds is not None:
+        left = min(left, remaining_seconds)
+    if left <= 0:
+        raise ContractError("DEADLINE_EXCEEDED", "model_request")
+    return call(*args, remaining_seconds=left, **kwargs)
 
 
 class Outcome(tuple):

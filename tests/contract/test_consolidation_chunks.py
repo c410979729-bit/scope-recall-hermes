@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import datetime, timedelta
 
 import pytest
 from scope_recall.contracts import ContractError
@@ -142,6 +143,119 @@ def test_page_checkpoint_does_not_stand_down_other_consolidation(worker_app):
     )
     assert row(core, source)[0] == "pending" and 0 < row(core, source)[1] < len(source.event["content"])
     assert [row(core, other)[0] for other in others] == ["done"] * 3
+
+
+def _advance_worker_clock(clock, seconds):
+    """Move both clocks so the simulated provider and the SQLite lease agree."""
+    now = datetime.fromisoformat(clock.utc_now()) + timedelta(seconds=seconds)
+    clock.advance(seconds=seconds, iso=now.isoformat().replace("+00:00", "Z"))
+
+
+@pytest.mark.parametrize(("timeout", "claim_delay"), [(False, 0), (True, 0), (False, 7)])
+def test_resumed_page_leaves_time_to_commit_or_record_a_timeout(worker_app, monkeypatch, timeout, claim_delay):
+    from scope_recall.core import worker
+    from scope_recall.runtime.models import AuxiliaryModelError
+
+    core, ctx, clock = worker_app
+    source = long_source(core, ctx)
+    quick = FakeConsolidation(lambda sources, **_: consolidation_payload(*sources))
+    assert core.drain_worker(ctx, consolidation=quick, max_items=1, remaining_seconds=25).deferred == 1
+    _, checkpoint, _ = row(core, source)
+    assert checkpoint > 0
+    budgets = []
+    claim = worker._claim_idle
+
+    def claim_after_waiting_for_writer(*args, **kwargs):
+        _advance_worker_clock(clock, claim_delay)
+        return claim(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_claim_idle", claim_after_waiting_for_writer)
+
+    class SlowPage:
+        def propose(self, sources, *, episode_ref, remaining_seconds):
+            assert sources[0].consolidation_window.start == checkpoint
+            budgets.append(remaining_seconds)
+            _advance_worker_clock(clock, remaining_seconds)
+            if timeout:
+                raise AuxiliaryModelError("timeout")
+            return json.dumps(consolidation_payload(*sources))
+
+    receipt = core.drain_worker(ctx, consolidation=SlowPage(), max_items=1, remaining_seconds=25, lease_seconds=8)
+    state, offset, attempt = row(core, source)
+    assert len(budgets) == 1
+    assert state == "pending"
+    assert 3 < budgets[0] < 8
+    if timeout:
+        assert (offset, attempt) == (checkpoint, 1)
+        assert [(item.disposition, item.error_code) for item in receipt.items] == [("retry", "timeout")]
+    else:
+        assert offset > checkpoint and attempt == 0 and receipt.deferred == 1
+
+
+@pytest.mark.parametrize("proposal_uses_request_window", [False, True])
+def test_publication_judge_uses_lease_time_left_after_the_proposal(worker_app, proposal_uses_request_window):
+    from scope_recall.runtime.instance import RuntimeInstance
+    from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+
+    core, ctx, clock = worker_app
+    source = capture(core, ctx, "TEST-project 的数据库采用 postgres。")
+    _mark_embed_done(core)
+    proposal = draft(source, subject="TEST-project", predicate="database", value="PostgreSQL")
+    budgets = []
+
+    class JudgedPage:
+        def propose(self, sources, *, episode_ref, remaining_seconds):
+            _advance_worker_clock(clock, remaining_seconds if proposal_uses_request_window else 2)
+            return json.dumps(consolidation_payload(*sources, claims=[proposal]), ensure_ascii=False)
+
+        def judge(self, messages, *, remaining_seconds):
+            budgets.append(remaining_seconds)
+            _advance_worker_clock(clock, remaining_seconds)
+            return json.dumps(dict(support="supported", action="new", target_ref=None, target_revision=None))
+
+    config = RuntimeInstanceConfig(
+        binding=ctx.binding,
+        session_id=ctx.session_id,
+        allowed_scope_ids=ctx.allowed_scope_ids,
+        project_id=ctx.project_id,
+        branch_id=ctx.branch_id,
+        request_seconds=8,
+        lease_seconds=8,
+        drain_seconds=25,
+        max_items=1,
+    )
+    receipt = RuntimeInstance(config=config, core=core, auxiliary=None).drain(consolidation=JudgedPage())
+    if proposal_uses_request_window:
+        assert budgets == []
+        assert [(item.disposition, item.error_code) for item in receipt.items] == [("retry", "DEADLINE_EXCEEDED")]
+        assert row(core, source) == ("pending", 0, 1) and claims(core) == []
+        return
+    assert len(budgets) == 1
+    assert receipt.completed == 1
+    assert 0 < budgets[0] < 6
+    assert [(payload["value_text"], state) for payload, state in claims(core)] == [("PostgreSQL", "active")]
+
+
+def test_adoption_continuation_keeps_its_pass_budget(worker_app):
+    from test_adoption import assistant, model
+
+    core, ctx, _clock = worker_app
+    assistant(core, ctx)
+    owner = capture(core, ctx, "好，就用方案二")
+    _mark_embed_done(core)
+    judge, budgets = model()[0], []
+
+    class AdoptingModel(FakeConsolidation):
+        def judge(self, messages, *, remaining_seconds):
+            budgets.append(remaining_seconds)
+            return judge(messages, remaining_seconds=remaining_seconds)
+
+    port = AdoptingModel(lambda sources, **_: consolidation_payload(*sources))
+    for _ in range(2):
+        receipt = core.drain_worker(ctx, consolidation=port, max_items=1, remaining_seconds=25, lease_seconds=8)
+        assert receipt.deferred == 1
+    assert row(core, owner)[0] == "pending"
+    assert budgets == [25]
 
 
 def test_port_refusal_still_stands_consolidation_down_for_the_pass(worker_app):
@@ -305,3 +419,52 @@ def test_oversized_repair_is_exact_once_and_short_resume_cannot_skip_long_source
     with core.storage.write(ctx) as tx:
         assert tx.work.recover_oversized_consolidations(now=clock.utc_now(), formatter=consolidation_messages) == 0
     assert row(core, source)[0] == "failed"
+
+
+def test_embed_and_projection_leases_start_after_writer_lock_wait(worker_app, monkeypatch):
+    """Writer-lock wait before ``_claim_idle`` must not eat into a fresh embed or projection lease."""
+    from scope_recall.core import worker, worker_projection
+
+    core, ctx, clock = worker_app
+    source = capture(core, ctx, "TEST 嵌入与投影租约从拿到写锁后起算。")
+    with sqlite3.connect(core.storage.path) as db:
+        db.execute("UPDATE work_items SET state='done' WHERE work_type='consolidate'")
+    claim = worker._claim_idle
+    waited = False
+
+    def claim_after_waiting_for_writer(*args, **kwargs):
+        nonlocal waited
+        if not waited:
+            waited = True
+            _advance_worker_clock(clock, 7)
+        return claim(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_claim_idle", claim_after_waiting_for_writer)
+    embed_windows = []
+
+    class RecordingEmbed:
+        def prepare_source(self, item_source, *, remaining_seconds):
+            embed_windows.append(remaining_seconds)
+            return item_source.ref
+
+        def publish_source(self, prepared, **kwargs):
+            return prepared
+
+    receipt = core.drain_worker(ctx, max_items=1, remaining_seconds=25, lease_seconds=8, embed=RecordingEmbed())
+    assert receipt.completed == 1
+    assert embed_windows == [4.0]
+
+    with core.storage.write(ctx) as tx:
+        tx.work.enqueue("rebuild_projection", source.ref, source.revision, available_at=clock.utc_now())
+    waited = False
+    projection_windows = []
+    real_projection = worker_projection.process_rebuild_projection
+
+    def recording_projection(storage, item_clock, item_ctx, item, *, started, budget, **kwargs):
+        projection_windows.append(budget - (item_clock.monotonic() - started))
+        return real_projection(storage, item_clock, item_ctx, item, started=started, budget=budget, **kwargs)
+
+    monkeypatch.setattr(worker, "process_rebuild_projection", recording_projection)
+    proj_receipt = core.drain_worker(ctx, max_items=1, remaining_seconds=25, lease_seconds=8)
+    assert proj_receipt.completed == 1
+    assert projection_windows == [8.0]

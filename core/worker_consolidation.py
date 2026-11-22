@@ -35,6 +35,7 @@ from .source_records import StoredSource
 from .worker_outcomes import (
     Outcome,
     budget_left,
+    call_model_before_deadline,
     deadline_result,
     derivation_changed,
     epoch_changed,
@@ -43,6 +44,7 @@ from .worker_outcomes import (
     hold_for_private_mode,
     mark_obsolete,
     model_failure,
+    provider_prepare_budget,
     read_derivation_fence,
     work_result,
 )
@@ -444,6 +446,8 @@ def _decode_refused(finish, exc: Exception, *, private_hold=None):
         return private_hold()
     if isinstance(exc, ContractError) and exc.code in {"SOURCE_MISSING", "VERSION_CONFLICT", "ACCESS_DENIED"}:
         return _accept_refused(finish, exc)
+    if isinstance(exc, ContractError) and exc.code == "DEADLINE_EXCEEDED":
+        return finish("retry", exc.code, error_detail=exc.field, stage="prepare_publication")
     detail = exc.field if isinstance(exc, ContractError) else "json_envelope"
     return Outcome(
         *finish(
@@ -500,7 +504,9 @@ def process_consolidate(
     model: ConsolidationModel | None,
     started: float,
     budget: float,
+    ordinary_budget: float | None = None,
 ) -> tuple[str, str | None, str]:
+    """Dispatch consolidation, with the lease budget applied to ordinary pages and their publication."""
     with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
         feedback = tx.work.derivation_feedback(item.work_id)
         if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
@@ -527,6 +533,8 @@ def process_consolidate(
         return finalize_work(
             storage, clock, context, item, "obsolete", NO_DERIVATION_ROOT_REASON, started=started, budget=budget
         )
+    if ordinary_budget is not None:
+        budget = ordinary_budget
     with using_memory_instruction(instruction):
         return _process_ordinary(
             storage, clock, context, item, (read, feedback), model=model, started=started, budget=budget
@@ -577,9 +585,12 @@ def _process_ordinary(storage, clock, context, item, prepared, *, model, started
             return hold_for_private_mode(storage, clock, context, item, started=started, budget=budget)
         if sources_paused_now(storage, context, roots, remaining_seconds=budget_left(started, clock, budget)):
             return hold_for_entry_state(storage, clock, context, item, started=started, budget=budget)
+        # Proposal extraction and support checks share one deadline. Reading
+        # evidence and committing the cursor still use the item's full budget.
+        request_end = provider_prepare_budget(clock, started, budget)
         with private.using_outbound_check(lambda: private.outbound_blocked(storage, clock, context, sources=roots)):
-            raw = model.propose(
-                roots, episode_ref=episode_ref, remaining_seconds=budget_left(started, clock, budget), **repair
+            raw = call_model_before_deadline(
+                model.propose, clock, started, request_end, roots, episode_ref=episode_ref, **repair
             )
     except ContractError as exc:
         # A probabilistic model occasionally emits an invalid derivation; give
@@ -591,12 +602,15 @@ def _process_ordinary(storage, clock, context, item, prepared, *, model, started
     try:
         rejected_items: list[RejectedProposal] = []
         value = decode_consolidation_result(raw, roots, rejected_items=rejected_items, episode_ref=episode_ref)
+        judge = getattr(model, "judge", None)
+        if judge is not None:
+            judge = partial(call_model_before_deadline, judge, clock, started, request_end)
         verdicts = prepare_publication(
             storage,
             context,
             value,
             roots,
-            getattr(model, "judge", None),
+            judge,
             remaining_seconds=budget_left(started, clock, budget),
             clock=clock,
         )

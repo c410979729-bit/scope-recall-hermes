@@ -51,6 +51,30 @@ def group_members(tx, group):
     ]
 
 
+def require_summary_source(tx, ref, revision):
+    """Return a current, visible source whose capture has no missing evidence."""
+    source = tx.claims.require_live_source(ref, revision)
+    if source.suppressed or source.capture_gaps:
+        raise ContractError("SOURCE_MISSING", "summary_source")
+    return source
+
+
+def summary_source_failure(tx, members):
+    """Return the reason the whole group is unavailable for summarization, if any."""
+    if not members or len(members) > 2048 or any(m["read_blocked"] or m["suppressed"] for m in members):
+        return "source_coverage"
+    pairs = [(m["ref"], m["revision"]) for m in members]
+    tx.prefetch_sources(pairs)
+    try:
+        for ref, revision in pairs:
+            require_summary_source(tx, ref, revision)
+    except ContractError as exc:
+        if exc.code not in {"SOURCE_MISSING", "VERSION_CONFLICT"}:
+            raise
+        return "source_unavailable"
+    return None
+
+
 def obsolete_ranges(tx, members):
     """Locate evidence belonging to corrected or withdrawn fact versions.
 
@@ -202,16 +226,12 @@ def summary_live(tx, ref, revision, *, query_scope=None, excluded=()):
     ):
         return False
     try:
-        coverage = json.loads(row["coverage_json"])
-        for member in json.loads(row["manifest_json"]):
-            source_ref, source_revision = member["ref"], member["revision"]
-            source = tx.source(source_ref, source_revision)
-            tx.claims.require_live_source(source_ref, source_revision)
-            if source is None or source.suppressed or source.capture_gaps:
-                return False
+        return bool(json.loads(row["coverage_json"])) and tx.remembered(
+            ("summary_sources_available", row["group_key"], row["generation"]),
+            lambda: summary_source_failure(tx, members) is None,
+        )
     except ContractError:
         return False
-    return bool(coverage)
 
 
 def summary_origin(tx, ref, revision):

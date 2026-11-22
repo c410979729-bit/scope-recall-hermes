@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from datetime import datetime, timedelta
 
 import pytest
 from scope_recall.core.entity_queries import resolved_query
@@ -9,6 +10,7 @@ from scope_recall.core.entity_resolution import entity_progress, publish_entity_
 from scope_recall.core.evidence_support import SupportVerdict
 from scope_recall.core.read_views import resolve_subject
 from scope_recall.core.worker import WorkerConfig, drain_worker
+from scope_recall.core.worker_projection import process_rebuild_projection
 
 from tests.contract.test_aliases import app
 from tests.contract.test_claims import accept, capture, draft
@@ -135,6 +137,240 @@ def drain_entities(core, ctx, model):
         consolidation=model,
         remaining_seconds=20,
     )
+
+
+def _project_claim(core, ctx, source, model):
+    with core.storage.write(ctx) as tx:
+        conn = tx._check(write=True)
+        conn.execute("UPDATE work_items SET state='done'")
+        conn.execute(
+            "UPDATE work_items SET state='pending' WHERE work_type='rebuild_projection' AND subject_ref=?",
+            (source.ref,),
+        )
+        (item,) = tx.work.claim_next(
+            "TEST-entity", core.clock.utc_now(), lease_seconds=60, allowed_work_types=frozenset({"rebuild_projection"})
+        )
+    return process_rebuild_projection(
+        core.storage, core.clock, ctx, item, model=model, started=core.clock.monotonic(), budget=20
+    )
+
+
+@pytest.mark.parametrize("interval", ["ended", "future", "lease_expired"])
+def test_entity_projection_respects_the_fact_validity_interval(app, monkeypatch, interval):
+    from scope_recall.core import worker_entities
+    from scope_recall.core.claims import Qualification
+
+    core, ctx = app
+    instant = datetime.fromisoformat(core.clock.utc_now().replace("Z", "+00:00"))
+    start = instant + timedelta(hours=1 if interval == "future" else -2)
+    end = start + timedelta(hours=1)
+    raw = capture(core, ctx, "TEST-Cedar lives in TEST-Harbor.")
+    proposal = draft(
+        raw, "TEST-Harbor", kind="fact", statement_kind="assertion", subject="TEST-Cedar", predicate="home"
+    )
+    proposal.update(valid_from=start.isoformat(), valid_to=end.isoformat())
+    with core.storage.write(ctx) as tx:
+        version = tx.claims.append(
+            raw.scope_id,
+            proposal,
+            Qualification("active", "direct_report", "normalized_evidence_supported"),
+            recorded_at=core.clock.utc_now(),
+            previous=None,
+        )
+        tx.work.enqueue("rebuild_projection", version.ref, version.revision, available_at=core.clock.utc_now())
+    if interval == "lease_expired":
+        original = worker_entities.ineligible
+
+        def expire_after_retirement(*args):
+            original(*args)
+            core.clock.now = (instant + timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+
+        monkeypatch.setattr(worker_entities, "ineligible", expire_after_retirement)
+    model = RecordedModel(False)
+    outcome = _project_claim(core, ctx, version, model)
+    assert outcome[0] == {"ended": "obsolete", "future": "deferred", "lease_expired": "stale"}[interval]
+    assert not model.calls
+    with core.storage.read(ctx) as tx:
+        row = (
+            tx._check()
+            .execute(
+                "SELECT state,attempt,available_at FROM work_items "
+                "WHERE subject_ref=? AND work_type='rebuild_projection'",
+                (version.ref,),
+            )
+            .fetchone()
+        )
+        assert tx.claims.version(version.ref, 1).payload == version.payload
+        if interval == "lease_expired":
+            assert row["state"] == "leased"
+            assert (
+                not tx._check()
+                .execute("SELECT entity_resolved FROM claim_versions WHERE claim_id=?", (version.ref,))
+                .fetchone()[0]
+            )
+        elif interval == "ended":
+            assert row["state"] == "obsolete"
+        else:
+            assert (row["state"], row["attempt"]) == ("pending", 0)
+            assert datetime.fromisoformat(row["available_at"].replace("Z", "+00:00")) == start
+
+
+def test_stale_candidate_evidence_does_not_retry_a_current_entity(app):
+    core, ctx = app
+    stale = capture(core, ctx, "TEST-Cedar category person.", key="TEST-stale-candidate")
+    accept(
+        core,
+        ctx,
+        draft(stale, "person", kind="fact", statement_kind="assertion", subject="TEST-Cedar", predicate="category"),
+    )
+    live = fact(core, ctx, "TEST-Cedar North", "category", "person")
+    source = fact(
+        core,
+        ctx,
+        "TEST-Cedar Jr",
+        "home",
+        "TEST-Harbor",
+        "TEST-Cedar Jr is also called TEST-Cedar North. TEST-Cedar Jr home TEST-Harbor.",
+    )
+    capture(core, ctx, "TEST-Cedar category organization.", key="TEST-stale-candidate", revision=2)
+    model = RecordedModel()
+
+    assert _project_claim(core, ctx, source, model) == ("completed", None, "done")
+    assert [c["ref"] for c in model.calls[0]["candidates"]] == [live.ref]
+    with core.storage.read(ctx) as tx:
+        assert resolve_subject(tx, "TEST-Cedar Jr", core.clock.utc_now()).subject == "TEST-Cedar North"
+
+
+@pytest.mark.parametrize(
+    ("answer", "field"),
+    [
+        (None, "model_output_content"),
+        ('{"support": "TEST-private-answer"', "payload"),
+        ('{"support": [], "action": "new", "target_ref": null, "target_revision": null}', "support_verdict"),
+        (
+            '{"support": "uncertain", "support": "supported", "action": "new", '
+            '"target_ref": null, "target_revision": null}',
+            "duplicate_key",
+        ),
+        ("unsupported_duplicate", "entity_decision"),
+        ("update", "entity_decision"),
+        ("unknown_target", "merge_target"),
+    ],
+)
+def test_invalid_entity_answer_fails_with_bounded_detail_and_releases_names(app, answer, field):
+    core, ctx = app
+    target = fact(core, ctx, "TEST-Nian", "species", "cat")
+    source = fact(
+        core, ctx, "TEST-Ricecake", "home", "TEST-Harbor", "TEST-Ricecake is TEST-Nian. TEST-Ricecake home TEST-Harbor."
+    )
+
+    class InvalidModel:
+        def judge(self, messages, **kwargs):
+            if answer in ("unsupported_duplicate", "update", "unknown_target"):
+                return json.dumps(
+                    dict(
+                        support="unsupported" if answer == "unsupported_duplicate" else "supported",
+                        action="update" if answer == "update" else "duplicate",
+                        target_ref="claim-TEST-unknown" if answer == "unknown_target" else target.ref,
+                        target_revision=target.revision,
+                    )
+                )
+            return answer
+
+    assert _project_claim(core, ctx, source, InvalidModel()) == ("failed", "derivation_invalid", "failed")
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        details = conn.execute(
+            "SELECT d.stage,d.error_code,d.error_field FROM work_error_details d JOIN work_items w USING(work_id) "
+            "WHERE w.subject_ref=?",
+            (source.ref,),
+        ).fetchone()
+        assert tuple(details) == ("entity_judge", "DERIVATION_INVALID", field)
+        name_state = conn.execute("SELECT status,work_id FROM entity_names WHERE name='TEST-Ricecake'").fetchone()
+        assert tuple(name_state) == ("pending", None)
+        assert not conn.execute("SELECT 1 FROM entity_alias_proofs").fetchone()
+
+
+def test_unevidenced_name_does_not_discard_the_valid_name_in_the_same_judgement(app):
+    core, ctx = app
+    raw = capture(core, ctx, "TEST-Nian, also called TEST-Ricecake, species cat.")
+    receipt = accept(
+        core,
+        ctx,
+        draft(
+            raw,
+            "cat",
+            kind="fact",
+            statement_kind="assertion",
+            subject="TEST-Nian",
+            predicate="species",
+            entity_names=["TEST-Ricecake", "TEST-invented-name"],
+        ),
+    )
+    source = core.current_claim(ctx, receipt.items[0].ref)
+    model = RecordedModel()
+
+    assert _project_claim(core, ctx, source, model) == ("failed", "derivation_invalid", "failed")
+    assert len(model.calls) == 1
+    assert model.calls[0]["proposal"]["entity_names"] == ["TEST-Ricecake"]
+    assert model.calls[0]["candidates"][0]["payload"]["entity_names"] == ["TEST-Ricecake"]
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        assert resolve_subject(tx, "TEST-Ricecake", core.clock.utc_now()).subject == "TEST-Nian"
+        name_state = conn.execute("SELECT status,work_id FROM entity_names WHERE name='TEST-invented-name'").fetchone()
+        assert tuple(name_state) == ("pending", None)
+        assert tuple(conn.execute("SELECT stage,error_field FROM work_error_details").fetchone()) == (
+            "entity_prepare",
+            "entity_name",
+        )
+        assert entity_progress(tx)["pending"] == 1
+
+
+@pytest.mark.parametrize("include_unevidenced_name", [False, True])
+def test_entity_lease_expiring_after_alias_publication_rolls_back_work(app, monkeypatch, include_unevidenced_name):
+    from scope_recall.core import worker_entities
+
+    core, ctx = app
+    raw = capture(core, ctx, "TEST-Nian, also called TEST-Ricecake, species cat.")
+    names = ["TEST-Ricecake"]
+    if include_unevidenced_name:
+        names.append("TEST-invented-name")
+    receipt = accept(
+        core,
+        ctx,
+        draft(
+            raw,
+            "cat",
+            kind="fact",
+            statement_kind="assertion",
+            subject="TEST-Nian",
+            predicate="species",
+            entity_names=names,
+        ),
+    )
+    source = core.current_claim(ctx, receipt.items[0].ref)
+
+    def expire_after_alias(*args, **kwargs):
+        alias = publish_entity_merge(*args, **kwargs)
+        if alias is not None:
+            core.clock.now = "2026-09-06T12:02:00Z"
+        return alias
+
+    monkeypatch.setattr(worker_entities, "publish_entity_merge", expire_after_alias)
+    assert _project_claim(core, ctx, source, RecordedModel()) == ("stale", None, "leased")
+    with core.storage.read(ctx) as tx:
+        conn = tx._check()
+        assert not conn.execute("SELECT 1 FROM entity_alias_proofs").fetchone()
+        assert not conn.execute("SELECT 1 FROM work_error_details").fetchone()
+        assert not conn.execute("SELECT 1 FROM claim_versions WHERE entity_resolved=1").fetchone()
+        work = conn.execute(
+            "SELECT work_id,lease_owner FROM work_items WHERE subject_ref=? AND work_type='rebuild_projection'",
+            (source.ref,),
+        ).fetchone()
+        assert work["lease_owner"] == "TEST-entity"
+        assert {tuple(row) for row in conn.execute("SELECT status,work_id FROM entity_names")} == {
+            ("pending", work["work_id"])
+        }
 
 
 @pytest.mark.parametrize("same", [True, False])
@@ -481,7 +717,7 @@ def test_endpoint_changed_during_judgement_cannot_publish_a_stale_merge(app):
 
     core, ctx = app
     target = fact(core, ctx, "TEST-Nian", "species", "cat")
-    fact(
+    source = fact(
         core, ctx, "TEST-Ricecake", "home", "TEST-Harbor", "TEST-Ricecake is TEST-Nian. TEST-Ricecake home TEST-Harbor."
     )
 
@@ -498,9 +734,12 @@ def test_endpoint_changed_during_judgement_cannot_publish_a_stale_merge(app):
                 )
             return answer
 
-    drain_entities(core, ctx, RevisingModel())
+    result = _project_claim(core, ctx, source, RevisingModel())
+    assert result == ("retry", "memory_epoch_changed", "pending")
     with core.storage.read(ctx) as tx:
-        assert tx._check().execute("SELECT count(*) FROM entity_alias_proofs").fetchone()[0] == 0
+        conn = tx._check()
+        assert conn.execute("SELECT count(*) FROM entity_alias_proofs").fetchone()[0] == 0
+        assert conn.execute("SELECT status FROM entity_names WHERE name='TEST-Ricecake'").fetchone()[0] == "pending"
 
 
 def test_recall_release_rechecks_a_withdrawn_entity_proof(app, monkeypatch):

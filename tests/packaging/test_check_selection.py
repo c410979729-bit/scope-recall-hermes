@@ -120,6 +120,21 @@ def test_changed_contract_file_is_always_selected() -> None:
     assert details["unknown_files"] == []
 
 
+def test_compaction_runs_in_the_tiers_its_sqlite_checks_require() -> None:
+    candidates = "tests/contract/test_compact_candidates.py"
+    pager_tests = {"tests/contract/test_compact_lexical.py", "tests/contract/test_compact_store.py"}
+
+    # The pager runs in its own interpreter so it can hold SQLite locks independently of the caller.
+    for tier in ("contract", "release"):
+        assert candidates in check.select_tests(tier)[0]
+    for tier in ("migration", "integration", "release"):
+        assert pager_tests <= set(check.select_tests(tier)[0])
+    selected, details = check.select_tests("contract", changed=[candidates, *sorted(pager_tests)])
+    assert candidates in selected
+    assert pager_tests.isdisjoint(selected)
+    assert "migration" in details["required_tiers"]
+
+
 def test_claim_change_adds_current_history_time_and_migration_closure() -> None:
     selected, details = check.select_tests("unit", changed=["core/claims.py"])
 

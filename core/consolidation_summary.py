@@ -4,13 +4,41 @@ from __future__ import annotations
 
 import json
 
-from ..contracts import ContractError, validate_payload
+from ..contracts import ContractError, claim_evidence_span_limit, validate_payload
 from .evidence_quote import resolve_fragment_summaries
 from .source_qualification import sentence_bounds
 from .worker_outcomes import record_error_detail
 
+_SUMMARY_CHARACTER_LIMIT = 1536
 
-def grounded_sentences(value, sources, *, originals=None, blocked=None, stats=None, positions=None):
+
+def _bounded_spans(spans):
+    """Fit whole sentences into one claim, representing as many of its sources as possible."""
+    capacity = claim_evidence_span_limit()
+    if len(spans) <= capacity and len("\n".join(span["quote"] for span in spans)) <= _SUMMARY_CHARACTER_LIMIT:
+        return spans
+    # The shortest complete quote from each source maximizes representation when
+    # expansion added conditions. Other quotes retain the model's preference order.
+    by_length = sorted(range(len(spans)), key=lambda index: len(spans[index]["quote"]))
+    shortest = {}
+    for index in by_length:
+        span = spans[index]
+        shortest.setdefault((span["source_ref"], span["source_revision"]), index)
+    selected = set()
+    available = _SUMMARY_CHARACTER_LIMIT
+    for index in dict.fromkeys([*shortest.values(), *range(len(spans))]):
+        cost = len(spans[index]["quote"]) + bool(selected)
+        if cost <= available:
+            selected.add(index)
+            available -= cost
+            if len(selected) == capacity:
+                break
+    return [spans[index] for index in sorted(selected)]
+
+
+def grounded_sentences(
+    value, sources, *, originals=None, blocked=None, stats=None, positions=None, display_limits=None
+):
     """Expand literal excerpts to whole sentences and omit obsolete or over-budget selections.
 
     Traversing a source is independent of quoting it. Omitted excerpts leave its
@@ -21,7 +49,7 @@ def grounded_sentences(value, sources, *, originals=None, blocked=None, stats=No
     if not 1 <= len(value["sentences"]) <= 32:
         raise ContractError("DERIVATION_INVALID", "summary_capacity")
     by_ref = {(source.ref, source.revision): source for source in sources}
-    spans, sentences = [], []
+    spans = []
     for index, item in enumerate(value["sentences"]):
         if not isinstance(item, dict) or set(item) != {"text", "source_ref", "source_revision"}:
             raise ContractError("DERIVATION_INVALID", "summary_sentence")
@@ -47,9 +75,15 @@ def grounded_sentences(value, sources, *, originals=None, blocked=None, stats=No
         whole = original[start:end]
         if stats is not None and whole != text:
             stats["expanded"] = stats.get("expanded", 0) + 1
+        # Expanding to the full sentence cannot authorize quoting text outside the shown prefix.
+        outside = display_limits is not None and (
+            start < (offset.start if offset else 0)
+            or end > min(offset.end if offset else len(original), display_limits[source.event["role"]])
+        )
         if (
-            any(start < b and a < end for a, b in (blocked or {}).get(key, ()))
-            or len("\n".join([*sentences, whole])) > 1536
+            outside
+            or len(whole) > _SUMMARY_CHARACTER_LIMIT
+            or any(start < b and a < end for a, b in (blocked or {}).get(key, ()))
         ):
             if stats is not None:
                 stats["rejected"] = stats.get("rejected", 0) + 1
@@ -57,8 +91,10 @@ def grounded_sentences(value, sources, *, originals=None, blocked=None, stats=No
         span = dict(source_ref=key[0], source_revision=key[1], quote=whole, start=start, end=end)
         if span not in spans:
             spans.append(span)
-            sentences.append(whole)
-    return sentences, spans
+    retained = _bounded_spans(spans)
+    if stats is not None and len(retained) < len(spans):
+        stats["rejected"] = stats.get("rejected", 0) + len(spans) - len(retained)
+    return [span["quote"] for span in retained], retained
 
 
 def _json(value):

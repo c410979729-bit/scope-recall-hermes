@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..contracts import ContractError
 from .claims import evidence_refs, valid_at
 
 
@@ -49,6 +50,12 @@ def entity_candidates(tx, source, *, now: str, vector_hits=(), name=None):
             continue
         if not valid_at(head, now, historical=False) or head.payload.get("conditions"):
             continue
-        tx.claims.live_sources(evidence_refs(head.payload), head.scope_id)
+        try:
+            tx.claims.live_sources(evidence_refs(head.payload), head.scope_id)
+        except ContractError as exc:
+            # A claim head can remain current after its evidence is superseded.
+            if exc.code in {"SOURCE_MISSING", "ACCESS_DENIED", "VERSION_CONFLICT"}:
+                continue
+            raise
         found.append(dict(ref=head.ref, revision=head.revision, payload=head.payload))
     return tuple(found)
