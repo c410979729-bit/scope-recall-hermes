@@ -1344,6 +1344,264 @@ def _attachment_snapshot(root, *homes):
     return manifest, (root / "memory.sqlite3").read_bytes(), pointers, directories
 
 
+def test_grant_preview_accepts_two_verified_spellings_of_one_local_store(tmp_path, capsys, monkeypatch):
+    import unicodedata
+
+    from scope_recall.adapters import attachment_paths
+    from scope_recall.adapters.shared_entries import attachment_path
+
+    root = tmp_path / "TEST-café"
+    assert _run(capsys, "init-shared", "--root", str(root), "--agent-id", AGENT)[0] == 0
+    home, recipient = tmp_path / "donor", tmp_path / "recipient"
+    assert _attach_client(capsys, root, home, host="dsh", like=None, capture=None)[0] == 0
+    pointer = attachment_path(home)
+    alias = root.with_name(unicodedata.normalize("NFD", root.name.upper()))
+    before = json.loads(pointer.read_text(encoding="utf-8"))
+    pointer.write_text(json.dumps({**before, "root": str(alias)}), encoding="utf-8")
+    stat_path = attachment_paths.local_attachment_stat
+    # Model the two names returning the same filesystem identity on a case-insensitive volume.
+    monkeypatch.setattr(attachment_paths, "local_attachment_stat", lambda p: stat_path(root if p == alias else p))
+    code, proposed = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+    assert (code, proposed["status"]) == (0, "review_grants"), proposed
+    assert load_shared_client(home, "dsh", expected_store=root).manifest.data_directory == root
+    assert read_attachment(recipient) is None
+    # The same spelling difference on a case-sensitive volume can identify two distinct directories.
+    monkeypatch.setattr(attachment_paths, "local_attachment_stat", lambda p: stat_path(home if p == alias else p))
+    assert _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)[0] == 2
+
+
+@pytest.mark.parametrize("recipient_host", ["codex", "cherry-studio"])
+def test_attach_preview_reuses_local_clients_in_a_mixed_store(tmp_path, capsys, root, monkeypatch, recipient_host):
+    from scope_recall.adapters.clients.remote_server import write_server_config
+
+    donor, remote, away, other, recipient = (
+        tmp_path / f"TEST-{name}" for name in ("donor", "remote", "away", "other", "recipient")
+    )
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    for name, home in (("aa", remote), ("ab", away), ("ac", other)):
+        assert _attach_client(capsys, root, home, host="workbuddy", entry=name, like="dsh", capture="dsh")[0] == 0
+    write_server_config(remote, "workbuddy", listen="100.64.0.1", port=43210, token_sha256="0" * 64)
+    for index in range(5):
+        name = f"agent-{index}"
+        assert (
+            _run(
+                capsys,
+                "attach",
+                "--host",
+                "hermes",
+                "--instance-root",
+                str(tmp_path / name),
+                "--root",
+                str(root),
+                "--entry",
+                name,
+                "--display-name",
+                name,
+            )[0]
+            == 0
+        )
+    payload = read_shared_payload(root)
+    for entry in payload["entries"]:
+        if entry["host"] == "hermes":
+            principal = {"platform": "telegram", "user_id": f"TEST-{entry['entry_id']}"}
+            entry["owner_principals"].append(principal)
+            entry["audiences"].append({**entry["audiences"][0], **principal, "chat_id": principal["user_id"]})
+        if entry["entry_id"] == "ab":
+            entry["home"] = "//TEST-foreign/share/workbuddy"
+        if entry["entry_id"] == "ac":
+            entry["local_account_id"] = "sid:S-1-0-0" if os.name == "nt" else "uid:4294967294"
+    shared_entries.write_shared_payload(root, payload)
+
+    for method in ("resolve", "stat", "lstat"):
+        original = getattr(Path, method)
+
+        def guard(path, *args, original=original, **kwargs):
+            assert not path.as_posix().startswith("//TEST-foreign/"), "foreign homes must never be traversed"
+            assert not path.is_relative_to(other), "a different account's entry must never be traversed"
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method, guard)
+    before = _attachment_snapshot(root, donor, remote, recipient)
+    code, preview = _attach_client(capsys, root, recipient, host=recipient_host, like=None, capture=None)
+    assert (code, preview.get("status"), preview.get("donor")) == (0, "review_grants", "dsh"), preview
+    assert _attachment_snapshot(root, donor, remote, recipient) == before
+    assert cli.main(preview["arguments"][1:]) == 0
+    received = load_shared_client(recipient, recipient_host).audience
+    expected = load_shared_client(donor, "dsh").audience
+    assert received.allowed_scope_ids == expected.allowed_scope_ids
+    assert received.writable_scope_ids == (expected.writable_scope_ids if recipient_host == "codex" else frozenset())
+    assert received.capture_scope_id == (expected.capture_scope_id if recipient_host == "codex" else None)
+
+
+def test_preview_preserves_the_global_capture_read_check(tmp_path, capsys, root):
+    from scope_recall.maintenance.shared_grants import verified_donor
+
+    donor, recipient = (tmp_path / f"TEST-{name}" for name in ("donor", "recipient"))
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    home, _ = _installed(tmp_path, "other-agent", workspace="TEST-independent")
+    archive = _moved_aside(home, _routes(home))
+    assert _attach(capsys, home, root, archive, "other-agent", "Other agent")[0] == 0
+    before = _attachment_snapshot(root, donor, recipient)
+    payload = read_shared_payload(root)
+    binding = shared.store_binding(payload, root, frozenset(payload["scope_ids"]))
+    assert verified_donor(root, payload, binding, read_only=False) is None
+    assert verified_donor(root, payload, binding, read_only=True) == "dsh"
+    code, result = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+    assert code == 2 and "other-agent:cli" in result["error"], result
+    assert _attachment_snapshot(root, donor, recipient) == before
+    code, explicit = _attach_client(capsys, root, recipient, host="codex", like="dsh", capture="dsh")
+    assert (code, explicit) == (2, result)
+    assert read_attachment(recipient) is None
+
+
+@pytest.mark.parametrize("location", ["unc", "network-mount", "pointer-root", "foreign-account-local-path"])
+def test_attach_cannot_displace_an_active_entry_at_an_unverified_home(tmp_path, capsys, root, monkeypatch, location):
+    from scope_recall.adapters import attachment_paths
+
+    donor, peer, recipient, mount = (tmp_path / f"TEST-{name}" for name in ("donor", "peer", "recipient", "mount"))
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    assert _attach_client(capsys, root, peer, host="workbuddy", like="dsh", capture="dsh")[0] == 0
+    payload = read_shared_payload(root)
+    remote = (
+        mount / "workbuddy"
+        if location in ("network-mount", "foreign-account-local-path")
+        else Path("//TEST-foreign/share/workbuddy")
+    )
+    if location == "pointer-root":
+        pointer_path = shared_entries.attachment_path(peer)
+        pointer_path.write_text(json.dumps({**_read(pointer_path), "root": str(remote)}), encoding="utf-8")
+    else:
+        entry = next(entry for entry in payload["entries"] if entry["entry_id"] == "workbuddy")
+        entry["home"] = str(remote)
+        if location == "foreign-account-local-path":
+            entry["local_account_id"] = "sid:S-1-0-0" if os.name == "nt" else "uid:4294967294"
+        shared_entries.write_shared_payload(root, payload)
+    if location == "network-mount":
+        if sys.platform == "win32":
+            local_drive = attachment_paths._local_drive
+            monkeypatch.setattr(
+                attachment_paths, "_local_drive", lambda p: not p.is_relative_to(mount) and local_drive(p)
+            )
+        else:
+            probe_name = "_darwin_remote_mount" if sys.platform == "darwin" else "_linux_remote_mount"
+            monkeypatch.setattr(attachment_paths, probe_name, lambda p: p.is_relative_to(mount))
+
+    for method in ("resolve", "stat", "lstat"):
+        original = getattr(Path, method)
+
+        def guard(path, *args, original=original, **kwargs):
+            assert not path.is_relative_to(remote), "collision checks must never probe the previous remote home"
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method, guard)
+    before = _attachment_snapshot(root, donor)
+
+    code, result = _attach_client(capsys, root, recipient, host="workbuddy", like="dsh", capture="dsh")
+
+    assert code == 2 and "already attached" in result["error"], result
+    assert _attachment_snapshot(root, donor) == before
+    assert read_attachment(recipient) is None
+    code, listed = _run(capsys, "entries", "--root", str(root))
+    assert code == 0, listed
+    assert not next(entry for entry in listed["entries"] if entry["entry_id"] == "workbuddy")["pointer_present"]
+
+
+@pytest.mark.parametrize("state", ["detached_at", "recovery_pending"])
+def test_attach_can_replace_a_foreign_home_released_by_detach_or_restore(tmp_path, capsys, root, monkeypatch, state):
+    donor, peer, recipient = (tmp_path / f"TEST-{name}" for name in ("donor", "peer", "recipient"))
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    assert _attach_client(capsys, root, peer, host="workbuddy", like="dsh", capture="dsh")[0] == 0
+    if state == "detached_at":
+        assert _run(capsys, "detach", "--instance-root", str(peer))[0] == 0
+    remote = Path("//TEST-foreign/share/workbuddy")
+    payload = read_shared_payload(root)
+    entry = next(entry for entry in payload["entries"] if entry["entry_id"] == "workbuddy")
+    entry["home"] = str(remote)
+    if state == "recovery_pending":
+        entry[state] = True
+    shared_entries.write_shared_payload(root, payload)
+
+    original = Path.lstat
+
+    def guard(path, *args, **kwargs):
+        assert not path.is_relative_to(remote), "released entries do not need filesystem verification"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", guard)
+    like = None if state == "recovery_pending" else "dsh"
+    code, result = _attach_client(capsys, root, recipient, host="workbuddy", like=like, capture=like)
+
+    assert (code, result["status"]) == (0, "attached"), result
+    restored = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "workbuddy")
+    assert state not in restored
+    assert restored["home"] == str(recipient)
+    assert load_shared_client(recipient, "workbuddy").scope_ids == frozenset(entry["scope_ids"])
+
+
+@pytest.mark.parametrize("change", ["pointer", "recovery", "paused", "invalid-remote-marker"])
+def test_preview_refuses_a_local_peer_conflict_with_another_eligible_donor(tmp_path, capsys, root, monkeypatch, change):
+    from scope_recall.adapters.clients.config import remote_server_config_path
+    from scope_recall.contracts import TrustedContext
+    from scope_recall.core.entry_control import change as change_entry_control
+    from scope_recall.core.storage import SQLiteStorage
+
+    donor, peer, recipient = (tmp_path / f"TEST-{name}" for name in ("donor", "peer", "recipient"))
+    assert _attach_client(capsys, root, donor, host="dsh", like=None, capture=None)[0] == 0
+    assert _attach_client(capsys, root, peer, host="workbuddy", like="dsh", capture="dsh")[0] == 0
+    payload = read_shared_payload(root)
+    if change == "pointer":
+        pointer = shared_entries.attachment_path(peer)
+        document = _read(pointer)
+        document["root"] = "//TEST-foreign/share/store"
+        pointer.write_text(json.dumps(document), encoding="utf-8")
+        resolve = Path.resolve
+
+        def refuse_foreign_path(path, *args, **kwargs):
+            assert not path.as_posix().startswith("//TEST-foreign/"), "never resolve an untrusted pointer's root"
+            return resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", refuse_foreign_path)
+    elif change == "recovery":
+        next(e for e in payload["entries"] if e["entry_id"] == "workbuddy")["recovery_pending"] = True
+        shared_entries.write_shared_payload(root, payload)
+    elif change == "invalid-remote-marker":
+        remote_server_config_path(peer).write_text("{}", encoding="utf-8")
+    else:
+        binding = shared.store_binding(payload, root, frozenset(payload["scope_ids"]))
+        context = TrustedContext(binding, "TEST-peer-paused", binding.scope_ids, "host_generated")
+        with SQLiteStorage(binding).write(context) as tx:
+            change_entry_control(tx, context, "workbuddy", "paused", "TEST-owner", "2026-01-01T00:00:00Z")
+    before = _attachment_snapshot(root, donor, recipient)
+
+    code, result = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+
+    assert code == 2 and "--grants-like" in result["error"], result
+    assert _attachment_snapshot(root, donor, recipient) == before
+
+
+def test_default_preview_reads_uncheckpointed_entries_without_writing(tmp_path, capsys, root):
+    from scope_recall.maintenance.migration_records import open_immutable
+
+    first, donor, recipient = (tmp_path / f"TEST-{name}" for name in ("first", "donor", "recipient"))
+    assert _attach_client(capsys, root, first, host="dsh", like=None, capture=None)[0] == 0
+    database, wal = root / "memory.sqlite3", root / "memory.sqlite3-wal"
+    with closing(sqlite3.connect(database)) as keeper:
+        keeper.execute("PRAGMA journal_mode=WAL")
+        keeper.execute("PRAGMA wal_autocheckpoint=0")
+        assert _attach_client(capsys, root, donor, host="workbuddy", entry="aa", like="dsh", capture="dsh")[0] == 0
+        assert keeper.execute("SELECT host FROM entries WHERE entry_id='aa'").fetchone() == ("workbuddy",)
+        with closing(open_immutable(database)) as checkpoint:
+            assert checkpoint.execute("SELECT host FROM entries WHERE entry_id='aa'").fetchone() is None
+        before, wal_bytes = _attachment_snapshot(root, donor, recipient), wal.read_bytes()
+
+        code, result = _attach_client(capsys, root, recipient, host="codex", like=None, capture=None)
+
+        assert (code, result.get("status"), result.get("donor")) == (0, "review_grants", "aa"), result
+        assert _attachment_snapshot(root, donor, recipient) == before
+        assert wal.read_bytes() == wal_bytes
+        assert cli.main(result["arguments"][1:]) == 0
+
+
 @pytest.mark.parametrize("recipient_host", ["codex", "cherry-studio"])
 @pytest.mark.parametrize("writer_attached", [True, False])
 def test_preview_agrees_on_read_access_across_read_only_and_capture_hosts(

@@ -70,12 +70,14 @@ def test_normalized_quote_maps_back_to_the_literal_source(app, quote, content):
     )
 
 
-def test_repeated_quote_requires_a_verified_occurrence_or_longer_anchor(app):
+@pytest.mark.parametrize("escaped", [False, True])
+def test_repeated_literal_uses_the_first_occurrence_unless_a_valid_hint_selects_another(app, escaped):
     core, ctx = app
-    quote = "TEST-project 配色蓝色。"
+    quote = 'TEST-project 配色为"蓝色"。'
     source = capture(core, ctx, quote + "TEST 后续决定：" + quote)
+    rendered = json.dumps(quote, ensure_ascii=False)[1:-1] if escaped else quote
     start = source.event["content"].rindex(quote)
-    proposal = draft(source, quote_override=quote)
+    proposal = draft(source, quote_override=rendered)
     span = proposal["evidence_spans"][0]
     rejected = []
 
@@ -83,14 +85,27 @@ def test_repeated_quote_requires_a_verified_occurrence_or_longer_anchor(app):
         raw = json.dumps(consolidation_payload(source, claims=[proposal]))
         return decode_consolidation_result(raw, (source,), rejected_items=rejected)["claim_proposals"]
 
-    assert decode() == []
-    assert rejected == [RejectedProposal("claim", "DERIVATION_INVALID", "claim_proposals[0].evidence_spans[0].quote")]
+    first = decode()[0]["evidence_spans"][0]
+    assert (first["quote"], first["start"], first["end"]) == (quote, 0, len(quote))
+    span.update(start=1, end=len(quote) + 1)
+    assert decode()[0]["evidence_spans"][0] == first
     span.update(start=start, end=start + len(quote))
-    assert decode()[0]["evidence_spans"][0]["start"] == start
+    second = decode()[0]["evidence_spans"][0]
+    assert (second["quote"], second["start"], second["end"]) == (quote, start, start + len(quote))
     span.pop("start")
     span.pop("end")
     span["quote"] = "TEST 后续决定：" + quote
     assert decode()[0]["evidence_spans"][0]["start"] == len(quote)
+    assert rejected == []
+
+
+def test_typographic_match_remains_ambiguous_when_the_normalized_quote_is_repeated(app):
+    core, ctx = app
+    literal = "ＴＥＳＴ 配色蓝色。"
+    source = capture(core, ctx, literal + "\n" + literal)
+    proposal = draft(source, quote_override="TEST 配色蓝色。")
+    with pytest.raises(ContractError, match=r"evidence_spans\[0\]\.quote"):
+        align_claim_evidence(proposal, {(source.ref, source.revision): source}, index=0)
 
 
 @pytest.mark.parametrize("version", [None, "wrong", 9])

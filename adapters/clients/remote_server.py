@@ -53,15 +53,16 @@ from ...runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 from ..host_profiles import HERMES_MAX_FACT_BYTES
 from . import transcript
 from .boundary import IN_CONTEXT_FIELD, without_lone_surrogates
+from .config import REMOTE_SERVER_CONFIG_FILENAME as CONFIG_NAME
 from .config import CodexConfigError, SharedClientConfig, load_server_entry
 from .config import load_remote_client as load_shared_client
+from .config import remote_server_config_path as config_path
 from .handler import CodexHookHandler, SystemHookClock
 from .identity import resolve_runtime_audience, trusted_context
 from .local_endpoint import KeptRecaller, entry_files, file_stamp
 from .record_reader import RecordLines
 from .remote_client import _private_drop, direct_owner_command, eligible_body, owner_prompt
 
-CONFIG_NAME = "remote-server.json"
 LOG_NAME = "remote-server.log"
 #: The log is kept to about this size, with two older copies.
 LOG_BYTES = 1024 * 1024
@@ -135,10 +136,6 @@ class RemoteServerConfig:
     listen: str
     port: int
     token_sha256: str
-
-
-def config_path(home: Path) -> Path:
-    return home / "scope-recall" / CONFIG_NAME
 
 
 def _listen_address(value: object) -> str:

@@ -149,11 +149,10 @@
    "reportArgumentType": 2
   },
   "maintenance/legacy_catalog.py": {
-   "reportArgumentType": 3,
+   "reportArgumentType": 1,
    "reportAttributeAccessIssue": 2
   },
   "maintenance/legacy_conversion.py": {
-   "reportArgumentType": 4,
    "reportAttributeAccessIssue": 1
   },
   "maintenance/legacy_sources.py": {
@@ -164,19 +163,16 @@
    "reportArgumentType": 1
   },
   "maintenance/migration_activation.py": {
-   "reportArgumentType": 6
+   "reportArgumentType": 2
   },
   "maintenance/migration_index.py": {
    "reportArgumentType": 2
-  },
-  "maintenance/migration_records.py": {
-   "reportArgumentType": 1
   },
   "maintenance/package_health.py": {
    "reportArgumentType": 3
   },
   "maintenance/package_upgrade.py": {
-   "reportArgumentType": 6
+   "reportArgumentType": 1
   },
   "maintenance/shared.py": {
    "reportOptionalMemberAccess": 1

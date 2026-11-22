@@ -1,4 +1,4 @@
-"""Hold the native SQLite file lock for an offline compaction parent process."""
+"""Coordinate native SQLite read locks and exclusive offline publication."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ SCRIPT_PATH = Path(__file__).resolve()
 
 _WINDOWS_LOCK_OFFSET = 1 << 30
 _WINDOWS_LOCK_BYTES = 512
+_SHARED_FIRST = _WINDOWS_LOCK_OFFSET + 2
+_SHARED_SIZE = _WINDOWS_LOCK_BYTES - 2
 STAGE_PREFIX = ".scope-recall-compact-"
 
 
@@ -44,6 +46,57 @@ def _acquire(source: BinaryIO) -> bool:
     return False
 
 
+def _acquire_shared(source: BinaryIO) -> bool:
+    """Keep the last SQLite connection from unlinking its WAL while a preview opens."""
+    if sys.platform == "win32":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("internal", ctypes.c_size_t),
+                ("internal_high", ctypes.c_size_t),
+                ("offset", wintypes.DWORD),
+                ("offset_high", wintypes.DWORD),
+                ("event", wintypes.HANDLE),
+            ]
+
+        lock = ctypes.WinDLL("kernel32", use_last_error=True).LockFileEx
+        lock.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(Overlapped),
+        )
+        lock.restype = wintypes.BOOL
+        # FAIL_IMMEDIATELY without EXCLUSIVE_LOCK lets ordinary WAL writers commit.
+        position = Overlapped(offset=_SHARED_FIRST)
+        return bool(lock(msvcrt.get_osfhandle(source.fileno()), 1, 0, _SHARED_SIZE, 0, ctypes.byref(position)))
+    if os.name == "posix":
+        import fcntl
+
+        fcntl.lockf(source.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB, _SHARED_SIZE, _SHARED_FIRST)
+        return True
+    return False
+
+
+def _read_guard(path: Path) -> int:
+    """Hold a shared lock on a read-only descriptor until the parent closes its pipe."""
+    with path.open("rb", buffering=0) as source:
+        if not _acquire_shared(source):
+            return 2
+        header = source.read(20)
+        sys.stdout.buffer.write(
+            b"W" if header.startswith(b"SQLite format 3\0") and header[18:] == b"\x02\x02" else b"R"
+        )
+        sys.stdout.buffer.flush()
+        sys.stdin.buffer.read(1)
+        return 0
+
+
 def _publish(source: Path, expected: tuple[int, ...], request: str) -> int:
     """Link one validated staging file while this process still owns the source lock."""
     if not request.endswith("\n"):
@@ -73,6 +126,11 @@ def _publish(source: Path, expected: tuple[int, ...], request: str) -> int:
 
 def _main(argv: list[str]) -> int:
     """Lock one physical file and publish at most one fully received request."""
+    if len(argv) == 2 and argv[0] == "--read-guard":
+        try:
+            return _read_guard(Path(argv[1]))
+        except OSError:
+            return 2
     if len(argv) != 5:
         return 2
     path = Path(argv[0])

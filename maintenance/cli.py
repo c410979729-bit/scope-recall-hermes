@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import sqlite3
@@ -44,7 +45,13 @@ from .install_hermes import LOCAL_PLATFORM_CHOICES
 
 
 def _emit(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    """Write one UTF-8 JSON receipt, including when the caller redirects a legacy Windows stream."""
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        sys.stdout.write(text)
+    else:
+        stream.write(text.encode("utf-8", errors="backslashreplace"))
 
 
 def _path(value: str, field: str) -> Path:
@@ -685,7 +692,7 @@ def _report_other_tables(result: dict[str, Any], database: Path) -> None:
 
 
 def _compact_store(args: argparse.Namespace) -> int:
-    """Run offline compaction and emit only a metadata receipt."""
+    """Emit a read-only estimate or a verified offline compaction receipt."""
     if args.apply != (args.output is not None):
         raise BackupError("--output is required with --apply and unavailable with --dry-run")
     try:
@@ -775,7 +782,7 @@ _COMMANDS: tuple[
     ),
     (
         "compact-store",
-        "inspect or compact a separate copy of an offline SQLite store",
+        "preview live SQLite storage or compact a separate offline copy",
         _add_compact_store_arguments,
         _compact_store,
     ),
@@ -789,6 +796,9 @@ def _subparser(sub, name: str, help_text: str | None) -> argparse.ArgumentParser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run a maintenance command. The installed CLI also owns its redirected output encoding."""
+    if argv is None and isinstance(sys.stdout, io.TextIOWrapper) and not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     arguments = sys.argv[1:] if argv is None else argv
     if arguments and arguments[0] in _DELEGATED:
         return _DELEGATED[arguments[0]][1](arguments)

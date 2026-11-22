@@ -114,14 +114,22 @@ A cold rollback can return to the pre-upgrade snapshot when no later deletion, w
 4. Replace `memory.sqlite3` with the pre-upgrade snapshot and delete the old `memory.sqlite3-wal` and `memory.sqlite3-shm`, which belong to the replaced newer store.
 5. Open with 3.16, verify the restored memories, and then restart hosts and workers.
 
-## Compact an offline SQLite copy
+## Preview and compact SQLite storage
 
-Stop the processes using the source database and preview the eligible records. To create a smaller file, choose a new path in an existing directory.
-On Linux and macOS, the account needs write permission on the source file to acquire SQLite's exclusive lock. The command writes database content only to the new copy.
+Preview reclaimable data while the store is running. The command copies one committed SQLite snapshot, including its write-ahead log, and releases the source before counting rows and search terms. For stores over 16 MiB, the system temporary directory needs room for one database copy. The temporary file receives the source's access restrictions before any data is copied and is removed when the command exits normally.
 
 ```sh
 scope-recall compact-store --source /path/to/memory.sqlite3 --dry-run
+```
+
+To create a smaller file, stop every process using the source database and choose a new path in an existing directory. On Linux and macOS, the account needs write permission on the source file to acquire SQLite's exclusive lock. The command verifies the new database and its foreign keys before publishing it.
+
+```sh
 scope-recall compact-store --source /path/to/memory.sqlite3 --apply --output /path/to/archive/compacted.sqlite3
 ```
 
-The default retention period is 180 days. Use `--retention-days` to set a different age. The command trims large staged payloads of completed consolidation work and redundant evidence lists of obsolete evaluations. It checks the resulting SQLite file and its foreign keys before publishing the copy. Raw source messages, current facts, permissions and deletion records stay in the copy. A full backup also includes the store's other files.
+The default retention period is 30 days. Use `--retention-days` to change when retired candidate and consolidation data becomes eligible. With `--retention-days 0`, eligible records must still be older than the command's UTC cutoff. A waiting candidate keeps the evidence and triggers that can wake it. Old questions on a current revision keep their fingerprints so that withdrawing newer evidence cannot cause a duplicate model call. The copy drops redundant evidence lists and eligible unattempted evaluations of closed revisions. It retains outstanding work, model attempts, their outcomes and formal claims.
+
+The command rebuilds stale search postings for already indexed long tool outputs using their first and last excerpts. For historical tool outputs of any length, it removes indexed terms outside the public text. Detected credentials in the public text remove that source's postings. Cleaning a private section or transport envelope can only narrow its existing terms. Blocked and held sources keep their access protections. Raw source text and deletion records stay in the copy. A full backup also includes the store's other files.
+
+The receipt gives logical row and byte counts. Payload estimates count stored values. The lexical estimate counts 16 bytes per source posting and eight bytes plus the UTF-8 text length per term, with new postings and terms deducted. Terms still used by a source or fact remain in the dictionary. SQLite pages, record overhead, reverse indexes and already free pages affect physical savings. For a completed copy, compare `output_bytes` with `source_bytes` to see the actual SQLite file size change.

@@ -29,7 +29,7 @@ import json
 from typing import Iterable
 
 from ..contracts import ContractError, utc_timestamp
-from .events import WITHHELD_TOOL_OUTPUT_SQL, indexed_terms, lexical_terms, withheld_tool_output
+from .events import WITHHELD_TOOL_OUTPUT_SQL, lexical_terms, source_lexical_projection, withheld_tool_output
 from .recall_policy import claim_embedding_text
 
 #: ``t`` is the term, ``p`` the posting, ``e`` the source version.
@@ -65,13 +65,19 @@ def index_terms(conn, source: int, terms: Iterable[str]) -> int:
 
 def terms_of(conn, source: int) -> tuple[str, ...]:
     """The terms recorded for one source version, in term order: one row, whatever the count (``index_terms``)."""
-    row = conn.execute(
-        "SELECT json_group_array(t.term) FROM lexical_postings p JOIN lexical_terms t ON t.term_id=p.term_id "
-        "WHERE p.source_id=?",
-        (source,),
-    ).fetchone()
+    return terms_for_sources(conn, (source,))[source]
+
+
+def terms_for_sources(conn, sources: Iterable[int]) -> dict[int, tuple[str, ...]]:
+    """Read the terms per source version in one statement for a bounded page."""
+    rows = conn.execute(
+        "SELECT j.value,(SELECT json_group_array(t.term) FROM lexical_postings p "
+        "JOIN lexical_terms t ON t.term_id=p.term_id WHERE p.source_id=j.value) FROM json_each(?) j",
+        (json.dumps(tuple(sources)),),
+    )
+    # One reverse-index range per ID returns one aggregate, including empty ranges.
     # Python orders strings by code point, as SQLite's binary collation orders their UTF-8.
-    return tuple(sorted(json.loads(row[0])))
+    return {source: tuple(sorted(json.loads(terms))) for source, terms in rows}
 
 
 def forget(conn, event_id: str) -> None:
@@ -153,16 +159,21 @@ def unindex_withheld(conn, scope_ids: Iterable[str], *, after_id: int, limit: in
     ).fetchall()
     page = rows[:limit]
     whole: list[int] = []  # placeholders indexed by nothing
-    beyond: list[tuple[int, tuple[str, ...]]] = []  # those indexed by their error text, holding more than its terms
+    beyond: list[tuple[int, tuple[str, ...], int]] = []  # placeholders indexed by their error text
     for source, role, content in page:
         event = {"role": role, "content": content}
         if not withheld_tool_output(event):
             continue
-        keep = indexed_terms(event)
+        keep, may_add = source_lexical_projection(event)
         if not keep:
             whole.append(source)
-        elif terms_of(conn, source) != keep:
-            beyond.append((source, keep))
+            continue
+        existing = terms_of(conn, source)
+        allowed = set(keep)
+        if not may_add:
+            keep = tuple(term for term in existing if term in allowed)
+        if existing != keep:
+            beyond.append((source, keep, len(set(existing) - allowed)))
     if dry_run:
         postings = (
             0
@@ -171,10 +182,10 @@ def unindex_withheld(conn, scope_ids: Iterable[str], *, after_id: int, limit: in
                 f"SELECT COUNT(*) FROM lexical_postings WHERE source_id IN ({','.join('?' for _ in whole)})", whole
             ).fetchone()[0]
         )
-        postings += sum(len(set(terms_of(conn, source)) - set(keep)) for source, keep in beyond)
+        postings += sum(removed for _, _, removed in beyond)
     else:
         postings = unindex(conn, whole)
-        for source, keep in beyond:
+        for source, keep, _ in beyond:
             postings += unindex_beyond(conn, source, keep)
             index_terms(conn, source, keep)
     return {
@@ -406,6 +417,7 @@ __all__ = [
     "forget",
     "index_terms",
     "source_id",
+    "terms_for_sources",
     "terms_of",
     "unindex",
     "unindex_beyond",

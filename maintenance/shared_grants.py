@@ -3,26 +3,28 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from collections.abc import Sequence
-from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from ..adapters.attachment_paths import UnverifiedAttachmentPath, local_attachment_stat, same_local_path
 from ..adapters.audiences import LOCAL_PLATFORMS, LOCAL_USER_ID, HermesIdentityError
-from ..adapters.clients.config import CodexConfigError, load_shared_client
-from ..adapters.hermes.identity import bind_hermes_identity
+from ..adapters.clients.config import CodexConfigError, load_shared_client, remote_server_config_path
 from ..adapters.hermes.installation import InstallationManifest, build_installation_manifest
 from ..adapters.host_identity import matches_owner_principal
 from ..adapters.shared_entries import read_attachment, read_shared_payload
-from ..contracts import CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, TrustedContext
+from ..contracts import CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
 from ..core.entry_control import entry_fence_for_keys, local_account_matches
 from ..core.restore import restore_pending
 from ..core.storage import SQLiteStorage, Transaction
+from ..core.store_upgrade import upgrade_in_progress
+from ..core.truth_connection import TruthDatabaseConnectionError
+from .install_common import RUNTIME_CONFIG_LIMIT
 from .install_hermes import DEFAULT_AGENT_WORKSPACE
-from .legacy_catalog import offline_source_path
-from .migration_records import MigrationError, open_immutable
 from .shared_run import SharedStoreError
+from .store_snapshot import read_store_snapshot
 
 
 def _local_owner(row: dict) -> bool:
@@ -57,6 +59,39 @@ def fresh_installation(
     return replace(manifest, agent_identity=agent_identity)
 
 
+def _other_entries(payload: dict[str, Any], entry_id: str | None, *, read_only: bool) -> dict[str, dict]:
+    """Return the attached entries relevant to read or capture grants for the recipient."""
+    return {
+        entry["entry_id"]: entry
+        for entry in payload["entries"]
+        if not entry.get("detached_at")
+        and entry["entry_id"] != entry_id
+        and (read_only or entry["host"] not in READ_ONLY_CLIENT_HOSTS)
+    }
+
+
+def _capture_scope(owners: dict[str, list[dict]], capture_like: str) -> str:
+    """Return the source's single capture scope if every relevant owner row can read it."""
+    captures = {row["capture_scope_id"] for row in owners[capture_like]}
+    if len(captures) != 1:
+        raise SharedStoreError(
+            f"{capture_like}'s owner rows capture into {len(captures)} scopes; name an entry with one"
+        )
+    capture = next(iter(captures))
+    unread = sorted(
+        f"{name}:{row['platform']}"
+        for name, rows in owners.items()
+        for row in rows
+        if capture not in row["allowed_scope_ids"]
+    )
+    if unread:
+        raise SharedStoreError(
+            f"{capture_like}'s capture scope is not read by these owner rows: {', '.join(unread)}; "
+            "what the owner says in the client would not reach them"
+        )
+    return capture
+
+
 def client_grants(
     payload: dict[str, Any],
     home: Path,
@@ -71,13 +106,7 @@ def client_grants(
     The first entry gets the default owner's scope. Later entries must reference
     attached donors. A write target must be readable by every other owner entry.
     """
-    entries = {
-        entry["entry_id"]: entry
-        for entry in payload["entries"]
-        if not entry.get("detached_at")
-        and entry["entry_id"] != entry_id
-        and (read_only or entry["host"] not in READ_ONLY_CLIENT_HOSTS)
-    }
+    entries = _other_entries(payload, entry_id, read_only=read_only)
     if not entries:
         if like or capture_like:
             raise SharedStoreError(
@@ -106,23 +135,7 @@ def client_grants(
         raise SharedStoreError(f"not other entries attached to this store: {', '.join(unknown)}")
     allowed = {scope for name in names for row in others[name] for scope in row["allowed_scope_ids"]}
     writable = {scope for name in names for row in others[name] for scope in row["writable_scope_ids"]}
-    captures = {row["capture_scope_id"] for row in others[capture_like]}
-    if len(captures) != 1:
-        raise SharedStoreError(
-            f"{capture_like}'s owner rows capture into {len(captures)} scopes; name an entry with one"
-        )
-    capture = next(iter(captures))
-    unread = sorted(
-        f"{name}:{row['platform']}"
-        for name, rows in others.items()
-        for row in rows
-        if capture not in row["allowed_scope_ids"]
-    )
-    if unread:
-        raise SharedStoreError(
-            f"{capture_like}'s capture scope is not read by these owner rows: {', '.join(unread)}; "
-            "what the owner says in the client would not reach them"
-        )
+    capture = _capture_scope(others, capture_like)
     return allowed | {capture}, writable | {capture}, capture
 
 
@@ -164,27 +177,43 @@ def matching_donor(entries: list[dict], *, read_only: bool) -> str | None:
     return min(donors, default=None)
 
 
-def _runtime_owner_matches(root: Path, entry: dict, binding) -> bool:
+def _local_clients(root: Path, entries: list[dict]) -> list[dict]:
+    """Find local client peers; a broken pointer on a known local home is a conflict."""
+    clients = []
+    for entry in entries:
+        if entry["host"] not in CLIENT_HOSTS or not local_account_matches(entry.get("local_account_id")):
+            continue
+        home = Path(entry["home"])
+        try:
+            info = local_attachment_stat(home)
+        except UnverifiedAttachmentPath:
+            continue
+        if info is None:
+            continue
+        pointer = read_attachment(home, local_only=True)
+        if (
+            pointer is None
+            or (pointer.entry_id, pointer.host) != (entry["entry_id"], entry["host"])
+            or not same_local_path(pointer.root, root)
+        ):
+            raise HermesIdentityError("local client attachment no longer matches the shared store")
+        remote = local_attachment_stat(remote_server_config_path(home))
+        if remote is None:
+            clients.append(entry)
+        else:
+            from ..adapters.clients.remote_server import load_server_config
+
+            if not stat.S_ISREG(remote.st_mode) or remote.st_size > RUNTIME_CONFIG_LIMIT:
+                raise HermesIdentityError("remote entry configuration is invalid")
+            load_server_config(home, entry["host"])
+    return clients
+
+
+def _runtime_owner_matches(root: Path, entry: dict, binding: InstanceBinding) -> bool:
     """Compare the installed entry's real local route with the owner grants to be copied."""
-    home = Path(entry["home"])
     entry_id, host = entry["entry_id"], entry["host"]
-    pointer = read_attachment(home)
-    # Avoid opening a store named by a pointer to a different installation.
-    if pointer is None or (pointer.root, pointer.entry_id, pointer.host) != (root, entry_id, host):
-        return False
-    if host == "hermes":
-        identity = bind_hermes_identity(
-            "attach-preview",
-            hermes_home=home,
-            platform="cli",
-            user_id=LOCAL_USER_ID,
-            agent_identity=entry.get("agent_identity") or binding.agent_id,
-            agent_workspace=DEFAULT_AGENT_WORKSPACE,
-        )
-        manifest, audience = identity.manifest, identity.runtime_audience
-    else:
-        client = load_shared_client(home, host)
-        manifest, audience = client.manifest, client.audience
+    client = load_shared_client(Path(entry["home"]), host, expected_store=root)
+    manifest, audience = client.manifest, client.audience
     owner = entry["audience_scopes"]["owner_private"]
     row = owner_rows(entry)[0]
     return (
@@ -202,56 +231,65 @@ def _runtime_owner_matches(root: Path, entry: dict, binding) -> bool:
     )
 
 
-def _checkpoint_stamp(storage: SQLiteStorage):
-    """Require an offline view before using SQLite's side-effect-free reader."""
-    if restore_pending(storage.binding.data_directory):
-        return None
-    offline_source_path(storage.path)
-    return storage._file_stamp()
-
-
-def _registered_owners_match(active, binding) -> bool:
-    """Read registry and entry state only from an unchanged, journal-free database."""
+def _registered_owners_match(clients: list[dict], binding: InstanceBinding) -> bool:
+    """Verify local registrations and entry state in one current read snapshot."""
     storage = SQLiteStorage(binding, upgrade_on_open=False)
-    stamp = _checkpoint_stamp(storage)
-    if stamp is None:
+    root = binding.data_directory
+    if restore_pending(root) or upgrade_in_progress(root):
         return False
     context = TrustedContext(binding, "attach-preview", binding.scope_ids, "host_generated")
-    # A normal read-only SQLite connection may still create WAL and SHM files.
-    with closing(open_immutable(storage.path)) as conn:
+    with read_store_snapshot(storage.path) as conn:
         storage.verify(conn)
         tx = Transaction(conn, context, writable=False)
-        registered = tx.registry.entries()
-        states = entry_fence_for_keys(tx, (entry["entry_id"] for entry in active))
+        try:
+            registered = tx.registry.entries()
+            states = entry_fence_for_keys(tx, (entry["entry_id"] for entry in clients))
+        finally:
+            tx._finish()
     return (
-        _checkpoint_stamp(storage) == stamp
-        and all(registered.get(e["entry_id"], {}).get("host") == e["host"] for e in active)
+        not (restore_pending(root) or upgrade_in_progress(root))
+        and all(registered.get(e["entry_id"], {}).get("host") == e["host"] for e in clients)
         and all(state == "normal" for state, _ in states.values())
     )
 
 
-def verified_donor(root: Path, payload: dict, binding, *, read_only: bool) -> str | None:
-    """Return the matching donor only if its peer attachments and current store controls agree."""
-    active = [entry for entry in payload["entries"] if not entry.get("detached_at")]
+def verified_donor(
+    root: Path,
+    payload: dict,
+    binding: InstanceBinding,
+    *,
+    read_only: bool,
+    target_entry_id: str | None = None,
+    explain_capture_conflict: bool = False,
+) -> str | None:
+    """Return a local donor usable by the recipient, optionally reporting conflicting owner rows."""
+    active = _other_entries(payload, target_entry_id, read_only=True)
     try:
-        donor = matching_donor(active, read_only=read_only)
+        clients = _local_clients(root, list(active.values()))
+        donor = matching_donor(clients, read_only=read_only)
         if (
             donor is not None
-            and all(_runtime_owner_matches(root, entry, binding) for entry in active)
-            and _registered_owners_match(active, binding)
+            and all(_runtime_owner_matches(root, entry, binding) for entry in clients)
+            and _registered_owners_match(clients, binding)
             and read_shared_payload(root) == payload
         ):
+            if not read_only:
+                entries = _other_entries(payload, target_entry_id, read_only=False)
+                _capture_scope({name: owner_rows(entry) for name, entry in entries.items()}, donor)
             return donor
+    except SharedStoreError:
+        if explain_capture_conflict:
+            raise
     except (
         CodexConfigError,
         ContractError,
         HermesIdentityError,
         KeyError,
-        MigrationError,
         OSError,
+        TruthDatabaseConnectionError,
         TypeError,
         ValueError,
         sqlite3.Error,
     ):
-        return None
+        pass
     return None

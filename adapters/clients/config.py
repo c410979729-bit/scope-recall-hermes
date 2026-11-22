@@ -16,6 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from scope_recall.adapters.attachment_paths import same_local_path
 from scope_recall.adapters.audiences import LOCAL_USER_ID
 from scope_recall.adapters.host_identity import (
     HermesRuntimeScope,
@@ -38,6 +39,8 @@ from scope_recall.host_registry import HOSTS, REMOTE_HOSTS
 from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 
 from ..installation_identity import path_identity
+
+REMOTE_SERVER_CONFIG_FILENAME = "remote-server.json"
 
 
 class CodexConfigError(RuntimeError):
@@ -220,9 +223,14 @@ class SharedClientConfig:
         return self.manifest.to_binding()
 
 
-def load_shared_client(home: Path | str, host: str) -> SharedClientConfig:
-    """Bind a local client using the entry's OS-account approval."""
-    return _load_shared_client(home, host, local=True)
+def remote_server_config_path(home: Path) -> Path:
+    """The server-side configuration of a token-authorized remote entry."""
+    return attachment_path(home).with_name(REMOTE_SERVER_CONFIG_FILENAME)
+
+
+def load_shared_client(home: Path | str, host: str, *, expected_store: Path | None = None) -> SharedClientConfig:
+    """Bind a local client, optionally confining discovery to one already verified store path."""
+    return _load_shared_client(home, host, local=True, expected_store=expected_store)
 
 
 def load_remote_client(home: Path | str, host: str) -> SharedClientConfig:
@@ -232,19 +240,24 @@ def load_remote_client(home: Path | str, host: str) -> SharedClientConfig:
     return _load_shared_client(home, host, local=False)
 
 
-def _load_shared_client(home: Path | str, host: str, *, local: bool) -> SharedClientConfig:
+def _load_shared_client(
+    home: Path | str, host: str, *, local: bool, expected_store: Path | None = None
+) -> SharedClientConfig:
     """The entry ``home`` is of a shared store, for the client ``host``."""
     if host not in CLIENT_HOSTS:
         raise CodexConfigError(f"host must be one of {', '.join(CLIENT_HOSTS)}")
     path = Path(home).expanduser()
     if not path.is_absolute():
         raise CodexConfigError("home must be absolute")
-    path = path.resolve()
+    if expected_store is None:
+        path = path.resolve()
     try:
-        attachment = read_attachment(path)
+        attachment = read_attachment(path, local_only=expected_store is not None)
         if attachment is None:
             raise CodexConfigError("home is not attached to a shared store")
-        manifest = shared_entry_manifest(attachment.root, attachment.entry_id, hermes_home=path)
+        if expected_store is not None and not same_local_path(attachment.root, expected_store):
+            raise CodexConfigError("home points to another shared store")
+        manifest = shared_entry_manifest(expected_store or attachment.root, attachment.entry_id, hermes_home=path)
     except HermesIdentityError as exc:
         raise CodexConfigError(str(exc)) from exc
     if attachment.host != host or manifest.entry_host != host:

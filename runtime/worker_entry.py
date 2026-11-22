@@ -33,6 +33,7 @@ from ..core.backup_primitives import BackupError, backup_deadline
 from ..core.failure_retry import retry_class
 from ..core.file_lock import advisory_file_lock
 from ..core.storage import SQLiteStorage
+from ..core.worker_entities import ENTITY_NAME_LEASED
 from ..core.writer_lease import TruthWriterBusyError
 from .backup_upkeep import BACKUP_JOB_SECONDS, backup_if_due, record_backup_job_failure
 from .instance import build_runtime_instance
@@ -478,8 +479,16 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
         purge_only=reserved == 0,
         remaining_seconds=min(config.drain_seconds, max(0.001, deadline - time.monotonic())),
     )
-    # Purge never spends the optional enrichment budget.
-    used = sum(item.work_type != "purge" for item in receipt.items)
+    # Purge and a name reservation refusal do not spend the enrichment budget.
+    used = sum(
+        item.work_type != "purge"
+        and not (
+            item.work_type == "rebuild_projection"
+            and item.disposition == "deferred"
+            and item.error_code == ENTITY_NAME_LEASED
+        )
+        for item in receipt.items
+    )
     budget_state["used"] -= max(0, reserved - used)
     write_worker_metadata(budget_path, budget_state)
     background_gaps = tuple(instance.background_gaps)

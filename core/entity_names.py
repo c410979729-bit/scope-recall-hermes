@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 from difflib import SequenceMatcher
 
-from ..contracts import ContractError, utc_timestamp
+from ..contracts import ContractError
 from .aliases import ENTITY_KINDS
 from .fact_identity import normalize_fact_component
+from .work_storage import _lease_remaining
 
 
 def audience(context, scope):
@@ -95,7 +96,7 @@ def index_claim(tx, version):
             continue
         key = audience(tx.context, version.scope_id)
         existing = conn.execute(
-            "SELECT name_id,terms FROM entity_names WHERE audience=? AND name=?", (key, name)
+            "SELECT name_id,terms,work_id FROM entity_names WHERE audience=? AND name=?", (key, name)
         ).fetchone()
         if existing is None:
             name_id = conn.execute(
@@ -109,6 +110,14 @@ def index_claim(tx, version):
             ).fetchone()[0]
         else:
             name_id = existing[0]
+            # Reattaching a mention must not revive a reservation that lost its mention.
+            if existing[2] is not None:
+                conn.execute(
+                    "UPDATE entity_names SET work_id=NULL WHERE name_id=? AND EXISTS ("
+                    "SELECT 1 FROM work_items w WHERE w.work_id=entity_names.work_id "
+                    "AND w.subject_ref=? AND w.subject_revision=?)",
+                    (name_id, version.ref, version.revision),
+                )
             if name == version.payload["subject"] and not existing[1]:
                 conn.execute("UPDATE entity_names SET terms=? WHERE name_id=?", (" ".join(grams(name)), name_id))
         conn.execute(
@@ -117,15 +126,23 @@ def index_claim(tx, version):
         )
 
 
+def _pending_names(tx, ref, revision):
+    return tx._check().execute(
+        "SELECT n.name,n.work_id FROM entity_name_mentions m JOIN entity_names n USING(name_id) "
+        "WHERE m.claim_ref=? AND m.claim_revision=? AND n.status='pending' ORDER BY n.name",
+        (ref, revision),
+    )
+
+
 def pending_names(tx, source):
     """Read only the names of this fact which have no current judgement receipt."""
-    return tuple(
-        row[0]
-        for row in tx._check().execute(
-            "SELECT n.name FROM entity_name_mentions m JOIN entity_names n USING(name_id) "
-            "WHERE m.claim_ref=? AND m.claim_revision=? AND n.status='pending' ORDER BY n.name",
-            (source.ref, source.revision),
-        )
+    return tuple(row[0] for row in _pending_names(tx, source.ref, source.revision))
+
+
+def owns_pending_names(tx, item, names):
+    """Verify the whole pending set is unchanged and still reserved by this job."""
+    return tuple(tuple(row) for row in _pending_names(tx, item.subject_ref, item.subject_revision)) == tuple(
+        (name, item.work_id) for name in names
     )
 
 
@@ -147,25 +164,32 @@ def backfill_names(tx, scope, *, limit=7):
     return conn.execute(query, (*namespace, 1)).fetchone() is None
 
 
-def reserve_names(tx, source, item, now):
-    """Reuse the projection lease to prevent concurrent facts paying for the same name."""
+def reserve_names(tx, item, now):
+    """Reserve all pending names, or report seconds until the first active holder expires."""
     conn = tx._check(write=True)
     if not tx.work._verify_lease(*item.lease, now=now):
         raise ContractError("VERSION_CONFLICT", "entity_lease")
-    blocked = conn.execute(
-        "SELECT 1 FROM entity_name_mentions m JOIN entity_names n USING(name_id) "
+    holders = conn.execute(
+        "SELECT DISTINCT w.lease_until FROM entity_name_mentions m JOIN entity_names n USING(name_id) "
         "JOIN work_items w ON w.work_id=n.work_id "
-        "WHERE m.claim_ref=? AND n.status='pending' AND w.work_id!=? "
-        "AND (w.state IN ('pending','failed') OR (w.state='leased' AND w.lease_until>?)) LIMIT 1",
-        (source.ref, item.work_id, utc_timestamp(now)),
-    ).fetchone()
-    if blocked:
-        raise ContractError("VERSION_CONFLICT", "entity_name_lease")
+        "WHERE m.claim_ref=? AND m.claim_revision=? AND n.status='pending' AND w.work_id!=? "
+        "AND w.work_type='rebuild_projection' AND w.state='leased' "
+        "AND w.lease_owner IS NOT NULL AND w.lease_until IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM entity_name_mentions owner JOIN claims c ON c.claim_id=owner.claim_ref "
+        "WHERE owner.name_id=n.name_id AND owner.claim_ref=w.subject_ref AND owner.claim_revision=w.subject_revision "
+        "AND c.current_revision=owner.claim_revision)",
+        (item.subject_ref, item.subject_revision, item.work_id),
+    )
+    waits = (_lease_remaining(row[0], now) for row in holders)
+    wait = min((seconds for seconds in waits if seconds > 0), default=0.0)
+    if wait:
+        return wait
     conn.execute(
         "UPDATE entity_names SET work_id=? WHERE status='pending' AND name_id IN "
-        "(SELECT name_id FROM entity_name_mentions WHERE claim_ref=?)",
-        (item.work_id, source.ref),
+        "(SELECT name_id FROM entity_name_mentions WHERE claim_ref=? AND claim_revision=?)",
+        (item.work_id, item.subject_ref, item.subject_revision),
     )
+    return 0.0
 
 
 def checked(tx, source, name, target=None, alias=None):
@@ -187,14 +211,17 @@ def checked(tx, source, name, target=None, alias=None):
     )
 
 
-def ineligible(tx, ref):
+def ineligible(tx, ref, revision):
     """Exclude an inadmissible mention and hand a pending name to its next usable fact."""
     conn = tx._check(write=True)
-    conn.execute("UPDATE entity_name_mentions SET usable=0 WHERE claim_ref=?", (ref,))
+    conn.execute(
+        "UPDATE entity_name_mentions SET usable=0 WHERE claim_ref=? AND claim_revision=?",
+        (ref, revision),
+    )
     conn.execute(
         "UPDATE entity_names SET status='pending' WHERE status='pending' AND name_id IN "
-        "(SELECT name_id FROM entity_name_mentions WHERE claim_ref=?)",
-        (ref,),
+        "(SELECT name_id FROM entity_name_mentions WHERE claim_ref=? AND claim_revision=?)",
+        (ref, revision),
     )
 
 
@@ -289,7 +316,6 @@ def restore_review_controls(tx, controls):
     """Restore reviewed controls after version restoration, without declaring a withdrawal."""
     fields = (
         "status",
-        "work_id",
         "source_ref",
         "source_revision",
         "target_ref",
@@ -301,8 +327,11 @@ def restore_review_controls(tx, controls):
         changed = (
             tx._check(write=True)
             .execute(
-                "UPDATE entity_names SET " + ",".join(name + "=?" for name in fields) + " WHERE name_id=?",
-                (*[row[name] for name in fields], row["name_id"]),
+                "UPDATE entity_names SET "
+                + ",".join(name + "=?" for name in fields)
+                # A review snapshot cannot reinstate a reservation from a previous lease.
+                + ",work_id=CASE WHEN status='pending' AND ?='pending' THEN work_id END WHERE name_id=?",
+                (*[row[name] for name in fields], row["status"], row["name_id"]),
             )
             .rowcount
         )

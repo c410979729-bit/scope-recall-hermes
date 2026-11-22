@@ -1,22 +1,9 @@
-"""Operator commands for a shared store, the one store every agent attaches to.
+"""Manage the entries, grants and model routes of a shared store.
 
-``init-shared`` makes the store's directory and manifest.  ``attach`` makes a
-host's home an entry of it, carrying over the grants the home's own
-installation had, and writes the runtime configs: the entry's, and the shared
-worker's.  ``grants`` shows an attached entry's grants and changes them from
-an edited copy.  ``detach`` undoes ``attach`` for one home.  ``adopt`` records the store's
-new directory after the directory was copied elsewhere.  ``entries`` lists who
-is attached and when each was last heard from.  ``import-entry`` copies what
-an entry's own store held, moved aside at attach, into the shared store
-(``shared_import.py``).
-
-The store's directory holds everything memory needs, so moving to another
-machine is copying that directory, ``adopt``, and attaching each agent again.
-Every write command keeps a copy of each file it replaces and leaves a receipt
-under the store's ``receipts/``.  Hermes homes attach with the grants their own
-installation had; a local client (Codex, Claude Code, WorkBuddy, dsh) has none
-of its own and attaches as the owner, with grants taken from the owner rows of
-entries already attached, or, as the store's first entry, a fresh installation's.
+Attach registers a home and writes its pointer. Detach releases it. Adopt records a moved
+store, and import-entry copies data from a previous installation. A write saves the files it
+replaces and records a receipt in the store. Hermes entries carry their existing grants.
+Local clients bind to owner scopes.
 """
 
 from __future__ import annotations
@@ -27,6 +14,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -37,6 +25,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from ..adapters.attachment_paths import local_attachment_stat, same_local_path
 from ..adapters.clients.config import CONFIG_FILENAME as CODEX_CONFIG_FILENAME
 from ..adapters.hermes.audiences import LOCAL_USER_ID
 from ..adapters.hermes.identity import HermesRuntimeScope, resolve_runtime_audience
@@ -64,7 +53,7 @@ from ..adapters.hermes.shared_entries import (
     shared_entry_record,
     write_shared_payload,
 )
-from ..adapters.shared_entries import check_attachment_target
+from ..adapters.shared_entries import check_attachment_target, may_inspect_entry_home
 from ..contracts import HOOK_CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
 from ..core.storage import SQLiteStorage
 from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
@@ -112,7 +101,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _fits(config: dict[str, Any] | None, what: str) -> None:
-    """Refuse, before anything is written, a runtime config these commands could not read back."""
+    """Reject a configuration that would exceed the runtime reader’s size limit."""
     if config is not None and len(encoded(config).encode("utf-8")) > _CONFIG_LIMIT:
         raise SharedStoreError(f"the {what} runtime config would pass {_CONFIG_LIMIT} bytes")
 
@@ -211,13 +200,7 @@ def _entry_config(
 
 
 def _ledger_made(raw: dict[str, Any]) -> list[str]:
-    """Create the spend ledger a written config names, when it does not exist yet.
-
-    A ledger is only ever made on purpose (``runtime/model_budget.py``), and
-    every model request reserves in it first: a config naming a missing one
-    refuses every embedding and consolidation with ``ledger_not_initialized``.
-    The entry's moved aside with its old store, and the shared worker's is new.
-    """
+    """Create the configured spend ledger if it is missing. Model requests reserve budget here."""
     auxiliary = RuntimeInstanceConfig.from_mapping(raw).auxiliary
     ledger = getattr(auxiliary, "ledger_path", None)
     if ledger is None or ledger.exists():
@@ -264,8 +247,7 @@ def _refuse_misfit(
     grants_like: tuple[str, ...],
     capture_like: str | None,
 ) -> None:
-    """Refuse a host this command does not attach, grant options ``host`` takes none of, and a home whose own store is
-    still in place."""
+    """Reject incompatible host and grant options or a home that still holds its own store."""
     if host == "hermes":
         if grants_like or capture_like:
             raise SharedStoreError(
@@ -296,10 +278,10 @@ def _refuse_misfit(
 def _runtime_configs(
     routes_from: Path | None, payload: dict[str, Any], root: Path, record: dict[str, Any], home: Path
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, list[str]]:
-    """What an attach of ``record`` writes of runtime configs, built and checked before anything is written: the
-    entry's, from ``routes_from`` bound to its scopes, and the shared worker's, from the same routes when the store has
-    none, else its own bound to every scope of the store with the entry's (``None`` when that leaves it as it is);
-    then the worker's as it stands, and notes on what is not configured."""
+    """Build and validate the entry config and shared worker update before writing either.
+
+    Return the proposed entry and worker configs, existing worker config and configuration notes.
+    """
     scopes = frozenset(record["scope_ids"])
     union = frozenset(payload["scope_ids"]) | scopes
     worker_path = root / RUNTIME_CONFIG_FILENAME
@@ -346,11 +328,10 @@ def _runtime_configs(
 
 def _check_implicit_home(root: Path, target: dict) -> None:
     """Keep an implicit attach from changing a pointer to another entry or store."""
-    pointer = read_attachment(target["home"])
-    if pointer is not None and (pointer.root, pointer.entry_id, pointer.host) != (
-        root.resolve(),
-        target["entry_id"],
-        target["host"],
+    pointer = read_attachment(target["home"], local_only=True)
+    if pointer is not None and (
+        (pointer.entry_id, pointer.host) != (target["entry_id"], target["host"])
+        or not same_local_path(pointer.root, root.resolve())
     ):
         raise SharedStoreError("home is already attached to another entry or shared store")
 
@@ -388,13 +369,15 @@ def _grant_preview(root, target, runtime_config_from):
     _refuse_misfit(host, home, None, (), None)
     payload = read_shared_payload(root)
     _check_implicit_home(root, target)
-    check_attachment_target(root, payload, home=home, entry_id=entry_id)
+    check_attachment_target(root, payload, home=home, entry_id=entry_id, host=host)
     if attached_again(payload, **target) is not None or not _has_attached_entries(payload):
         # First attachment and re-entry are writes, rechecked under both locks.
         return None
     read_only = host in READ_ONLY_CLIENT_HOSTS
     binding = store_binding(payload, root, frozenset(payload["scope_ids"]))
-    donor = verified_donor(root, payload, binding, read_only=read_only)
+    donor = verified_donor(
+        root, payload, binding, read_only=read_only, target_entry_id=entry_id, explain_capture_conflict=True
+    )
     if donor is None:
         raise SharedStoreError("choose explicit owner grants for this entry with --grants-like")
     capture = None if read_only else donor
@@ -467,7 +450,7 @@ def _attach_locked(
         payload = read_shared_payload(root)
         source, notes = None, []
         # A home attached as the entry already keeps the grants the entry holds, and takes none of the options.
-        check_attachment_target(root, payload, home=instance_root, entry_id=entry_id)
+        check_attachment_target(root, payload, home=instance_root, entry_id=entry_id, host=host)
         record = attached_again(payload, **target)
         if review:
             _check_implicit_home(root, target)
@@ -544,10 +527,7 @@ def _attach_locked(
 
 @contextmanager
 def _attached_home(instance_root: Path, command: str, now: str) -> Iterator[Attachment]:
-    """The home's pointer, held: the home's lock, then the lock of the store the pointer names.  Read again under both,
-    the pointer must still name that store and entry; one written meanwhile by something that takes neither lock, such
-    as an edit by hand, is refused, so that nothing is written to a store the home no longer points at, nor the pointer
-    of another store removed."""
+    """Hold the home lock, then the store lock. Recheck the pointer before yielding it."""
     attachment = read_attachment(instance_root)
     if attachment is None:
         raise SharedStoreError("this home is not attached to a shared store")
@@ -688,11 +668,10 @@ def _in_order(rows: list[str], common: Counter[str]) -> list[str]:
 
 
 def _routes_changed(before: InstallationManifest, after: InstallationManifest) -> list[dict[str, Any]]:
-    """Each route a row names, before or after, that the change lets read, write or capture otherwise, as its
-    session binds (``resolve_runtime_audience``) before and after.  Rows alone do not say it: of the rows a session
-    matches, the first that captures into a scope it may write decides, so two rows on one route, swapped, move a
-    chat's captures with no row, scope or principal changed; an owner principal wakes or silences owner rows.  A
-    route resolved with its own session key stands for every session it matches, unpinned rows included."""
+    """Report routes whose effective read, write or capture scopes would change.
+
+    Resolve both configurations as a real session would. Reordered rows can change its capture scope.
+    """
     routes = {tuple(row[field] for field in _ROUTE_FIELDS) for row in (*before.audiences, *after.audiences)}
     changed = []
     for route in sorted(routes):
@@ -719,10 +698,7 @@ def _routes_changed(before: InstallationManifest, after: InstallationManifest) -
 def _grants_change(
     before: dict[str, Any], after: dict[str, Any], views: tuple[InstallationManifest, InstallationManifest]
 ) -> dict[str, Any]:
-    """What a grants change does: the rows that go and the rows that come, each whole (two rows may share a route,
-    and both count), whether the rows both hold changed order, each route that binds otherwise, the owner principals,
-    the scopes the entry holds, and the owner rows that grant nothing.  Routes and scope ids only.  Whether anything
-    changes is read from the whole records, not from this summary."""
+    """Summarize changes to audience rows, effective routes, owners and scope IDs."""
     shown = [list(map(_row_shown, record["audiences"])) for record in (before, after)]
     old, new = Counter(shown[0]), Counter(shown[1])
     owners = _owners(after)
@@ -926,13 +902,12 @@ def _put_back(run: Run, replaced: dict[Path, str]) -> list[str]:
 
 
 def _pointer_of(home: Path, now: str) -> Attachment | None:
-    """A home's pointer, read holding the home's lock, so that no command is midway through changing it.  The lock is
-    held for that read alone, never beside another home's; a home that is no directory has no pointer, and gets no
-    lock file."""
-    if not home.is_dir():
+    """Read one local home's pointer under its lock, without traversing an unverified path."""
+    info = local_attachment_stat(home)
+    if info is None or not stat.S_ISDIR(info.st_mode):
         return None
     with home_lock(home, "entries", now):
-        return read_attachment(home)
+        return read_attachment(home, local_only=True)
 
 
 def entries(*, root: Path, now: str | None = None) -> dict[str, Any]:
@@ -954,8 +929,10 @@ def entries(*, root: Path, now: str | None = None) -> dict[str, Any]:
     for record in payload["entries"]:
         home = Path(record["home"])
         try:
-            pointer = _pointer_of(home, now)
-            here = pointer is not None and pointer.entry_id == record["entry_id"] and pointer.root == root
+            pointer = _pointer_of(home, now) if may_inspect_entry_home(record) else None
+            here = (
+                pointer is not None and pointer.entry_id == record["entry_id"] and same_local_path(pointer.root, root)
+            )
         except HermesIdentityError:
             here = False
         found = seen.get(record["entry_id"], {})

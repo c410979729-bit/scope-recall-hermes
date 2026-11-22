@@ -250,10 +250,15 @@ TOOL_OBSERVATION_INDEX_CHARS = 1024
 _EXCERPT_GAP = "\n…\n"
 
 
+def _is_tool_observation(event) -> bool:
+    """Recognize native and imported observations using the same origin rule."""
+    origin = event.get("source_original_origin") if event.get("origin") == "imported" else event.get("origin")
+    return origin == "tool_observation"
+
+
 def tool_observation_excerpt(event) -> str | None:
     """Return an optional bounded search excerpt; each stored revision keeps its full evidence."""
-    origin = event.get("source_original_origin") if event.get("origin") == "imported" else event.get("origin")
-    if origin != "tool_observation":
+    if not _is_tool_observation(event):
         return None
     # The embedding encoder normalizes before applying its input budget. Cut in
     # the same representation so normalization cannot push the tail out of that budget.
@@ -265,14 +270,46 @@ def tool_observation_excerpt(event) -> str | None:
     return text[:head] + _EXCERPT_GAP + text[-tail:]
 
 
+def tool_lexical_projection(
+    event, *, secret_free: bool = False, skip_clean_short: bool = False
+) -> tuple[tuple[str, ...], bool] | None:
+    """Return allowed tool terms and whether they can be added, optionally skipping unchanged short sources."""
+    content = event["content"]
+    public, private_count = without_private(content)
+    if (private_count or not secret_free) and contains_secret_like_text(public):
+        return (), False
+    cleaned = sanitize_source_capture_text(public)
+    if cleaned != public and contains_secret_like_text(cleaned):
+        return (), False
+
+    unchanged = cleaned == content
+    projected = event if unchanged else {**event, "content": cleaned}
+    excerpt = tool_observation_excerpt(projected)
+    if skip_clean_short and unchanged and excerpt is None:
+        return None
+    if withheld_tool_output(projected):
+        # The error is the one part of an omission summary that belongs to the tool output.
+        error = _WITHHELD_ERROR.search(cleaned)
+        return lexical_terms(error.group(1)) if error else (), unchanged
+    if not unchanged and withheld_tool_output(event):
+        # Stripping the omission marker cannot make the envelope ordinary tool output.
+        return (), False
+    return lexical_terms(excerpt or cleaned), unchanged
+
+
+def source_lexical_projection(event, *, secret_free: bool = False) -> tuple[tuple[str, ...], bool]:
+    """Return allowed source terms and whether its stored content can supply new postings."""
+    if _is_tool_observation(event) or withheld_tool_output(event):
+        projection = tool_lexical_projection(event, secret_free=secret_free)
+        assert projection is not None  # Runtime indexing includes short tool outputs.
+        return projection
+    return lexical_terms(event["content"]), True
+
+
 def indexed_terms(event) -> tuple[str, ...]:
-    """The terms a source is indexed by.  A withheld tool output's placeholder is indexed by its error text alone,
-    when it carries one: the rest is the envelope's own words, and indexed, the placeholders push ordinary words such
-    as "tool", "status" and "patch" past the common-term ceiling, so questions lose them."""
-    if withheld_tool_output(event):
-        error = _WITHHELD_ERROR.search(str(event.get("content") or ""))
-        return lexical_terms(error.group(1)) if error else ()
-    return lexical_terms(tool_observation_excerpt(event) or event["content"])
+    """Return terms eligible for a new index. Unfiltered historical tool text can only lose old postings."""
+    terms, may_add = source_lexical_projection(event)
+    return terms if may_add else ()
 
 
 def lexical_terms(text: str) -> tuple[str, ...]:

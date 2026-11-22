@@ -24,9 +24,7 @@ _NOT_EXPIRED = """NOT EXISTS(SELECT 1 FROM expired_vectors x
 
 
 def respace_refusal(run: dict | None, space_id: str, *, restart: bool) -> str | None:
-    """Why a run into ``space_id`` may not start now, or None.  One run at a time, and one per space: a run that is
-    going, or one into the same space that finished, is started again only on purpose (``restart``); a finished run
-    into another space gives way to the new one (the model changed again)."""
+    """Return the reason a migration needs an explicit restart, or None if it can proceed."""
     if run is None or restart:
         return None
     if not run["completed"]:
@@ -41,11 +39,10 @@ class EmbeddingQueue:
         self._tx = transaction
 
     def _claim_heads_without_vectors(self, *, limit: int) -> list[tuple[int | None, str, int]]:
-        """Readable claim heads of this context whose vector work was made obsolete or never queued: (the obsolete
-        row's work id, or None when there is none, the claim, its head revision), at most ``limit``.
+        """Return eligible (work ID or None, claim ID, head revision) tuples, bounded by limit.
 
-        The query asks what ``_embed_retry_reason`` will (the exact project and branch, no block), so heads it would
-        refuse never fill the page ahead of one it takes."""
+        Match the retry policy on scope, project and branch before filling the page.
+        """
         conn = self._tx._check()
         context = self._tx.context
         scopes = sorted(context.allowed_scope_ids)
@@ -96,10 +93,10 @@ class EmbeddingQueue:
         }
 
     def embed_queue(self) -> dict:
-        """The store's embed queue, every partition: pending and failed rows, and the oldest pending one's time.
+        """Count pending and failed embedding jobs across the store and report the oldest pending time.
 
-        A re-embed run reopens rows of every partition, so it is held by what waits anywhere; and the doctor reports
-        the store.  Read through ``work_ready`` (state first): by ``work_type`` SQLite walked every embed row."""
+        The state-first index keeps this check proportional to the outstanding queue.
+        """
         pending, failed, oldest = (
             self._tx._check()
             .execute(
@@ -111,8 +108,7 @@ class EmbeddingQueue:
         return {"pending": int(pending or 0), "failed": int(failed or 0), "oldest_pending_at": oldest}
 
     def respace_remaining(self, *, at_most: int | None = None) -> int:
-        """Embeddings done so far that a run would reopen: at or below work id ``at_most`` (all when None), except a
-        tool output whose vector the retention window expired, which stays without one."""
+        """Count completed embeddings through the optional work ID limit, excluding expired tool vectors."""
         bound = (2**63 - 1) if at_most is None else int(at_most)
         return int(
             self._tx._check()
@@ -184,7 +180,7 @@ class EmbeddingQueue:
         return self.respace_run()
 
     def cancel_respace(self) -> bool:
-        """Forget the run, if there is one.  What it reopened already stays queued and is embedded."""
+        """Remove the migration cursor and return whether it existed. Already queued jobs continue."""
         return (
             self._tx._check(write=True)
             .execute("DELETE FROM candidate_scan_cursors WHERE cursor_name=?", (RESPACE_CURSOR,))
@@ -193,13 +189,10 @@ class EmbeddingQueue:
         )
 
     def respace_page(self, space_id: str, *, now: str, room: int) -> dict:
-        """Reopen the run's next page of done embeddings, newest first and at most ``room``, for a worker in
-        ``space_id``.
+        """Queue a bounded page of completed embeddings for the selected space, newest first.
 
-        A reopened row is pending like a new one: its attempts count afresh, any lease is fenced off, and it is
-        available from ``now``, so it waits behind the queue it joins rather than ahead of it.  A page looks through
-        at most ``RESPACE_SCAN`` work ids, newest first by the primary key, so it holds the writer lease for a bounded
-        scan however sparse the done embeddings are among them.  A worker of another space leaves the run alone.
+        Scan at most RESPACE_SCAN work IDs per transaction. Reset attempts and fence old leases
+        when returning a job to the queue. A worker in another space leaves the cursor alone.
         """
         if type(room) is not int:
             raise ContractError("INPUT_INVALID", "respace_room")

@@ -205,7 +205,7 @@ def _terminal_forms(quote: str, needle: str):
 
 
 class QuoteAnchors:
-    """Resolve unique short anchors within one authorized source or source window."""
+    """Locate a literal occurrence or one unambiguous typographic match in an authorized window."""
 
     def __init__(self, content: str, *, complete_end: bool = True) -> None:
         self.content = content
@@ -225,7 +225,7 @@ class QuoteAnchors:
                 continue
             start = self.content.find(literal)
             if start >= 0:
-                return (start, start + len(literal)) if self.content.find(literal, start + 1) < 0 else None
+                return start, start + len(literal)
         return self._locate_normalized(decoded or quote)
 
     def _locate_normalized(self, quote: str) -> tuple[int, int] | None:
@@ -280,7 +280,7 @@ class QuoteAnchors:
 
 
 def quote_interval(quote: str, content: str) -> tuple[int, int] | None:
-    """Return the exact Unicode interval selected by one unambiguous anchor."""
+    """Return the first literal interval, or a unique interval after typographic normalization."""
     return QuoteAnchors(content).locate(quote)
 
 
@@ -310,13 +310,11 @@ def align_claim_evidence(claim: dict, sources: dict, *, index: int, anchors: dic
         window = getattr(source, "consolidation_window", None)
         offset = window.start if window is not None else 0
         quote, start, end = span["quote"], span.get("start"), span.get("end")
-        if (
-            type(start) is int
-            and type(end) is int
-            and offset <= start < end <= offset + len(content)
-            and content[start - offset : end - offset] == quote
-        ):
-            continue
+        if type(start) is int and type(end) is int and offset <= start < end <= offset + len(content):
+            hinted = content[start - offset : end - offset]
+            if hinted == quote or ("\\" in quote and hinted == _json_decoded(quote)):
+                span["quote"] = hinted
+                continue
         key = (source.ref, source.revision)
         if key not in anchors:
             complete_end = (

@@ -4,14 +4,17 @@
 
 ### Added
 
-- `scope-recall compact-store` can preview expired processing data and write a smaller, verified copy of an offline SQLite store.
-- `scope-recall attach` suggests a command when it can verify that active entries share the same local owner and grants.
+- `scope-recall compact-store` previews reclaimable data in a live store. On an offline copy it compacts expired candidate history and rebuilds the search index for long tool outputs.
+- `scope-recall attach` suggests a command when installed clients on the current machine agree on grants and the selected capture scope is readable by the other owners.
 
 ### Fixed
 
 - Doctor checks the read-only shared-store binding for Cherry Studio.
-- Consolidation keeps valid facts when another proposal fails validation. Evidence anchors must resolve to a unique passage in the source.
+- Consolidation keeps valid facts when another proposal fails validation. Repeated literal quotes use the indicated occurrence or the first one. A typographic match must be unique.
 - Long tool output is indexed from its beginning and end. The full text stays available as evidence.
+- Failed entity checks release their names for other jobs. A worker waiting for a live name reservation resumes after the lease and keeps its daily queue allowance.
+- Storage previews release the live database before scanning the snapshot. Compaction trims redundant candidate evidence and withdraws stale tool-output search terms. Windows maintenance commands emit UTF-8 receipts through redirected output.
+- Local entry checks recognize verified case and Unicode aliases of the same directory on shared-store volumes.
 
 ## [4.0.5]
 

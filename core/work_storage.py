@@ -178,6 +178,11 @@ def _after(now: str, seconds: float) -> str:
     return _format_time(_parse_time(now) + timedelta(seconds=seconds))
 
 
+def _lease_remaining(lease_until: str, now: str) -> float:
+    """Compare lease instants independently of the UTC offset and fraction spelling."""
+    return (_parse_time(lease_until) - _parse_time(now)).total_seconds()
+
+
 @dataclass(frozen=True)
 class LeasedWork:
     work_id: int
@@ -411,6 +416,14 @@ class WorkItems(EmbeddingQueue):
                 (owner, until, row["work_id"]),
             )
             item = conn.execute("SELECT * FROM work_items WHERE work_id=?", (row["work_id"],)).fetchone()
+            if item["work_type"] == "rebuild_projection":
+                # The same work id can be leased again. Drop its previous name reservations
+                # before another writer can mistake them for this lease's reservations.
+                conn.execute(
+                    "UPDATE entity_names SET work_id=NULL WHERE work_id=? AND name_id IN "
+                    "(SELECT name_id FROM entity_name_mentions WHERE claim_ref=? AND claim_revision=?)",
+                    (item["work_id"], item["subject_ref"], item["subject_revision"]),
+                )
             claimed.append(
                 LeasedWork(
                     item["work_id"],
@@ -1023,7 +1036,7 @@ class WorkItems(EmbeddingQueue):
             return False
         if self._context_denial(row) is not None:
             return False
-        return row["lease_until"] is None or _parse_time(row["lease_until"]) > _parse_time(now)
+        return row["lease_until"] is None or _lease_remaining(row["lease_until"], now) > 0
 
     def _stale_mutation(self, conn, work_id: int) -> WorkMutation:
         row = conn.execute("SELECT state,lease_token FROM work_items WHERE work_id=?", (work_id,)).fetchone()

@@ -1,9 +1,13 @@
 """Offline compaction preserves SQLite authority and refuses unsafe publication."""
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from contextlib import closing, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from scope_recall.core.backup_primitives import BackupError, sha256
@@ -70,12 +74,12 @@ def _fixture(app):
             (claim.ref, claim.revision, evidence.ref, evidence.revision, OLD),
         )
         refs = [f"{evidence.ref}@{evidence.revision}"]
-        obsolete = _evaluation(db, claim, "old-question", refs)
+        _evaluation(db, claim, "old-question", refs)
         _evaluation(db, claim, "old-verdict", refs, attempted=OLD)
         _evaluation(db, claim, "old-block", refs, reason="authority_revoked")
         _evaluation(db, claim, "old-missing", [f"{deleted.ref}@{deleted.revision}"])
         _evaluation(db, claim, "current", refs)
-    return path, retired, obsolete, evidence, deleted, sources[0]
+    return path, retired, evidence, deleted, sources[0]
 
 
 def _tables(db):
@@ -85,18 +89,18 @@ def _tables(db):
 
 
 def test_dry_run_and_apply_trim_just_proven_retired_payloads(app, tmp_path, capsys):
-    source, retired, obsolete, evidence, deleted, other_scope = _fixture(app)
+    source, retired, evidence, deleted, other_scope = _fixture(app)
     target = tmp_path / "compacted.sqlite3"
     before = sha256(source)
     assert main(["compact-store", "--source", str(source), "--dry-run"]) == 0
     preview = json.loads(capsys.readouterr().out)
-    assert preview["consolidation_fragments"] == {"rows": 1, "payload_bytes": len(LARGE.encode())}
-    assert preview["obsolete_evaluations"]["rows"] == 1
+    assert preview["consolidation_fragments"] == {"rows": 1, "estimated_bytes": len(LARGE.encode())}
+    assert preview["candidate_evaluations"]["rows"] == 0
     assert sha256(source) == before and not target.exists()
     assert main(["compact-store", "--source", str(source), "--apply", "--output", str(target)]) == 0
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["consolidation_fragments"] == preview["consolidation_fragments"]
-    assert receipt["obsolete_evaluations"] == preview["obsolete_evaluations"]
+    assert receipt["candidate_evaluations"] == preview["candidate_evaluations"]
     assert receipt["output_bytes"] == target.stat().st_size < preview["source_bytes"]
     assert sha256(source) == before
 
@@ -105,14 +109,8 @@ def test_dry_run_and_apply_trim_just_proven_retired_payloads(app, tmp_path, caps
         assert not copy.execute("PRAGMA foreign_key_check").fetchall()
         assert not copy.execute("SELECT 1 FROM consolidation_fragments WHERE work_id=?", (retired,)).fetchone()
         assert copy.execute("SELECT count(*) FROM consolidation_fragments").fetchone() == (5,)
-        saved = "SELECT * FROM candidate_evaluations WHERE evaluation_id=?"
-        old = list(original.execute(saved, (obsolete,)).fetchone())
-        old[4] = "[]"
-        assert copy.execute(saved, (obsolete,)).fetchone() == tuple(old)
-        trial = "SELECT * FROM candidate_evaluations WHERE evaluation_id<>? ORDER BY evaluation_id"
-        assert copy.execute(trial, (obsolete,)).fetchall() == original.execute(trial, (obsolete,)).fetchall()
         assert _tables(copy) == _tables(original)
-        for table in _tables(original) - {"candidate_evaluations", "consolidation_fragments"}:
+        for table in _tables(original) - {"consolidation_fragments"}:
             query = f'SELECT * FROM "{table}"'
             assert set(original.execute(query)) == set(copy.execute(query)), table
         assert list(original.execute("SELECT rowid,event_id FROM source_events")) == list(
@@ -157,9 +155,207 @@ def test_live_writer_and_sqlite_sidecar_are_refused(app, tmp_path, capsys):
     assert not output.exists() and sha256(source) == before
 
 
+def test_online_dry_run_reads_committed_wal_without_store_locks(app, capsys):
+    core, ctx = app
+    source = capture(core, ctx, "TEST committed WAL fragment", origin="tool_observation")
+    path = core.storage.path
+    wal = path.with_name(path.name + "-wal")
+    lease = TruthWriterLease(path.parent, role="provider")
+    assert lease.acquire()["status"] == "acquired"
+    try:
+        with closing(sqlite3.connect(path)) as writer:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            with writer:
+                _fragment(writer, source, state="done", outcome="complete")
+            before = (sha256(path), sha256(wal))
+            assert main(["compact-store", "--source", str(path), "--dry-run"]) == 0
+            preview = json.loads(capsys.readouterr().out)
+            assert preview["retention_days"] == 30
+            assert preview["consolidation_fragments"]["rows"] == 1
+            assert (sha256(path), sha256(wal)) == before
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_preview_leaves_an_incomplete_wal_pair_untouched(app, suffix):
+    path = app[0].storage.path
+    with closing(sqlite3.connect(path)) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    journal = path.with_name(path.name + suffix)
+    journal.write_bytes(b"TEST incomplete journal")
+    before = {file.name: sha256(file) for file in (path, journal)}
+    with pytest.raises(sqlite3.OperationalError, match="incomplete"):
+        compact_store.compact_store(path)
+    after = {file.name: sha256(file) for file in path.parent.glob(path.name + "*")}
+    assert after == before
+
+
+def test_last_wal_writer_can_close_while_preview_opens(app, monkeypatch):
+    path = app[0].storage.path
+    native_connect = sqlite3.connect
+    writer = native_connect(path)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    with writer:
+        writer.execute("UPDATE instance_meta SET storage_revision=storage_revision+1")
+    seen = {}
+
+    def close_writer_then_open(*args, **kwargs):
+        writer.close()
+        seen.update({f: f.exists() for f in (path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm"))})
+        return native_connect(*args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(sqlite3, "connect", close_writer_then_open)
+        compact_store.compact_store(path)
+    assert seen and all(was_present or not f.exists() for f, was_present in seen.items())
+
+
+@pytest.mark.parametrize("suffixes", [("-journal",), ("-wal", "-shm")])
+def test_read_preview_does_not_initialize_unrecovered_wal_sidecars(app, suffixes):
+    path = app[0].storage.path
+    with closing(sqlite3.connect(path)) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    for suffix in suffixes:
+        path.with_name(path.name + suffix).touch()
+    before = {f.name: sha256(f) for f in path.parent.glob(path.name + "*")}
+    try:
+        compact_store.compact_store(path)
+    except sqlite3.OperationalError:
+        pass  # SQLite can decline an unrecovered WAL without initializing it.
+    assert {f.name: sha256(f) for f in path.parent.glob(path.name + "*")} == before
+
+
+def test_online_dry_run_uses_one_snapshot_while_wal_writer_commits(app, monkeypatch):
+    core, ctx = app
+    source = capture(core, ctx, "TEST commit while measuring", origin="tool_observation")
+    path = core.storage.path
+    measure = compact_store._measure
+    with closing(sqlite3.connect(path)) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("PRAGMA busy_timeout=0")
+        with writer:
+            writer.execute("UPDATE instance_meta SET storage_revision=storage_revision+1")
+
+        def measure_after_commit(reader, params):
+            assert reader.execute("PRAGMA query_only").fetchone()[0] == 1
+            with writer:
+                _fragment(writer, source, state="done", outcome="complete")
+            assert writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+            return measure(reader, params)
+
+        with monkeypatch.context() as context:
+            context.setattr(compact_store, "_measure", measure_after_commit)
+            preview = compact_store.compact_store(path)
+        next_preview = compact_store.compact_store(path)
+    assert preview["consolidation_fragments"]["rows"] == 0
+    assert next_preview["consolidation_fragments"]["rows"] == 1
+
+
+def test_compact_cli_writes_a_utf8_receipt_on_a_legacy_pipe(app, tmp_path):
+    source = app[0].storage.path
+    target = tmp_path / "项目-🧭.sqlite3"
+    root = Path(__file__).resolve().parents[2]
+    boot = (
+        "import sys,types; package=types.ModuleType('scope_recall'); "
+        "package.__path__=[sys.argv.pop(1)]; sys.modules['scope_recall']=package; "
+        "from scope_recall.maintenance.cli import main; raise SystemExit(main())"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            boot,
+            str(root),
+            "compact-store",
+            "--source",
+            str(source),
+            "--apply",
+            "--output",
+            str(target),
+        ],
+        env={**os.environ, "PYTHONUTF8": "0", "PYTHONIOENCODING": "cp936"},
+        capture_output=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout.decode("utf-8"))
+    assert receipt["output"] == str(target)
+    assert receipt["output_bytes"] == target.stat().st_size
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_disk_preview_releases_its_private_copy(app, tmp_path, monkeypatch, fail):
+    from scope_recall.maintenance import store_snapshot
+
+    source = app[0].storage.path
+    before = sha256(source)
+    monkeypatch.setattr(store_snapshot, "_MEMORY_SNAPSHOT_BYTES", 0)
+    monkeypatch.setattr(store_snapshot.tempfile, "tempdir", str(tmp_path))
+    error = None
+    try:
+        with store_snapshot.detached_store_snapshot(source, compact_store._verify_schema) as copy:
+            assert copy.execute("PRAGMA query_only").fetchone()[0] == 1
+            assert len(list(tmp_path.glob("scope-recall-preview-*/snapshot.sqlite3"))) == 1
+            if fail:
+                raise ValueError("synthetic measurement interrupted")
+    except ValueError as exc:
+        error = exc
+    assert bool(error) == fail
+    assert list(tmp_path.glob("scope-recall-preview-*")) == []
+    assert sha256(source) == before
+
+
+def test_disk_preview_accepts_the_system_temp_directory_alias(app, tmp_path, monkeypatch):
+    from scope_recall.maintenance import store_snapshot
+
+    real = tmp_path / "physical"
+    real.mkdir()
+    alias = tmp_path / "system-temp"
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(real), str(alias))
+    else:
+        alias.symlink_to(real, target_is_directory=True)
+    try:
+        monkeypatch.setattr(store_snapshot.tempfile, "tempdir", str(alias))
+        monkeypatch.setattr(store_snapshot, "_MEMORY_SNAPSHOT_BYTES", 0)
+        assert compact_store.compact_store(app[0].storage.path)["status"] == "dry_run"
+        assert list(real.iterdir()) == []
+    finally:
+        if os.name == "nt":
+            alias.rmdir()
+        else:
+            alias.unlink()
+
+
+def test_retention_cutoff_defaults_to_30_days_and_zero_includes_recent_retired_work(app, capsys):
+    core, ctx = app
+    path = core.storage.path
+    now = datetime.now(UTC)
+    sources = [capture(core, ctx, f"TEST timestamp {days}", origin="tool_observation") for days in (31, 29, -1)]
+    unfinished = capture(core, ctx, "TEST unfinished", origin="tool_observation")
+    with closing(sqlite3.connect(path)) as db, db:
+        for source, days in zip(sources, (31, 29, -1), strict=True):
+            _fragment(db, source, state="done", outcome="complete", when=(now - timedelta(days=days)).isoformat())
+        _fragment(db, unfinished, state="pending", outcome="complete")
+    args = ["compact-store", "--source", str(path), "--dry-run"]
+    for flags, retained, rows in (([], 30, 1), (["--retention-days", "0"], 0, 2)):
+        assert main([*args, *flags]) == 0
+        receipt = json.loads(capsys.readouterr().out)
+        assert receipt["retention_days"] == retained
+        assert receipt["consolidation_fragments"]["rows"] == rows
+    assert main([*args, "--retention-days", "-1"]) == 2
+    assert "between 0 and 36500" in json.loads(capsys.readouterr().out)["error"]
+
+
 @pytest.mark.parametrize("apply", [False, True])
 @pytest.mark.parametrize("mode", ["IMMEDIATE", "EXCLUSIVE"])
-def test_rollback_journal_transactions_refuse_compaction(app, tmp_path, capsys, apply, mode):
+def test_rollback_journal_only_allows_dry_run_with_a_reserved_lock(app, tmp_path, capsys, apply, mode):
     source = app[0].storage.path
     output = tmp_path / "locked-source.sqlite3"
     args = ["compact-store", "--source", str(source)]
@@ -175,8 +371,9 @@ def test_rollback_journal_transactions_refuse_compaction(app, tmp_path, capsys, 
                     reader.execute("SELECT * FROM instance_meta").fetchall()
             else:
                 assert reader.execute("SELECT * FROM instance_meta").fetchall()
-        assert main(args) == 2
-        assert "store is busy" in capsys.readouterr().out
+        assert main(args) == (0 if not apply and mode == "IMMEDIATE" else 2)
+        status = json.loads(capsys.readouterr().out)["status"]
+        assert status == ("dry_run" if not apply and mode == "IMMEDIATE" else "error")
         assert not output.exists() and not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*"))
         assert not list(source.parent.glob("memory.sqlite3-*")) and sha256(source) == before
 

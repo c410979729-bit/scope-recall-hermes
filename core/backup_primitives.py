@@ -119,7 +119,7 @@ def first_link(path: Path) -> Path | None:
     return None
 
 
-def safe_path(value: str | Path, *, must_exist: bool = False, error_type=BackupError) -> Path:
+def safe_path(value: str | Path, *, must_exist: bool = False, error_type: type[Exception] = BackupError) -> Path:
     """Check the original path chain before resolution can erase a link."""
     path = Path(value).expanduser()
     if not path.is_absolute():

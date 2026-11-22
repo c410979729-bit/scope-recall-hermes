@@ -20,10 +20,11 @@ from scope_recall.contracts import (
     InstanceBinding,
     TrustedContext,
 )
-from scope_recall.core.entry_control import account_pin, current_account_pin
+from scope_recall.core.entry_control import account_pin, current_account_pin, local_account_matches
 from scope_recall.core.storage import SQLiteStorage
 from scope_recall.host_registry import HOSTS
 
+from .attachment_paths import local_attachment_stat, same_local_path
 from .audiences import (
     LOCAL_USER_ID,
     HermesIdentityError,
@@ -108,27 +109,31 @@ def _display_name(value: object) -> str:
     return value.strip()
 
 
-def _same_path(left: Path | str, right: Path | str) -> bool:
-    return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(Path(right).resolve()))
-
-
 def attachment_path(hermes_home: Path) -> Path:
     return hermes_home / "scope-recall" / ATTACHMENT_FILENAME
 
 
-def _points_here(hermes_home: Path | str, store: Path, entry_id: str) -> bool:
-    """Whether a home's pointer still names this store and entry; an unreadable one counts as yes."""
+def _blocks_entry_move(hermes_home: Path | str, store: Path, entry_id: str) -> bool:
+    """Keep a live entry reserved unless its local pointer can be shown to point elsewhere or be absent."""
     try:
-        attachment = read_attachment(hermes_home)
-    except HermesIdentityError:
+        attachment = read_attachment(hermes_home, local_only=True)
+        if attachment is None or attachment.entry_id != entry_id:
+            return False
+        if str(attachment.root) == str(store):
+            return True
+        # Two local paths can name the same store, for example through a mapped local volume.
+        previous, current = local_attachment_stat(attachment.root), local_attachment_stat(store)
+        return current is None or (previous is not None and os.path.samestat(previous, current))
+    except (HermesIdentityError, OSError):
         return True
-    return attachment is not None and attachment.entry_id == entry_id and _same_path(attachment.root, store)
 
 
-def read_attachment(hermes_home: Path | str) -> Attachment | None:
-    """This home's pointer to a shared store, or ``None`` when it has none."""
-    path = attachment_path(Path(str(hermes_home)).expanduser().resolve())
-    if not os.path.lexists(path):
+def read_attachment(hermes_home: Path | str, *, local_only: bool = False) -> Attachment | None:
+    """Read a home's pointer. Local-only discovery leaves the recorded store path unresolved."""
+    home = Path(hermes_home)
+    path = attachment_path(home if local_only else home.expanduser().resolve())
+    present = local_attachment_stat(path) is not None if local_only else os.path.lexists(path)
+    if not present:
         return None
     payload = _read_json(path, limit=_MAX_ATTACHMENT_BYTES, what="shared store attachment")
     if payload.get("schema") != ATTACHMENT_SCHEMA:
@@ -139,7 +144,10 @@ def read_attachment(hermes_home: Path | str) -> Attachment | None:
     if not root.is_absolute():
         raise HermesIdentityError("shared store attachment root must be absolute")
     return Attachment(
-        root.resolve(), _entry_id(payload.get("entry_id")), _display_name(payload.get("display_name")), payload["host"]
+        root if local_only else root.resolve(),
+        _entry_id(payload.get("entry_id")),
+        _display_name(payload.get("display_name")),
+        payload["host"],
     )
 
 
@@ -203,7 +211,7 @@ def shared_entry_for_home(payload: dict[str, Any], entry_id: str, *, hermes_home
             raise HermesIdentityError("restored entry needs an explicit attach")
         if record.get("detached_at"):
             raise HermesIdentityError("shared store entry is detached")
-        if not _same_path(bounded_text(record.get("home"), field="home"), hermes_home):
+        if not same_local_path(Path(bounded_text(record.get("home"), field="home")), hermes_home.resolve()):
             raise HermesIdentityError("shared store entry belongs to another home")
     return record
 
@@ -223,7 +231,7 @@ def _entry_view(store: Path, payload: dict[str, Any], record: Mapping[str, Any])
         agent_id=payload["agent_id"],
         data_directory=store,
         test_mode=payload["test_mode"],
-        hermes_home=home.resolve(),
+        hermes_home=home,
         installation_kind="shared",
         entry_id=_entry_id(record.get("entry_id")),
         entry_name=_display_name(record.get("display_name")),
@@ -413,21 +421,32 @@ def attach_shared_entry(
     return attach_shared_record(root, record, now=now)
 
 
-def check_attachment_target(store: Path, payload: dict[str, Any], *, home: Path, entry_id: str) -> None:
+def may_inspect_entry_home(entry: dict) -> bool:
+    """A client must belong to this OS account before its recorded home can be inspected."""
+    return entry["host"] not in CLIENT_HOSTS or local_account_matches(entry.get("local_account_id"))
+
+
+def check_attachment_target(store: Path, payload: dict[str, Any], *, home: Path, entry_id: str, host: str) -> None:
     """Ensure an entry ID and a home can name each other without displacing a live entry."""
     entry_id = _entry_id(entry_id)
     # A preview can read this without locking. The write checks again under
     # the store lock, which also fences other commands binding that entry.
     for entry in payload["entries"]:
+        # Records written by attach already carry canonical paths. Comparing them
+        # lexically keeps unrelated homes from being looked up after adoption.
+        recorded_home = Path(entry["home"])
+        same_home = same_local_path(recorded_home, home) if may_inspect_entry_home(entry) else recorded_home == home
+        released = entry.get("detached_at") or (entry.get("recovery_pending") is True and entry["host"] == host)
         if (
             entry["entry_id"] == entry_id
-            and not _same_path(entry["home"], home)
-            and _points_here(entry["home"], store, entry["entry_id"])
+            and not released
+            and (
+                not may_inspect_entry_home(entry)
+                or (not same_home and _blocks_entry_move(entry["home"], store, entry_id))
+            )
         ):
-            # A home that no longer points here gives its id up: the store was
-            # copied to another machine and adopted, or the home was detached.
             raise HermesIdentityError("entry_id is already attached from another home")
-        if entry["entry_id"] != entry_id and _same_path(entry["home"], home) and not entry.get("detached_at"):
+        if entry["entry_id"] != entry_id and same_home and not entry.get("detached_at"):
             raise HermesIdentityError("home is already attached as another entry")
 
 
@@ -440,7 +459,7 @@ def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) 
     store = Path(str(root)).expanduser().resolve()
     payload = read_shared_payload(store)
     home = Path(record["home"])
-    check_attachment_target(store, payload, home=home, entry_id=record["entry_id"])
+    check_attachment_target(store, payload, home=home, entry_id=record["entry_id"], host=record["host"])
     before = frozenset(payload["scope_ids"])
     after = before | frozenset(record["scope_ids"])
     updated = _checked_shared_payload(
@@ -514,7 +533,7 @@ def attached_again(
             entry["entry_id"] == entry_id
             and entry["host"] == host
             and not entry.get("detached_at")
-            and (_same_path(entry["home"], home) or entry.get("recovery_pending") is True)
+            and (entry.get("recovery_pending") is True or same_local_path(Path(entry["home"]), home))
         ):
             record = {
                 name: value for name, value in entry.items() if name not in {"python_executable", "recovery_pending"}
@@ -536,7 +555,7 @@ def _attached(hermes_home: Path | str) -> tuple[Path, dict[str, Any], dict[str, 
         raise HermesIdentityError("this home is not attached to a shared store")
     payload = read_shared_payload(attachment.root)
     record = next((entry for entry in payload["entries"] if entry["entry_id"] == attachment.entry_id), None)
-    if record is None or record.get("detached_at") or not _same_path(record["home"], home):
+    if record is None or record.get("detached_at") or not same_local_path(Path(record["home"]), home):
         raise HermesIdentityError("the shared store holds no attached entry of this home")
     return attachment.root, payload, record
 

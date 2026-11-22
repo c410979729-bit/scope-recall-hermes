@@ -1,15 +1,24 @@
 """Name-level work, indexed nomination and the default runtime identity boundary."""
 
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context
 from dataclasses import replace
 from difflib import SequenceMatcher
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
+from scope_recall.contracts import ContractError
 from scope_recall.core.claims import Qualification
 from scope_recall.core.entity_resolution import queue_entity_backfill
 from scope_recall.core.read_views import resolve_subject
+from scope_recall.core.worker import WorkerConfig, drain_worker
+from scope_recall.core.worker_projection import process_rebuild_projection
 from scope_recall.runtime.instance import build_runtime_instance
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+from scope_recall.runtime.worker_entry import _drain_once
 
 from tests.contract.test_aliases import _alias, _identity, app
 from tests.contract.test_claims import accept, capture, draft
@@ -212,45 +221,264 @@ def test_default_runtime_drains_entity_judgements_through_the_clamped_port(app):
 
 
 def test_two_fact_leases_cannot_judge_the_same_pending_name(app):
-    from scope_recall.core.worker_projection import process_rebuild_projection
-
     core, ctx = app
     named_fact(core, ctx, "TEST-Ricecake", "home")
     named_fact(core, ctx, "TEST-Ricecake", "color")
     with core.storage.write(ctx) as tx:
         tx._check(write=True).execute("UPDATE work_items SET state='done'")
         queue_entity_backfill(tx, now=core.clock.utc_now())
-        jobs = tx.work.claim_next(
+        first = tx.work.claim_next(
             "TEST-name-owner",
             core.clock.utc_now(),
             lease_seconds=60,
-            limit=2,
             allowed_work_types=frozenset({"rebuild_projection"}),
-        )
+        )[0]
+    config = RuntimeInstanceConfig(
+        ctx.binding,
+        ctx.session_id,
+        ctx.allowed_scope_ids,
+        project_id=ctx.project_id,
+        branch_id=ctx.branch_id,
+        daily_work_limit=1,
+    )
     nested = []
 
     class ReentrantModel(RecordedModel):
         def judge(self, messages, **kwargs):
             answer = super().judge(messages, **kwargs)
             if len(self.calls) == 1:
-                nested.append(
-                    process_rebuild_projection(
-                        core.storage, core.clock, ctx, jobs[1], model=self, started=core.clock.monotonic(), budget=10
+                instance = SimpleNamespace(
+                    auxiliary=SimpleNamespace(),
+                    background_gaps=(),
+                    ingress_receipts=(),
+                    status=partial(core.status, ctx),
+                    drain=lambda *, max_items, purge_only, remaining_seconds: drain_worker(
+                        core.storage,
+                        core.clock,
+                        ctx,
+                        config=WorkerConfig("TEST-concurrent", max_items=max_items, purge_only=purge_only),
+                        consolidation=self,
+                        remaining_seconds=remaining_seconds,
+                    ),
+                )
+                with ThreadPoolExecutor(max_workers=1) as workers:
+                    nested.append(workers.submit(_drain_once, config, instance, time.monotonic() + 10).result())
+                    core.clock.now = "2026-09-06T12:00:02Z"
+                    nested.append(workers.submit(_drain_once, config, instance, time.monotonic() + 10).result())
+            return answer
+
+    model = ReentrantModel(False)
+    result = process_rebuild_projection(
+        core.storage, core.clock, ctx, first, model=model, started=core.clock.monotonic(), budget=10
+    )
+    assert result[2] == "done"
+    assert nested[0]["deferred"] == 1 and nested[0]["items"][0]["error_code"] == "entity_name_leased"
+    assert nested[1]["processed"] == 0 and "daily_queue_budget" not in nested[1]["capability_gaps"]
+    assert [receipt["daily_queue_used"] for receipt in nested] == [0, 0]
+    assert len(model.calls) == 1
+    with core.storage.read(ctx) as tx:
+        assert tuple(
+            tx._check()
+            .execute("SELECT attempt,available_at FROM work_items WHERE work_id=?", (nested[0]["items"][0]["work_id"],))
+            .fetchone()
+        ) == (
+            0,
+            "2026-09-06T12:01:00Z",
+        )
+    core.clock.now = "2026-09-06T12:01:01Z"
+    receipt = drain_worker(
+        core.storage, core.clock, ctx, config=WorkerConfig("TEST-concurrent"), consolidation=model, remaining_seconds=20
+    )
+    assert receipt.completed == 1 and len(model.calls) == 1
+
+
+@pytest.mark.parametrize("owner_state", ["failed", "pending", "leased"])
+def test_worker_reuses_abandoned_name_reservation(app, owner_state):
+    core, ctx = app
+    previous = named_fact(core, ctx, "TEST-Ricecake", "home")
+    ready = named_fact(core, ctx, "TEST-Ricecake", "color")
+    core.clock.now = "2026-09-06T12:00:01.125000Z"
+    with core.storage.write(ctx) as tx:
+        conn = tx._check(write=True)
+        conn.execute("UPDATE work_items SET state='done'")
+        conn.execute(
+            "UPDATE work_items SET state=?,available_at='2026-09-07T12:00:00Z',last_error_code='http_400',"
+            "lease_owner='TEST-older-worker',lease_token=3,lease_until=? "
+            "WHERE work_type='rebuild_projection' AND subject_ref=?",
+            (owner_state, core.clock.utc_now(), previous.ref),
+        )
+        conn.execute(
+            "UPDATE entity_names SET work_id=(SELECT work_id FROM work_items "
+            "WHERE work_type='rebuild_projection' AND subject_ref=?) WHERE name='TEST-Ricecake'",
+            (previous.ref,),
+        )
+        conn.execute(
+            "UPDATE work_items SET state='pending' WHERE work_type='rebuild_projection' AND subject_ref=?",
+            (ready.ref,),
+        )
+    model = RecordedModel(False)
+    receipt = drain_worker(
+        core.storage, core.clock, ctx, config=WorkerConfig("TEST-ready"), consolidation=model, remaining_seconds=20
+    )
+    assert receipt.completed == 1 and receipt.deferred == 0
+    assert len(model.calls) == 1
+    with core.storage.read(ctx) as tx:
+        assert tuple(tx._check().execute("SELECT status,source_ref FROM entity_names").fetchone()) == (
+            "checked",
+            ready.ref,
+        )
+
+
+def test_reclaimed_work_cannot_reuse_the_previous_leases_name_reservation(app):
+    core, ctx = app
+    named_fact(core, ctx, "TEST-Ricecake", "home")
+    named_fact(core, ctx, "TEST-Ricecake", "color")
+    projection = frozenset({"rebuild_projection"})
+    with core.storage.write(ctx) as tx:
+        tx._check(write=True).execute("UPDATE work_items SET state='done'")
+        queue_entity_backfill(tx, now=core.clock.utc_now())
+        original = tx.work.claim_next(
+            "TEST-original", core.clock.utc_now(), lease_seconds=1, allowed_work_types=projection
+        )[0]
+
+    class ReentrantModel(RecordedModel):
+        nested = None
+
+        def judge(self, messages, **kwargs):
+            answer = super().judge(messages, **kwargs)
+            if len(self.calls) == 1:
+                core.clock.now = "2026-09-06T12:00:02Z"
+                with core.storage.write(ctx) as tx:
+                    reclaimed = tx.work.claim_next(
+                        "TEST-reclaim", core.clock.utc_now(), lease_seconds=60, limit=2, allowed_work_types=projection
                     )
+                assert reclaimed[0].work_id == original.work_id
+                assert reclaimed[0].lease_token > original.lease_token
+                self.nested = Context().run(
+                    process_rebuild_projection,
+                    core.storage,
+                    core.clock,
+                    ctx,
+                    reclaimed[1],
+                    model=self,
+                    started=core.clock.monotonic(),
+                    budget=10,
                 )
             return answer
 
     model = ReentrantModel(False)
     result = process_rebuild_projection(
-        core.storage, core.clock, ctx, jobs[0], model=model, started=core.clock.monotonic(), budget=10
+        core.storage, core.clock, ctx, original, model=model, started=core.clock.monotonic(), budget=10
     )
-    assert result[2] == "done"
-    assert nested == [("deferred", "entity_name_leased", "pending")]
-    assert len(model.calls) == 1
+    assert result[0] == "stale"
+    assert model.nested == ("completed", None, "done")
+    assert len(model.calls) == 2
     with core.storage.read(ctx) as tx:
-        assert (
-            tx._check().execute("SELECT attempt FROM work_items WHERE work_id=?", (jobs[1].work_id,)).fetchone()[0] == 0
+        assert tuple(tx._check().execute("SELECT status,source_ref FROM entity_names").fetchone()) == (
+            "checked",
+            model.calls[1]["candidates"][0]["ref"],
         )
+
+
+def test_expired_vector_lookup_does_not_start_a_late_entity_judgement(app):
+    core, ctx = app
+    named_fact(core, ctx, "TEST-Ricecake", "home")
+    with core.storage.write(ctx) as tx:
+        tx._check(write=True).execute("UPDATE work_items SET state='done'")
+        queue_entity_backfill(tx, now=core.clock.utc_now())
+        item = tx.work.claim_next(
+            "TEST-expired", core.clock.utc_now(), lease_seconds=1, allowed_work_types=frozenset({"rebuild_projection"})
+        )[0]
+
+    class ExpiringVector:
+        def search(self, *args, **kwargs):
+            core.clock.now = "2026-09-06T12:00:02Z"
+            return ()
+
+    core.storage.entity_vectors = ExpiringVector
+    model = RecordedModel(False)
+    result = process_rebuild_projection(
+        core.storage, core.clock, ctx, item, model=model, started=core.clock.monotonic(), budget=10
+    )
+    assert result[0] == "stale"
+    assert not model.calls
+
+
+@pytest.mark.parametrize("expires", ["lease", "budget"])
+def test_entity_provider_rechecks_expiry_after_evidence_reads(app, monkeypatch, expires):
+    from scope_recall.core import private, worker_entities
+
+    core, ctx = app
+    named_fact(core, ctx, "TEST-Ricecake", "home")
+    with core.storage.write(ctx) as tx:
+        tx._check(write=True).execute("UPDATE work_items SET state='done'")
+        queue_entity_backfill(tx, now=core.clock.utc_now())
+        item = tx.work.claim_next(
+            "TEST-late", core.clock.utc_now(), lease_seconds=1, allowed_work_types=frozenset({"rebuild_projection"})
+        )[0]
+
+    checking_provider = False
+    check_evidence = worker_entities._publication_blocked
+    monotonic = core.clock.monotonic
+
+    def slow_evidence_check(*args):
+        blocked = check_evidence(*args)
+        if checking_provider:
+            if expires == "lease":
+                core.clock.now = "2026-09-06T12:00:01.001000Z"
+            else:
+                monkeypatch.setattr(core.clock, "monotonic", lambda: monotonic() + 20)
+        return blocked
+
+    class GuardedModel(RecordedModel):
+        def judge(self, messages, **kwargs):
+            nonlocal checking_provider
+            checking_provider = True
+            private.require_outbound()
+            return super().judge(messages, **kwargs)
+
+    monkeypatch.setattr(worker_entities, "_publication_blocked", slow_evidence_check)
+    model = GuardedModel(False)
+    process_rebuild_projection(core.storage, core.clock, ctx, item, model=model, started=monotonic(), budget=10)
+    assert checking_provider and not model.calls
+
+
+def test_expired_worker_cannot_mark_its_reclaimed_mention_ineligible(app):
+    core, ctx = app
+    source = named_fact(core, ctx, "TEST-Ricecake", "home")
+    projection = frozenset({"rebuild_projection"})
+    with core.storage.write(ctx) as tx:
+        tx._check(write=True).execute("UPDATE work_items SET state='done'")
+        queue_entity_backfill(tx, now=core.clock.utc_now())
+        original = tx.work.claim_next(
+            "TEST-original", core.clock.utc_now(), lease_seconds=1, allowed_work_types=projection
+        )[0]
+
+    class LateRefusal:
+        def judge(self, messages, **kwargs):
+            core.clock.now = "2026-09-06T12:00:02Z"
+            with core.storage.write(ctx) as tx:
+                renewed = tx.work.claim_next(
+                    "TEST-renewed", core.clock.utc_now(), lease_seconds=60, allowed_work_types=projection
+                )[0]
+            assert renewed.work_id == original.work_id and renewed.lease_token > original.lease_token
+            raise ContractError("ACCESS_DENIED", "authority_revoked")
+
+    result = process_rebuild_projection(
+        core.storage, core.clock, ctx, original, model=LateRefusal(), started=core.clock.monotonic(), budget=10
+    )
+    assert result == ("stale", None, "leased")
+    with core.storage.read(ctx) as tx:
+        row = (
+            tx._check()
+            .execute(
+                "SELECT m.usable,v.entity_resolved FROM entity_name_mentions m JOIN claim_versions v "
+                "ON v.claim_id=m.claim_ref AND v.revision=m.claim_revision WHERE m.claim_ref=?",
+                (source.ref,),
+            )
+            .fetchone()
+        )
+        assert tuple(row) == (1, 0)
 
 
 def test_candidate_evidence_matches_a_name_before_sentence_punctuation(app):

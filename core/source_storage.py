@@ -17,10 +17,10 @@ from . import lexical_index
 from .adoption_schedule import reconcile_after_capture
 from .delete_storage import canonical, group_digest, purged_group_key
 from .events import (
-    indexed_terms,
     prepare_capture,
     query_terms,
     segment_key,
+    source_lexical_projection,
     stored_content_digest,
     tool_observation_excerpt,
     withheld_tool_output,
@@ -35,6 +35,12 @@ from .visibility import allowed, deletion_allows
 def source_reference(installation_id: str, key: str) -> str:
     """The stable source reference of an event key within one installation."""
     return "event-" + hashlib.sha256(canonical([installation_id, key]).encode("utf-8")).hexdigest()
+
+
+def _source_projection(source: StoredSource) -> tuple[tuple[str, ...], bool]:
+    """Reuse the current clean credential verdict tied to this authoritative body."""
+    secret_free = source.content_secret_scan == (SECRET_RULES_VERSION, source.content_sha256, ())
+    return source_lexical_projection(source.event, secret_free=secret_free)
 
 
 def _seconds_apart(first: object, second: object) -> float:
@@ -468,18 +474,21 @@ class Sources:
         return SourceWrite("inserted", ref, revision)
 
     def index_source(self, ref: str, revision: int) -> None:
+        """Repair this visible version's postings inside the writer transaction."""
         conn = self._tx._check(write=True)
         source = self._tx.source(ref, revision)
         if source is None:
             raise ContractError("SOURCE_MISSING")
         identity = lexical_index.source_id(conn, ref, revision)
-        terms = indexed_terms(source.event)
-        if withheld_tool_output(source.event) or tool_observation_excerpt(source.event) is not None:
-            # Repair may encounter postings from before the source was excerpted.
+        terms, may_add = _source_projection(source)
+        if not may_add or withheld_tool_output(source.event) or tool_observation_excerpt(source.event) is not None:
+            # Historical postings can contain the full output or uncensored transport data.
             lexical_index.unindex_beyond(conn, identity, terms)
-        lexical_index.index_terms(conn, identity, terms)
+        if may_add:
+            lexical_index.index_terms(conn, identity, terms)
 
     def source_projection_status(self, ref: str, revision: int) -> tuple[str, str]:
+        """Report lexical readiness and semantic work state for a visible version."""
         conn = self._tx._check()
         source = self._tx.source(ref, revision)
         if source is None:
@@ -487,7 +496,9 @@ class Sources:
                 return "not_indexed", "not_scheduled"
             raise ContractError("SOURCE_MISSING")
         actual = lexical_index.terms_of(conn, lexical_index.source_id(conn, ref, revision))
-        lexical = "ready" if actual == indexed_terms(source.event) else "not_ready"
+        terms, may_add = _source_projection(source)
+        ready = actual == terms if may_add else set(actual).issubset(terms)
+        lexical = "ready" if ready else "not_ready"
         work = conn.execute(
             "SELECT state FROM work_items WHERE work_type='embed' AND subject_ref=? AND subject_revision=?",
             (ref, revision),

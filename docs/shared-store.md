@@ -134,18 +134,19 @@ store; a 1.x or 2.x store is migrated into the agent's home first (`scope-recall
 
 ## Attach Codex or Claude Code
 
-For a client on the owner's computer, `attach` can show a complete command to reuse one verified entry's access. Omit both
-grant options to get a preview when the attached entries agree on the owner and readable scopes. A client that
-captures also needs a writable donor. Writable donors must agree on the write scopes and capture destination.
-Review and run the suggested command to attach the client. If the store has uncheckpointed SQLite changes,
-or the bindings cannot be verified, the preview asks for explicit grants. Choose the owner grants with
-`--grants-like` and the capture destination with `--capture-like`. The explicit command can run while the worker is active. A read-only MCP
-entry takes only read grants. Rows without a verified owner do not supply grants. What the owner types into
-it is captured into the scope another entry's owner captures into (`--capture-like`), which must
-be one every effective owner row of every attached entry reads, so that every agent hears it; otherwise
-`attach` refuses and names the rows that would not. No other entry's grants change and the
-worker keeps running. On a store no other entry is attached to, leave both options out: the
-client brings the owner's scope ([A store of clients alone](#a-store-of-clients-alone)).
+Omit both grant options to preview a command that gives a new client the same access as a verified client on this
+computer. The preview checks local clients' OS account, attachment pointer, active owner grants and store entry
+state. Local clients must agree on the readable scopes. A client that captures needs a hook client whose writable
+scopes and capture destination agree with the other local hook clients. A read-only MCP client can take its read
+scopes from either client type. The preview reads committed SQLite changes while the worker is active, including
+changes still in the write-ahead log.
+
+Review the suggested command before running it. If a local client's grants conflict, its binding cannot be verified,
+or its store entry is paused, read-only or pending recovery, choose the grants explicitly with `--grants-like`
+and the capture destination with `--capture-like`. The capture scope must be readable by the effective owner rows
+of the attached entries with capture support, including Hermes and remote entries. `attach` names the owner rows
+that would miss the capture. For a read-only MCP client, provide only `--grants-like`. On a store with no attached
+entries, leave both options out to use the new client's owner scope ([A store of clients alone](#a-store-of-clients-alone)).
 
 ```text
 scope-recall attach --host claude-code --instance-root "<claude-code-home>" --root "<store>" --entry claude-code --display-name "Claude Code" --grants-like all --capture-like desk --runtime-config-from "<attached-runtime-config>"
@@ -285,8 +286,8 @@ scope-recall entries --root "<store>"
 scope-recall doctor --host hermes --instance-root "<home>"
 ```
 
-`entries` lists each entry, whether its home still points here, and when the store last heard
-from it; it reads each home's pointer holding that home's lock, one home at a time. `doctor` on an
+`entries` lists each entry, whether it could verify a local pointer to this store, and when the store last heard
+from it. It reads each local home's pointer holding that home's lock, one home at a time. `doctor` on an
 attached home reports the shared store it belongs to, the store's health
 and the shared worker's registration.
 
@@ -435,8 +436,8 @@ references retain their existing semantics.
    to do next.
 4. Register the worker again (`autostart enable` with the new config path) and fill in `.env`
    for the new machine.
-5. Attach every agent again from its home. An entry whose old home no longer points at this
-   store can be attached from a new home under the same id.
+5. Attach every agent again from its home. An active entry can reuse its id from a new home when its previous
+   local pointer is absent or points to a different local store. Detaching the entry releases its id for a new home.
 
 ## Upgrading
 
