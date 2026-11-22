@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from scope_recall.contracts import TrustedSourcePrincipal
+from scope_recall.contracts import TrustedSourcePrincipal, claim_evidence_span_limit
 from scope_recall.core.language_resources import prompt_text
 from scope_recall.core.recall_budget import estimate_tokens
 from scope_recall.maintenance.setup_configuration import runtime_payload
@@ -94,7 +94,7 @@ def counting_response(proposals, records):
             elif task == "describe_adoption":
                 stage = task
                 answer = json.dumps(dict(decision="Back up the configuration.", topic="Backup strategy", importance=4))
-            elif system == prompt_text("session_summary"):
+            elif system == prompt_text("session_summary").replace("{max_sentences}", str(claim_evidence_span_limit())):
                 stage = "task_summary" if task else "session_summary"
                 source = payload["sources"][0]
                 answer = json.dumps(

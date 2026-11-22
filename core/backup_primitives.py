@@ -191,6 +191,85 @@ def seal_backup_manifest(value: dict[str, Any]) -> dict[str, Any]:
     return {**structural, "manifest_sha256": hashlib.sha256(_canonical(structural)).hexdigest()}
 
 
+class _ClosedWalChangedError(sqlite3.OperationalError):
+    """Raised when a writer opens a previously closed WAL file during an immutable read."""
+
+
+def _sqlite_sidecars_present(path: Path) -> bool:
+    return any(os.path.lexists(path.with_name(path.name + suffix)) for suffix in ("-wal", "-shm", "-journal"))
+
+
+def _sqlite_header_stamp(path: Path) -> tuple[int, int, int, int, int, bytes]:
+    info = path.stat()
+    with path.open("rb") as stream:
+        header = stream.read(100)
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, header)
+
+
+@contextmanager
+def readonly_sqlite(
+    path: Path, *, timeout: float = 5.0, immutable_when_closed: bool = True
+) -> Iterator[sqlite3.Connection]:
+    """Read SQLite without creating empty WAL/SHM sidecars on a cleanly closed WAL file."""
+    stamp: tuple[int, int, int, int, int, bytes] | None = None
+    uri = f"{path.as_uri()}?mode=ro"
+    if immutable_when_closed and not _sqlite_sidecars_present(path):
+        candidate = _sqlite_header_stamp(path)
+        header = candidate[5]
+        if len(header) >= 20 and header[:16] == b"SQLite format 3\x00" and header[18:20] == b"\x02\x02":
+            stamp = candidate
+            uri = f"{path.as_uri()}?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True, timeout=timeout)
+    try:
+        yield conn
+    finally:
+        conn.close()
+    if stamp is not None and (_sqlite_sidecars_present(path) or _sqlite_header_stamp(path) != stamp):
+        raise _ClosedWalChangedError("SQLite database changed while reading closed WAL snapshot")
+
+
+def _copy_verified_sqlite(
+    source_path: Path,
+    destination_path: Path,
+    *,
+    automatic_upgrade: bool,
+    immutable_when_closed: bool,
+) -> dict[str, Any]:
+    writer: sqlite3.Connection | None = None
+    try:
+        with readonly_sqlite(source_path, immutable_when_closed=immutable_when_closed) as reader:
+            writer = sqlite3.connect(destination_path)
+            reader.backup(writer, pages=256, progress=lambda _status, _remaining, _total: check_backup_deadline())
+            writer.commit()
+        writer.execute("PRAGMA journal_mode=DELETE")
+        writer.set_progress_handler(lambda: check_backup_deadline() or 0, 1000)
+        try:
+            quick = str(writer.execute("PRAGMA quick_check").fetchone()[0])
+        except sqlite3.Error:
+            check_backup_deadline()
+            raise
+        finally:
+            writer.set_progress_handler(None, 0)
+        check_backup_deadline()
+        if quick.lower() != "ok":
+            raise BackupError(f"backup quick_check failed: {quick}")
+        structural: dict[str, Any] = {
+            "format": "scope-recall-p15-sqlite-backup/1",
+            "backup_sha256": sha256(destination_path),
+            "size_bytes": destination_path.stat().st_size,
+            "user_version": int(writer.execute("PRAGMA user_version").fetchone()[0]),
+            "application_id": int(writer.execute("PRAGMA application_id").fetchone()[0]),
+            "quick_check": quick,
+        }
+        if automatic_upgrade:
+            structural["automatic_upgrade"] = True
+            structural["upgrade_role"] = "attempt"
+        return structural
+    finally:
+        if writer is not None:
+            writer.close()
+
+
 def backup_sqlite(
     source: str | Path,
     destination: str | Path,
@@ -209,40 +288,14 @@ def backup_sqlite(
     if manifest_path is not None and (manifest_path in {source_path, destination_path} or manifest_path.exists()):
         raise BackupError("refusing to overwrite existing backup manifest")
     create_output(destination_path)
-    reader = writer = None
     try:
-        reader = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)
-        writer = sqlite3.connect(destination_path)
-        reader.backup(writer, pages=256, progress=lambda _status, _remaining, _total: check_backup_deadline())
-        writer.commit()
-        writer.execute("PRAGMA journal_mode=DELETE")
-        writer.set_progress_handler(lambda: check_backup_deadline() or 0, 1000)
-        try:
-            quick = str(writer.execute("PRAGMA quick_check").fetchone()[0])
-        except sqlite3.Error:
-            check_backup_deadline()
-            raise
-        finally:
-            writer.set_progress_handler(None, 0)
-        check_backup_deadline()
-        if quick.lower() != "ok":
-            raise BackupError(f"backup quick_check failed: {quick}")
-        structural = {
-            "format": "scope-recall-p15-sqlite-backup/1",
-            "backup_sha256": sha256(destination_path),
-            "size_bytes": destination_path.stat().st_size,
-            "user_version": int(writer.execute("PRAGMA user_version").fetchone()[0]),
-            "application_id": int(writer.execute("PRAGMA application_id").fetchone()[0]),
-            "quick_check": quick,
-        }
-        if automatic_upgrade:
-            structural["automatic_upgrade"] = True
-            structural["upgrade_role"] = "attempt"
-    finally:
-        if reader is not None:
-            reader.close()
-        if writer is not None:
-            writer.close()
+        structural = _copy_verified_sqlite(
+            source_path, destination_path, automatic_upgrade=automatic_upgrade, immutable_when_closed=True
+        )
+    except _ClosedWalChangedError:
+        structural = _copy_verified_sqlite(
+            source_path, destination_path, automatic_upgrade=automatic_upgrade, immutable_when_closed=False
+        )
     structural = seal_backup_manifest(structural)
     if manifest_path is not None:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,6 +313,7 @@ __all__ = [
     "create_output",
     "exclusive_store",
     "first_link",
+    "readonly_sqlite",
     "safe_path",
     "sha256",
     "sqlite_busy",

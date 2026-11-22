@@ -32,8 +32,8 @@ from scope_recall.core.storage import SQLiteStorage
 from scope_recall.core.store_upgrade import read_upgrade_state
 from scope_recall.core.truth_connection import connect_truth_database
 from scope_recall.core.writer_lease import TruthWriterBusyError, TruthWriterLease
+from scope_recall.host_registry import ENTRY_HOSTS, INSTALL_HOSTS, LOCAL_STORE_HOSTS
 
-from ..host_registry import ENTRY_HOSTS, INSTALL_HOSTS, LOCAL_STORE_HOSTS
 from .backup import BackupError, sqlite_busy
 from .compact_store import add_arguments as _add_compact_store_arguments
 from .compact_store import compact_store
@@ -204,9 +204,9 @@ def _run_core(
     failed: Callable[[dict], bool] = lambda receipt: False,
 ) -> int:
     """Open the bound core for one maintenance call; contract and config failures exit 2."""
-    from ..contracts import ContractError
-    from ..core import CoreConfig, MemoryCore
-    from ..runtime.worker_entry import load_config
+    from scope_recall.contracts import ContractError
+    from scope_recall.core import CoreConfig, MemoryCore
+    from scope_recall.runtime.worker_entry import load_config
 
     try:
         config = load_config(_path(args.config, "config"))
@@ -345,7 +345,7 @@ def _add_retry_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _retry_failures(args: argparse.Namespace) -> int:
     def retry(core, config):
-        from ..adapters.clients.ledger import retry_given_up
+        from scope_recall.adapters.clients.ledger import retry_given_up
 
         receipt = core.operations.retry_failed_work(
             config.context(),

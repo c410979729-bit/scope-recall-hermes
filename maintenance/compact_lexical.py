@@ -9,12 +9,12 @@ from collections.abc import Iterator
 from itertools import islice
 from types import SimpleNamespace
 
-from ..core import lexical_index
-from ..core.backup_primitives import BackupError
-from ..core.delete_storage import group_digest
-from ..core.events import tool_lexical_projection
-from ..core.injection_guard import held_roots_sql
-from ..core.secret_patterns import SECRET_RULES_VERSION
+from scope_recall.core import lexical_index
+from scope_recall.core.backup_primitives import BackupError
+from scope_recall.core.delete_storage import group_digest
+from scope_recall.core.events import tool_lexical_projection
+from scope_recall.core.injection_guard import held_roots_sql
+from scope_recall.core.secret_patterns import SECRET_RULES_VERSION
 
 _PAGE_SIZE = 512
 _POSTING_BYTES = 16  # Two logical 64-bit identifiers, counted once per posting.

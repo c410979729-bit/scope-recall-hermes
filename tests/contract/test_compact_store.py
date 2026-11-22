@@ -550,3 +550,58 @@ def test_verification_failure_leaves_no_published_or_staging_file(app, tmp_path,
     assert "verification failure" in capsys.readouterr().out
     assert not output.exists() and not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*"))
     assert sha256(source) == before
+
+
+@pytest.mark.parametrize("host", ["hermes", "shared"])
+def test_documented_backup_and_compaction_commands_complete_end_to_end(tmp_path, host, capsys):
+    import shlex
+
+    from scope_recall.adapters.hermes.installation import build_installation_manifest, install_hermes_scope_recall
+    from scope_recall.adapters.hermes.shared_entries import (
+        attach_shared_record,
+        read_shared_payload,
+        shared_entry_record,
+    )
+    from scope_recall.maintenance.shared import init_shared, store_binding
+
+    documentation = Path(__file__).resolve().parents[2] / "docs" / "backup-restore.md"
+    commands = [
+        line for line in documentation.read_text(encoding="utf-8").splitlines() if line.startswith("scope-recall ")
+    ]
+    home = tmp_path / "original"
+    if host == "shared":
+        init_shared(root=home, agent_id="agent1", test_mode=True)
+        local = build_installation_manifest(tmp_path / "agent1", agent_id="agent1", test_mode=True)
+        moment = "2026-10-23T00:00:00Z"
+        record = shared_entry_record(local, entry_id="agent1", display_name="agent1", attached_at=moment)
+        attach_shared_record(home, record, now=moment)
+        payload = read_shared_payload(home)
+        binding = store_binding(payload, home, frozenset(payload["scope_ids"]))
+    else:
+        binding, _core = install_hermes_scope_recall(home, agent_id="agent1", test_mode=True)
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    selected = [commands[0 if host == "shared" else 1], *commands[2:]]
+    replacements = {
+        "/path/to/shared-store": str(home),
+        "/path/to/agent1": str(home),
+        "/path/to/backups/memory.zip": str(tmp_path / "backups" / "memory.zip"),
+        "/path/to/recovered": str(tmp_path / "recovered"),
+        "/path/to/memory.sqlite3": str(binding.data_directory / "memory.sqlite3"),
+        "/path/to/archive/compacted.sqlite3": str(archive / "compacted.sqlite3"),
+    }
+    receipts = []
+    for command in selected:
+        arguments = [replacements.get(value, value) for value in shlex.split(command)[1:]]
+        assert main(arguments) == 0
+        receipts.append(json.loads(capsys.readouterr().out))
+    assert [item["status"] for item in receipts] == [
+        "created",
+        "verified",
+        "verified",
+        "planned",
+        "restored",
+        "dry_run",
+        "compacted",
+    ]
+    assert (archive / "compacted.sqlite3").is_file()

@@ -35,6 +35,7 @@ from ..core.backup_primitives import (
     check_backup_deadline,
     copy_stream,
     exclusive_store,
+    readonly_sqlite,
     safe_path,
     sha256,
     stream_digest,
@@ -138,7 +139,7 @@ def _discover_included_entries(data_directory: Path, binding: InstanceBinding) -
     db_path = data_directory / "memory.sqlite3"
     if db_path.is_file():
         try:
-            with closing(sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)) as conn:
+            with readonly_sqlite(db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT entry_id, display_name, host, first_seen, last_seen FROM entries")
                 for row in cursor.fetchall():

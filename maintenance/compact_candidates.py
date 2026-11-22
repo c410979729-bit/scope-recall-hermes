@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 
-from ..core.backup_primitives import BackupError
-from ..core.candidate_lifecycle import RULE_VERSION
-from ..core.candidate_tables import reachable_sql
-from ..core.source_origin import ACTION as SOURCE_ORIGIN_ACTION
+from scope_recall.core.backup_primitives import BackupError
+from scope_recall.core.candidate_lifecycle import RULE_VERSION
+from scope_recall.core.candidate_tables import reachable_sql
+from scope_recall.core.source_origin import ACTION as SOURCE_ORIGIN_ACTION
 
 # Dormancy changes the whole candidate and therefore requires the whole revision
 # to be quiet. Evaluation history is selected separately, one question at a time.

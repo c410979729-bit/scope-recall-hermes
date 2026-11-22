@@ -266,8 +266,18 @@ def test_decoder_repairs_unique_serialized_quote_but_never_fuzzy_support(worker_
     assert "procedure" not in value["claim_proposals"][0]
     assert value["claim_proposals"][0]["evidence_spans"][0]["quote"] in raw
     p["evidence_spans"][0]["quote"] = "TEST invented quote"
-    value = decode_consolidation_result(json.dumps(consolidation_payload(source, claims=[p])), (source,))
-    assert value["claim_proposals"][0]["evidence_spans"][0]["quote"] == "TEST invented quote"
+    with pytest.raises(ContractError) as refused:
+        decode_consolidation_result(json.dumps(consolidation_payload(source, claims=[p])), (source,))
+    assert (refused.value.code, refused.value.field) == (
+        "DERIVATION_INVALID",
+        "claim_proposals[0].evidence_spans[0].quote",
+    )
+    rejected = []
+    value = decode_consolidation_result(
+        json.dumps(consolidation_payload(source, claims=[p])), (source,), rejected_items=rejected
+    )
+    assert value["claim_proposals"] == []
+    assert [item.field for item in rejected] == ["claim_proposals[0].evidence_spans[0].quote"]
 
 
 def test_external_wake_due_future_pause_and_task_plan(tmp_path):

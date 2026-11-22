@@ -123,9 +123,9 @@ def test_recall_uses_this_and_not_its_own_copy():
     """Two spellings of the same idea drift; this one already did."""
     import inspect
 
-    from scope_recall.core import recall
+    from scope_recall.core import recall, recall_channels
 
-    source = inspect.getsource(recall)
+    source = inspect.getsource(recall) + "\n" + inspect.getsource(recall_channels)
     assert "vector_failure_label(exc)" in source
     assert "label = type(exc).__name__" not in source
 

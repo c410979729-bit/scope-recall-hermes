@@ -15,10 +15,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from ..core.backup_primitives import BackupError, create_output, exclusive_store, first_link, safe_path
-from ..core.file_access import preserve_file_access
-from ..core.schema import APPLICATION_ID, SCHEMA_VERSION
-from ..core.writer_lease import TRUTH_WRITER_LEASE_FILENAME, TRUTH_WRITER_LEASE_INFO_FILENAME
+from scope_recall.core.backup_primitives import BackupError, create_output, exclusive_store, first_link, safe_path
+from scope_recall.core.file_access import preserve_file_access
+from scope_recall.core.schema import APPLICATION_ID, SCHEMA_VERSION
+from scope_recall.core.writer_lease import TRUTH_WRITER_LEASE_FILENAME, TRUTH_WRITER_LEASE_INFO_FILENAME
+
 from ._compact_pager import SCRIPT_PATH, STAGE_PREFIX, file_revision, sidecars
 from .compact_candidates import measure_candidates, trim_candidates
 from .compact_lexical import compact_tool_lexical, measure_tool_lexical

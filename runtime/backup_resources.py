@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +21,7 @@ from ..core.backup_primitives import (
     check_backup_deadline,
     copy_stream,
     first_link,
+    readonly_sqlite,
     safe_path,
     sha256,
 )
@@ -361,7 +361,7 @@ def _stage_worker_day(data: Path, stage: Path, files: list[dict], resources: lis
     config = _read_runtime_config(data) or {}
     installation = config.get("binding", {}).get("installation_id")
     if not installation:
-        with closing(sqlite3.connect(f"{(data / 'memory.sqlite3').as_uri()}?mode=ro", uri=True)) as conn:
+        with readonly_sqlite(data / "memory.sqlite3") as conn:
             installation = conn.execute("SELECT installation_id FROM instance_meta WHERE singleton=1").fetchone()[0]
     try:
         if source.stat().st_size > 4096:

@@ -536,8 +536,7 @@ def test_P08_what_the_channels_before_an_interrupted_one_found_still_answers(app
     """Keep the exact candidate found before an interrupted lexical statement.
     Hydration has its own allowance and runs without collection's exhausted
     progress handler; its long statement proves that the handler was removed."""
-    from scope_recall.core import recall as recall_module
-    from scope_recall.core import retrieval_storage
+    from scope_recall.core import recall_channels, retrieval_storage
 
     core, ctx = app
     target = capture(core, ctx, "TEST 值班表明天换人。", key="TEST-p08/interrupt-exact")
@@ -557,7 +556,7 @@ def test_P08_what_the_channels_before_an_interrupted_one_found_still_answers(app
         ).fetchone()
         return hydrate(self, tx, candidate, context)
 
-    monkeypatch.setattr(recall_module, "_INTERRUPT_STEPS", 1_000)
+    monkeypatch.setattr(recall_channels, "_INTERRUPT_STEPS", 1_000)
     monkeypatch.setattr(retrieval_storage.RetrievalStorage, "lexical", slow)
     monkeypatch.setattr(retrieval_storage.RetrievalStorage, "hydrate", hydrate_after_a_statement)
     request = recall_request(query="TEST 值班表", mode="current", focus_refs=[f"{target.ref}@{target.revision}"])

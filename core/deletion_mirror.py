@@ -11,11 +11,11 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable
-from contextlib import closing
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from ..contracts import ContractError
+from .backup_primitives import readonly_sqlite
 from .delete_storage import canonical
 from .deletion_mirror_checkpoint import (
     record_key,
@@ -201,46 +201,46 @@ def _catchup(
         advisory_file_lock(target.with_suffix(".lock"), timeout_seconds=lock_timeout_seconds),
         target.open("a+b") as stream,
         _safe_mirror(data_directory / DELETION_MIRROR_CHECKPOINT_FILENAME).open("a+b") as cache_stream,
-        closing(sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)) as conn,
     ):
-        conn.row_factory = sqlite3.Row
+        with readonly_sqlite(db_path) as conn:
+            conn.row_factory = sqlite3.Row
 
-        def validate_files():
-            validate_mutable_file(stream)
-            validate_mutable_file(cache_stream)
+            def validate_files():
+                validate_mutable_file(stream)
+                validate_mutable_file(cache_stream)
 
-        def bounded_check():
-            check()
-            validate_files()
-
-        bounded_check()
-        conn.execute("ATTACH DATABASE ? AS mirror_cache", (str(cache_stream.name),))
-        bounded_check()
-        scan_inventory(conn, stream, bounded_check, validate=validate_files)
-        count = 0
-        conn.execute("BEGIN")
-        conn.set_progress_handler(lambda: (bounded_check(), 0)[1], 1000)
-        try:
-            for item in _truth_records(conn, indexed=True):
-                bounded_check()
-                if conn.execute(
-                    "SELECT 1 FROM mirror_cache.records WHERE installation_id=? AND kind=? AND record_id=?",
-                    record_key(item),
-                ).fetchone():
-                    continue
-                stream.write((canonical(item) + "\n").encode("utf-8"))
-                stream.flush()
+            def bounded_check():
+                check()
                 validate_files()
-                remember_record(conn, item)
-                count += 1
-            check()
-        except sqlite3.OperationalError:
-            check()
-            raise
-        finally:
-            conn.set_progress_handler(None, 0)
-            save_inventory(conn, stream, validate=validate_files)
-        # Never clear lag before every record has been persisted.
+
+            bounded_check()
+            conn.execute("ATTACH DATABASE ? AS mirror_cache", (str(cache_stream.name),))
+            bounded_check()
+            scan_inventory(conn, stream, bounded_check, validate=validate_files)
+            count = 0
+            conn.execute("BEGIN")
+            conn.set_progress_handler(lambda: (bounded_check(), 0)[1], 1000)
+            try:
+                for item in _truth_records(conn, indexed=True):
+                    bounded_check()
+                    if conn.execute(
+                        "SELECT 1 FROM mirror_cache.records WHERE installation_id=? AND kind=? AND record_id=?",
+                        record_key(item),
+                    ).fetchone():
+                        continue
+                    stream.write((canonical(item) + "\n").encode("utf-8"))
+                    stream.flush()
+                    validate_files()
+                    remember_record(conn, item)
+                    count += 1
+                check()
+            except sqlite3.OperationalError:
+                check()
+                raise
+            finally:
+                conn.set_progress_handler(None, 0)
+                save_inventory(conn, stream, validate=validate_files)
+        # Never clear lag before every record has been persisted and verified.
         mirror_lag_path(data_directory).unlink(missing_ok=True)
     return {"status": "caught_up" if count else "up_to_date", "caught_up": count}
 
@@ -285,7 +285,7 @@ def mirror_pending(data_directory: Path, backup_dir: Path) -> int:
     path = mirror_file_path(backup_dir)
     known = {record_key(item) for item in load_mirror_records(path)} if path.exists() else set()
     db_path = data_directory / "memory.sqlite3"
-    with closing(sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)) as conn:
+    with readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
         return sum(record_key(item) not in known for item in _truth_records(conn))

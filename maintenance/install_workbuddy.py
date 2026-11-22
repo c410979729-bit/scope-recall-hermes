@@ -27,7 +27,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from ..host_registry import HOOK_TIMEOUTS as REMOTE_HOOK_TIMEOUTS
+from scope_recall.host_registry import HOOK_TIMEOUTS as REMOTE_HOOK_TIMEOUTS
+
 from . import install_client
 from .install_client import (  # noqa: F401 -- install.py calls these on every host's module
     approve_local_platforms,

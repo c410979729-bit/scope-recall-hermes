@@ -37,6 +37,7 @@ EXCEPTIONS = {
     "adapters/hermes/register.py": "Hermes owns the importing process.",
     "distribution/hermes/__init__.py": "Hermes loads this plugin wrapper in its own process.",
     "runtime/_http_worker.py": "The isolated HTTP transport uses only the standard library.",
+    "maintenance/_compact_pager.py": "The isolated SQLite lock holder uses only the standard library.",
     "adapters/clients/remote_client.py": "The HTTP forwarding client does not perform vector computations.",
     "maintenance/autostart.py": "Scheduler administration launches workers in separate owned processes.",
     "maintenance/package_health.py": "Installed-artifact diagnostics do not import numerical libraries.",

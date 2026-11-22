@@ -11,9 +11,10 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
-from ..core.backup_primitives import create_output, safe_path
-from ..core.file_access import preserve_file_access
-from ..core.truth_connection import require_query_only
+from scope_recall.core.backup_primitives import create_output, safe_path
+from scope_recall.core.file_access import preserve_file_access
+from scope_recall.core.truth_connection import require_query_only
+
 from ._compact_pager import SCRIPT_PATH
 
 _MEMORY_SNAPSHOT_BYTES = 16 * 1024 * 1024

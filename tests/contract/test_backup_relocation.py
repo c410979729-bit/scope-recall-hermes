@@ -640,7 +640,9 @@ def test_background_backup_cannot_exceed_an_expired_pass(tmp_path):
 def test_documented_commands_back_up_verify_rehearse_and_restore(tmp_path, host, capsys):
     documentation = Path(__file__).resolve().parents[2] / "docs" / "backup-restore.md"
     commands = [
-        line for line in documentation.read_text(encoding="utf-8").splitlines() if line.startswith("scope-recall ")
+        line
+        for line in documentation.read_text(encoding="utf-8").splitlines()
+        if line.startswith(("scope-recall backup ", "scope-recall restore "))
     ]
     home = tmp_path / "original"
     if host == "shared":
@@ -667,9 +669,16 @@ def test_documented_commands_back_up_verify_rehearse_and_restore(tmp_path, host,
         receipts.append(json.loads(capsys.readouterr().out))
         if receipts[-1]["status"] == "planned":
             assert not (tmp_path / "recovered").exists()
-    assert [item["status"] for item in receipts] == ["created", "verified", "verified", "planned", "restored"]
+    assert [item["status"] for item in receipts] == [
+        "created",
+        "verified",
+        "verified",
+        "planned",
+        "restored",
+    ]
+    assert not list(binding.data_directory.glob("memory.sqlite3-*"))
     assert receipts[2]["restore_check"]["doctor"]["binding_verified"]
-    recovered = receipts[-1]
+    recovered = receipts[4]
     assert recovered["doctor"]["binding_verified"]
     assert recovered["deletion_protection"]["installation_id"] == binding.installation_id
     assert recovered["unrecoverable_later_interval"]["start_utc"] == receipts[0]["created_at_utc"]

@@ -10,7 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
-from ..host_registry import HOOK_CLIENT_HOSTS, HOSTS
+from scope_recall.host_registry import HOOK_CLIENT_HOSTS, HOSTS
+
 from . import install_antigravity, install_claude_code, install_codex, install_dsh, install_hermes, install_workbuddy
 from .backup import adjacent_backup, atomic_write, sha256, write_private_configuration
 from .install_common import (
@@ -409,7 +410,7 @@ def _stop_residents(host: str, instance_root: Path) -> None:
         return
     import sys
 
-    from ..adapters.clients.local_endpoint import live_residents, stop_residents
+    from scope_recall.adapters.clients.local_endpoint import live_residents, stop_residents
 
     try:
         stop_residents(instance_root, host)
@@ -603,7 +604,8 @@ def _disable_autostart(data_dir: Path) -> None:
     registration_path = data_dir / "runtime-autostart.json"
     if not registration_path.is_file():
         return
-    from ..runtime.worker_entry import load_config
+    from scope_recall.runtime.worker_entry import load_config
+
     from .autostart import disable
 
     registration = json.loads(registration_path.read_text(encoding="utf-8"))
