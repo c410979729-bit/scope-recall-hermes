@@ -890,6 +890,43 @@ def test_doctor_names_a_surface_whose_unnamed_sessions_are_refused(hermes_home, 
     assert "approve the surface with apply-install --local-platform tui" in check["detail"]
 
 
+def test_a_dashboard_login_of_this_account_is_recorded_where_the_store_awaits_its_approval(
+    hermes_home, initialize_kwargs, this_account
+):
+    """A dashboard login names this machine's own account, but it is not the transport's conversation.
+
+    Where the store still awaits its owner's approval, that login binds no scope; the record ``doctor``
+    reads is the only way the person learns a store left that way says nothing about their sessions.
+    """
+    _binding, core = _install(hermes_home, initialize_kwargs, local_platforms=("desktop",))
+    manifest = load_installation_manifest(hermes_home)
+    write_installation_manifest(replace(manifest, local_account_id=None))
+
+    provider = ScopeRecallHermesAdapter(core=core)
+    provider.initialize(
+        "TEST-dashboard-session",
+        **_session(
+            initialize_kwargs,
+            "desktop",
+            user_id=THIS_ACCOUNT,
+            chat_type="private",
+            chat_id=THIS_ACCOUNT,
+            gateway_session_key=f"agent:main:desktop:dm:{THIS_ACCOUNT}",
+        ),
+    )
+    provider.shutdown()
+
+    [record] = unbound_sessions.owner_sessions_unbound(manifest.data_directory, entry_id="")
+    assert record["platform"] == "desktop"
+    assert "capability_gap:local_account_binding" in record["gaps"]
+
+    report = doctor.run_doctor(host="hermes", instance_root=hermes_home)
+    [check] = _local_sessions_check(report)
+    assert "local_session_unbound" in report.capability_gaps
+    assert check["result"] == "unbound" and check["detail"].startswith("desktop:")
+    assert THIS_ACCOUNT not in json.dumps(report.to_dict())
+
+
 def _ended_record(folder, *, entry_id, platform, pid):
     """A dead process record, including ids beyond POSIX's signed native int range."""
     folder.mkdir(exist_ok=True)

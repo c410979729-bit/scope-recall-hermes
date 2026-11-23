@@ -115,7 +115,7 @@ def host_account_principal() -> str | None:
         return None
 
 
-def _names_this_account(user_id: object) -> bool:
+def names_this_account(user_id: object) -> bool:
     account = host_account_principal()
     return account is not None and str(user_id or "").strip() == account
 
@@ -175,7 +175,7 @@ class HermesIdentity:
             and (
                 sender_id == self.local_account_principal
                 if self.local_account_principal is not None
-                else _names_this_account(sender_id)
+                else names_this_account(sender_id)
             )
         )
 
@@ -455,7 +455,7 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
     if conversation and (
         str(kwargs.get("user_id") or "").strip() == account
         if account is not None
-        else _names_this_account(kwargs.get("user_id"))
+        else names_this_account(kwargs.get("user_id"))
     ):
         # The person at this machine, bound as a session that names no user is on these surfaces.  Named, though, it
         # is somebody, the owner: where the installer approved no grant it binds no scope, as a login nobody approved
