@@ -42,6 +42,7 @@ from .doctor_store import read_journal_mode, recorded_schema_under_stale_header,
 from .install import InstallError, apply_install, apply_uninstall, default_target, plan_install, plan_uninstall
 from .install_common import absolute
 from .install_hermes import LOCAL_PLATFORM_CHOICES
+from .store_snapshot import SNAPSHOT_OPERATIONAL_MESSAGES
 
 
 def _emit(payload: dict) -> None:
@@ -695,8 +696,20 @@ def _compact_store(args: argparse.Namespace) -> int:
     """Emit a read-only estimate or a verified offline compaction receipt."""
     if args.apply != (args.output is not None):
         raise BackupError("--output is required with --apply and unavailable with --dry-run")
+    if args.apply and args.temp_dir is not None:
+        raise BackupError("--temp-dir is only available with --dry-run")
     try:
-        result = compact_store(args.source, output=args.output, retention_days=args.retention_days)
+        result = compact_store(
+            args.source,
+            output=args.output,
+            retention_days=args.retention_days,
+            temp_dir=args.temp_dir,
+        )
+    except sqlite3.OperationalError as exc:
+        detail = str(exc)
+        if detail in SNAPSHOT_OPERATIONAL_MESSAGES:
+            raise BackupError(f"SQLite compaction failed: {detail}") from exc
+        raise BackupError(f"SQLite compaction failed ({getattr(exc, 'sqlite_errorname', type(exc).__name__)})") from exc
     except sqlite3.Error as exc:
         raise BackupError(f"SQLite compaction failed ({getattr(exc, 'sqlite_errorname', type(exc).__name__)})") from exc
     except OSError as exc:

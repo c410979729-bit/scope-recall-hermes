@@ -12,16 +12,17 @@ from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..adapters.clients import CodexHookHandler, antigravity
-from ..adapters.hermes.audiences import LOCAL_USER_ID
-from ..adapters.hermes.provider import ScopeRecallHermesAdapter
-from ..contracts import ContractError
-from ..core.recall_log_writer import close_writers
-from ..core.writer_lease import TruthWriterBusyError
-from ..host_registry import HOSTS
-from ..runtime.instance import build_runtime_instance
-from ..runtime.instance_config import RuntimeInstanceConfig
-from ..runtime.worker_entry import credential_environment, run_worker
+from scope_recall.adapters.clients import CodexHookHandler, antigravity
+from scope_recall.adapters.hermes.audiences import LOCAL_USER_ID
+from scope_recall.adapters.hermes.provider import ScopeRecallHermesAdapter
+from scope_recall.contracts import ContractError
+from scope_recall.core.recall_log_writer import close_writers
+from scope_recall.core.writer_lease import TruthWriterBusyError
+from scope_recall.host_registry import HOSTS
+from scope_recall.runtime.instance import build_runtime_instance
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+from scope_recall.runtime.worker_entry import credential_environment, run_worker
+
 from .doctor import load_binding
 from .install_common import HostChoice
 from .install_hermes import profile_identity
@@ -294,7 +295,7 @@ def verify_memory(parent: Path, host: HostChoice, source: dict, *, env_file: str
     from .setup_configuration import runtime_payload
 
     if host == "hermes":
-        from ..adapters.hermes.identity import bind_hermes_identity
+        from scope_recall.adapters.hermes.identity import bind_hermes_identity
 
         # Check the selected entry with the real host identity before probing a disposable store.
         bind_hermes_identity(

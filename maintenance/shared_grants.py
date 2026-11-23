@@ -9,18 +9,19 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ..adapters.attachment_paths import UnverifiedAttachmentPath, local_attachment_stat, same_local_path
-from ..adapters.audiences import LOCAL_PLATFORMS, LOCAL_USER_ID, HermesIdentityError
-from ..adapters.clients.config import CodexConfigError, load_shared_client, remote_server_config_path
-from ..adapters.hermes.installation import InstallationManifest, build_installation_manifest
-from ..adapters.host_identity import matches_owner_principal
-from ..adapters.shared_entries import read_attachment, read_shared_payload
-from ..contracts import CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
-from ..core.entry_control import entry_fence_for_keys, local_account_matches
-from ..core.restore import restore_pending
-from ..core.storage import SQLiteStorage, Transaction
-from ..core.store_upgrade import upgrade_in_progress
-from ..core.truth_connection import TruthDatabaseConnectionError
+from scope_recall.adapters.attachment_paths import UnverifiedAttachmentPath, local_attachment_stat, same_local_path
+from scope_recall.adapters.audiences import LOCAL_PLATFORMS, LOCAL_USER_ID, HermesIdentityError
+from scope_recall.adapters.clients.config import CodexConfigError, load_shared_client, remote_server_config_path
+from scope_recall.adapters.hermes.installation import InstallationManifest, build_installation_manifest
+from scope_recall.adapters.host_identity import matches_owner_principal
+from scope_recall.adapters.shared_entries import read_attachment, read_shared_payload
+from scope_recall.contracts import CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
+from scope_recall.core.entry_control import entry_fence_for_keys, local_account_matches
+from scope_recall.core.restore import restore_pending
+from scope_recall.core.storage import SQLiteStorage, Transaction
+from scope_recall.core.store_upgrade import upgrade_in_progress
+from scope_recall.core.truth_connection import TruthDatabaseConnectionError
+
 from .install_common import RUNTIME_CONFIG_LIMIT
 from .install_hermes import DEFAULT_AGENT_WORKSPACE
 from .shared_run import SharedStoreError
@@ -201,7 +202,7 @@ def _local_clients(root: Path, entries: list[dict]) -> list[dict]:
         if remote is None:
             clients.append(entry)
         else:
-            from ..adapters.clients.remote_server import load_server_config
+            from scope_recall.adapters.clients.remote_server import load_server_config
 
             if not stat.S_ISREG(remote.st_mode) or remote.st_size > RUNTIME_CONFIG_LIMIT:
                 raise HermesIdentityError("remote entry configuration is invalid")

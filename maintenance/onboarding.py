@@ -7,9 +7,9 @@ from contextlib import closing
 from pathlib import Path
 
 import yaml
+from scope_recall.adapters.installation_receipt import RECEIPT_FILENAME
+from scope_recall.host_registry import HOSTS, LOCAL_STORE_HOSTS
 
-from ..adapters.installation_receipt import RECEIPT_FILENAME
-from ..host_registry import HOSTS, LOCAL_STORE_HOSTS
 from .backup import safe_path
 
 WORKFLOW = Path(__file__).with_name("AGENT_WORKFLOW.md")

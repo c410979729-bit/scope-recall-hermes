@@ -15,7 +15,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from scope_recall.core.backup_primitives import BackupError, create_output, exclusive_store, first_link, safe_path
+from scope_recall.core.backup_primitives import (
+    BackupError,
+    create_output,
+    exclusive_store,
+    first_link,
+    safe_path,
+    sha256,
+)
 from scope_recall.core.file_access import preserve_file_access
 from scope_recall.core.schema import APPLICATION_ID, SCHEMA_VERSION
 from scope_recall.core.writer_lease import TRUTH_WRITER_LEASE_FILENAME, TRUTH_WRITER_LEASE_INFO_FILENAME
@@ -23,7 +30,7 @@ from scope_recall.core.writer_lease import TRUTH_WRITER_LEASE_FILENAME, TRUTH_WR
 from ._compact_pager import SCRIPT_PATH, STAGE_PREFIX, file_revision, sidecars
 from .compact_candidates import measure_candidates, trim_candidates
 from .compact_lexical import compact_tool_lexical, measure_tool_lexical
-from .store_snapshot import detached_store_snapshot
+from .store_snapshot import detached_store_snapshot, require_disk_space
 
 RETENTION_DAYS = 30
 _LARGE_FRAGMENT_BYTES = 4096
@@ -72,6 +79,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     mode.add_argument("--apply", action="store_true", help="write a verified, vacuumed copy of an offline database")
     parser.add_argument("--output", help="new SQLite file to create in an existing folder; required for --apply")
     parser.add_argument(
+        "--temp-dir",
+        help="existing directory for large dry-run snapshots (defaults to the OS temporary directory)",
+    )
+    parser.add_argument(
         "--retention-days",
         type=int,
         default=RETENTION_DAYS,
@@ -82,7 +93,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 def _offline_file(path: Path) -> os.stat_result:
     """Refuse live or unrecovered journals and aliases that evade the directory lease."""
     if any(os.path.lexists(candidate) for candidate in sidecars(path)):
-        raise BackupError("store is busy or needs recovery: close it and clear its SQLite sidecars normally")
+        raise BackupError(
+            "store is busy or has uncheckpointed SQLite sidecars: "
+            "stop all store processes and open and close the store normally to checkpoint; "
+            "never delete -wal or -journal files"
+        )
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise BackupError("source must be a regular SQLite file with no other hard links")
@@ -128,6 +143,10 @@ def _read_offline_store(source: Path):
         raise BackupError("store lock files must not be symlinks or reparse points")
     with exclusive_store(source.parent, busy=lambda _reason: BackupError("store is busy: stop all store processes")):
         before = _offline_file(source)
+        # Compute the source digest before acquiring the Windows 1 GiB mandatory byte lock so multi-gigabyte
+        # files hash cleanly, then bind the exclusive pager lock to the exact stat revision read above.
+        source_digest = sha256(source)
+        _unchanged(source, before)
         with _exclusive_pager(source, before) as owner:
 
             def check_source() -> None:
@@ -144,7 +163,7 @@ def _read_offline_store(source: Path):
             # writers. This handle can read without opening source journals.
             with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as reader:
                 _verify_schema(reader)
-                yield reader, before, publish
+                yield reader, before, source_digest, publish
 
 
 def _unchanged(source: Path, before: os.stat_result) -> None:
@@ -195,6 +214,7 @@ def _trim_and_vacuum(conn: sqlite3.Connection, params: dict, measured: dict) -> 
     # payloads beside it under the output directory's inherited permissions.
     if conn.execute("PRAGMA journal_mode=OFF").fetchone()[0] != "off":
         raise BackupError("unable to disable journaling on the staging copy")
+    conn.execute("PRAGMA temp_store=MEMORY")
     # Rebuilding postings touches the reverse index in scattered page order.
     # Give this disposable connection up to 64 MiB of cache without changing the source.
     conn.execute("PRAGMA cache_size=-65536")
@@ -214,8 +234,6 @@ def _trim_and_vacuum(conn: sqlite3.Connection, params: dict, measured: dict) -> 
     finally:
         conn.set_authorizer(None)
     conn.commit()
-    conn.execute("VACUUM")
-    _check_store(conn)
 
 
 def _copy_store(
@@ -226,15 +244,28 @@ def _copy_store(
     measured: dict,
     publish: Callable[[Path, Path, os.stat_result], None],
 ) -> int:
-    """Transform a protected staging file; publish atomically without overwriting."""
+    """Transform a protected work copy and VACUUM directly into a protected staging file in output.parent."""
+    # Staging copies the source and runs VACUUM INTO inside output.parent, transiently holding both copies there
+    # without writing any temporary database bytes to the OS temporary directory.
+    require_disk_space(output.parent, source.stat().st_size * 2, label="compaction output directory")
+    work = output.with_name(f".scope-recall-work-{uuid4().hex}.sqlite3")
     stage = output.with_name(f"{STAGE_PREFIX}{uuid4().hex}.sqlite3")
-    create_output(stage)
-    owned = stage.stat()
+    create_output(work)
+    owned_work = work.stat()
+    owned = None
     try:
+        preserve_file_access(source, work, protect_acl=True)
+        create_output(stage)
+        owned = stage.stat()
         preserve_file_access(source, stage, protect_acl=True)
-        with closing(sqlite3.connect(stage)) as copy:
+        with closing(sqlite3.connect(work)) as copy:
             reader.backup(copy)
             _trim_and_vacuum(copy, params, measured)
+            copy.execute("VACUUM main INTO ?", (str(stage),))
+        if os.path.lexists(work) and os.path.samestat(owned_work, work.lstat()):
+            work.unlink()
+        with closing(sqlite3.connect(stage)) as compacted:
+            _check_store(compacted)
         if not os.path.samestat(owned, stage.lstat()) or any(os.path.lexists(p) for p in sidecars(stage)):
             raise BackupError("staging copy changed or has unexpected SQLite sidecars")
         if any(os.path.lexists(p) for p in (output, *sidecars(output))):
@@ -247,16 +278,24 @@ def _copy_store(
         publish(stage, output, verified)
         return verified.st_size
     finally:
-        if os.path.lexists(stage) and os.path.samestat(owned, stage.lstat()):
+        if os.path.lexists(work) and os.path.samestat(owned_work, work.lstat()):
+            work.unlink()
+        if owned is not None and os.path.lexists(stage) and os.path.samestat(owned, stage.lstat()):
             stage.unlink()
 
 
 def compact_store(
-    source: str | Path, *, output: str | Path | None = None, retention_days: int = RETENTION_DAYS
+    source: str | Path,
+    *,
+    output: str | Path | None = None,
+    retention_days: int = RETENTION_DAYS,
+    temp_dir: str | Path | None = None,
 ) -> dict:
     """Estimate from a read snapshot or create a compacted copy under offline locks."""
     if type(retention_days) is not int or not 0 <= retention_days <= 36500:
         raise BackupError("retention days must be between 0 and 36500")
+    if output is not None and temp_dir is not None:
+        raise BackupError("--temp-dir is only available with --dry-run")
     source = safe_path(source, must_exist=True)
     if output is not None:
         output = safe_path(output)
@@ -268,16 +307,23 @@ def compact_store(
     params = {"cutoff": cutoff, "large_fragment_bytes": _LARGE_FRAGMENT_BYTES}
     result = {"schema_version": SCHEMA_VERSION, "retention_days": retention_days, "cutoff_utc": cutoff}
     if output is None:
-        with detached_store_snapshot(source, _verify_schema) as reader:
+        preview_temp = Path(temp_dir) if temp_dir is not None else None
+        with detached_store_snapshot(source, _verify_schema, temp_dir=preview_temp) as reader:
             pages = reader.execute("PRAGMA page_count").fetchone()[0]
             page_bytes = reader.execute("PRAGMA page_size").fetchone()[0]
             source_bytes = pages * page_bytes
             measured = _measure(reader, params)
         result.update(status="dry_run", source_bytes=source_bytes)
     else:
-        with _read_offline_store(source) as (reader, before, publish):
+        with _read_offline_store(source) as (reader, before, source_digest, publish):
             measured = _measure(reader, params)
             output_bytes = _copy_store(reader, source, output, params, measured, publish)
-        result.update(status="compacted", source_bytes=before.st_size, output=str(output), output_bytes=output_bytes)
+        result.update(
+            status="compacted",
+            source_bytes=before.st_size,
+            source_sha256=source_digest,
+            output=str(output),
+            output_bytes=output_bytes,
+        )
     estimated = sum(item["estimated_bytes"] for item in measured.values())
     return {**result, **measured, "estimated_reclaimable_bytes": estimated}

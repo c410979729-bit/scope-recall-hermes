@@ -605,7 +605,10 @@ def process_embed(
 
 def _projection_entry_paused(storage, clock, context, item, started, budget):
     """Resolve source ownership without assigning an entry to unrelated work."""
-    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return False
+    with storage.read(context, remaining_seconds=left) as tx:
         row = (
             tx._check()
             .execute(
@@ -615,6 +618,22 @@ def _projection_entry_paused(storage, clock, context, item, started, budget):
             .fetchone()
         )
         return row is not None and state_for(tx, context, entry_id=row[0])[0] == "paused"
+
+
+def _prepare_projection_lane(storage, clock, context, item, started, budget):
+    """Defer held entities or classify summary and reflection jobs before ordinary lexical work."""
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return deadline_result(storage, context, item), False, None
+    with storage.write(context, remaining_seconds=left) as tx:
+        deferred = defer_held_entity(tx, item, clock.utc_now())
+        if deferred is not None:
+            return deferred, False, None
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return deadline_result(storage, context, item), False, None
+    with storage.read(context, remaining_seconds=left) as tx:
+        return None, is_summary_job(tx, item), reflection_job(tx, item)
 
 
 def process_rebuild_projection(
@@ -646,13 +665,9 @@ def process_rebuild_projection(
     )
     if screening is not None:
         return screening
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
-        deferred = defer_held_entity(tx, item, clock.utc_now())
-        if deferred is not None:
-            return deferred
-    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
-        summary = is_summary_job(tx, item)
-        reflection = reflection_job(tx, item)
+    early, summary, reflection = _prepare_projection_lane(storage, clock, context, item, started, budget)
+    if early is not None:
+        return early
     if reflection is not None or summary:
         process = process_reflection if reflection is not None else process_summary
         capable = config is None or (config.reflection_capable if reflection is not None else config.summary_capable)
@@ -666,7 +681,10 @@ def process_rebuild_projection(
             budget=budget,
         )
     if callable(getattr(model, "judge", None)):
-        with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+        left = budget_left(started, clock, budget)
+        if left <= 0:
+            return deadline_result(storage, context, item)
+        with storage.read(context, remaining_seconds=left) as tx:
             entity = needs_entity_projection(tx, item)
         if entity:
             return process_entity_projection(storage, clock, context, item, model=model, started=started, budget=budget)

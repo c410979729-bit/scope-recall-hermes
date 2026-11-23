@@ -141,7 +141,7 @@ class Operations:
         dry_run: bool = True,
         remaining_seconds: float | None = None,
     ) -> dict:
-        """Report, start or cancel the store's re-embed run into ``space_id`` (``core/work_storage.py``).
+        """Report, start or cancel the store's re-embed run into ``space_id`` (``core/embedding_queue.py``).
 
         ``run`` is the run as it stands after the action (before it, in a preview).  ``to_reopen`` is what a run that
         is going still has to look at, or else what a new one would reopen; ``waiting`` the embeddings still waiting

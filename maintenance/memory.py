@@ -12,8 +12,8 @@ from scope_recall.core.management import MemoryManagement
 from scope_recall.core.management_query import MemoryFilter
 from scope_recall.core.restore import InstallationMaintenance
 from scope_recall.core.storage import SQLiteStorage
+from scope_recall.host_registry import INSTALL_HOSTS
 
-from ..host_registry import INSTALL_HOSTS
 from .restore import RestoreError, store_to_restore
 
 FORMAT = "scope-recall-management/1"

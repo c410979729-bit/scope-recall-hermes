@@ -14,10 +14,11 @@ import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ..core.installation_copy import copy_task_name, installation_copy_id
-from ..core.storage import SQLiteStorage
-from ..runtime.scheduling import control_path, read_control
-from ..runtime.worker_entry import load_config, write_worker_metadata
+from scope_recall.core.installation_copy import copy_task_name, installation_copy_id
+from scope_recall.core.storage import SQLiteStorage
+from scope_recall.runtime.scheduling import control_path, read_control
+from scope_recall.runtime.worker_entry import load_config, write_worker_metadata
+
 from .windows_wake import wake_command
 
 #: How the wake runs outside Windows: from the operator's timer.  Nothing here registers one.

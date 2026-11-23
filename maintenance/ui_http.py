@@ -13,10 +13,10 @@ from pathlib import Path
 from threading import BoundedSemaphore, Lock, Timer
 from urllib.parse import parse_qs, urlsplit
 
-from ..contracts import ContractError
-from ..core.backup_primitives import BackupError
-from ..core.truth_connection import TruthDatabaseConnectionError
-from ..core.writer_lease import TruthWriterBusyError
+from scope_recall.contracts import ContractError
+from scope_recall.core.backup_primitives import BackupError
+from scope_recall.core.truth_connection import TruthDatabaseConnectionError
+from scope_recall.core.writer_lease import TruthWriterBusyError
 
 BODY_LIMIT = 65536
 REQUEST_SECONDS = 5

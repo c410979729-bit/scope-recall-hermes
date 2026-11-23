@@ -605,3 +605,84 @@ def test_documented_backup_and_compaction_commands_complete_end_to_end(tmp_path,
         "compacted",
     ]
     assert (archive / "compacted.sqlite3").is_file()
+
+
+def test_dry_run_and_apply_check_disk_space_and_record_source_sha256(app, tmp_path, capsys, monkeypatch):
+    from collections import namedtuple
+
+    from scope_recall.maintenance import store_snapshot
+
+    Usage = namedtuple("Usage", ["total", "used", "free"])
+    source = app[0].storage.path
+    custom_temp = tmp_path / "custom-preview-temp"
+    custom_temp.mkdir()
+    monkeypatch.setattr(store_snapshot, "_MEMORY_SNAPSHOT_BYTES", 0)
+
+    seen_dirs = []
+    real_mkdtemp = store_snapshot.tempfile.mkdtemp
+
+    def track_mkdtemp(*args, **kwargs):
+        seen_dirs.append(Path(kwargs["dir"]))
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(store_snapshot.tempfile, "mkdtemp", track_mkdtemp)
+    assert main(["compact-store", "--source", str(source), "--dry-run", "--temp-dir", str(custom_temp)]) == 0
+    assert seen_dirs == [custom_temp.resolve()]
+    capsys.readouterr()
+
+    missing_temp = tmp_path / "does-not-exist"
+    assert main(["compact-store", "--source", str(source), "--dry-run", "--temp-dir", str(missing_temp)]) == 2
+    assert "existing directory" in json.loads(capsys.readouterr().out)["error"]
+
+    output = tmp_path / "compacted-out.sqlite3"
+    assert (
+        main(
+            [
+                "compact-store",
+                "--source",
+                str(source),
+                "--apply",
+                "--output",
+                str(output),
+                "--temp-dir",
+                str(custom_temp),
+            ]
+        )
+        == 2
+    )
+    assert "--temp-dir is only available with --dry-run" in json.loads(capsys.readouterr().out)["error"]
+
+    with monkeypatch.context() as low_disk:
+        low_disk.setattr(store_snapshot.shutil, "disk_usage", lambda _path: Usage(1024, 1000, 24))
+        assert main(["compact-store", "--source", str(source), "--dry-run", "--temp-dir", str(custom_temp)]) == 2
+        assert "insufficient free disk space" in json.loads(capsys.readouterr().out)["error"]
+        assert main(["compact-store", "--source", str(source), "--apply", "--output", str(output)]) == 2
+        assert "insufficient free disk space" in json.loads(capsys.readouterr().out)["error"]
+        assert not output.exists()
+        assert not list(tmp_path.glob(".scope-recall-compact-*.sqlite3*"))
+
+    assert main(["compact-store", "--source", str(source), "--apply", "--output", str(output)]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["source_sha256"] == sha256(source)
+    assert not list(tmp_path.glob(".scope-recall-work-*"))
+    assert not list(tmp_path.glob(".scope-recall-compact-*"))
+
+
+def test_sidecar_refusal_warns_never_to_delete_wal_and_cli_surfaces_snapshot_diagnostics(app, tmp_path, capsys):
+    path = app[0].storage.path
+    output = tmp_path / "blocked-by-wal.sqlite3"
+    with closing(sqlite3.connect(path)) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    wal = path.with_name(path.name + "-wal")
+    wal.write_bytes(b"TEST uncheckpointed wal")
+    try:
+        assert main(["compact-store", "--source", str(path), "--apply", "--output", str(output)]) == 2
+        apply_err = json.loads(capsys.readouterr().out)["error"]
+        assert "SQLite sidecars" in apply_err
+        assert "never delete -wal or -journal files" in apply_err
+
+        assert main(["compact-store", "--source", str(path), "--dry-run"]) == 2
+        preview_err = json.loads(capsys.readouterr().out)["error"]
+        assert "SQLite WAL and shared memory are incomplete; retry the preview" in preview_err
+    finally:
+        wal.unlink(missing_ok=True)

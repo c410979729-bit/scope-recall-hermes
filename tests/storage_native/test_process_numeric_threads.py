@@ -177,6 +177,20 @@ def test_unprefixed_maintenance_entry_preserves_its_startup_contract(tmp_path: P
     assert observed == {"observed": [value or "1"], "final": value or "1"}
 
 
+def test_unprefixed_maintenance_subcommands_import_cleanly(tmp_path: Path):
+    code = (
+        "import importlib; "
+        "mods = ('backup_cli', 'private', 'resident', 'memory', 'ui', 'setup', 'restore', 'autostart', 'shared', "
+        "'package_upgrade', 'local_account', 'replay_sessions', 'budget', 'source_review', "
+        "'legacy_conversion', 'upgrade_cli'); "
+        "[importlib.import_module('maintenance.' + name) for name in mods]; "
+        "import maintenance.legacy_conversion as lc, maintenance.upgrade_cli as uc; "
+        "assert issubclass(lc.LegacyCompatibilityError, uc._TOLD)"
+    )
+    observed = _child(tmp_path, ["-c", code], None)
+    assert observed["final"] in (None, "1")
+
+
 def test_real_package_initialization_does_not_preload_numpy(tmp_path: Path):
     code = (
         "import scope_recall, sys; from pathlib import Path; "

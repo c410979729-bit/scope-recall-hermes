@@ -6,7 +6,8 @@ import configparser
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from ..adapters.clients.config import CodexConfigError, load_codex_config
+from scope_recall.adapters.clients.config import CodexConfigError, load_codex_config
+
 from .backup import adjacent_backup, atomic_write
 from .install_common import InstallError
 

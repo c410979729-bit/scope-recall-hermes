@@ -23,15 +23,6 @@ from scope_recall.core.requalify import settle_brought_denials
 from scope_recall.core.schema import SCHEMA_VERSION, normalize_scope_authorizations
 from scope_recall.core.source_records import restart_body_scan_maintenance
 from scope_recall.core.storage import SQLiteStorage
-from scope_recall.maintenance.legacy_episode_membership import plan_legacy_episode_memberships
-from scope_recall.maintenance.legacy_v2_compat import (
-    BRIDGE_TABLE,
-    IMPORT_LEDGER_TABLE,
-    LegacyCompatibilityError,
-    prepare_memory_storage_authority,
-    verify_completed_bridge_archive,
-    verify_import_ledger_archive,
-)
 
 from .backup import safe_path
 from .legacy_catalog import (
@@ -47,6 +38,7 @@ from .legacy_catalog import (
 )
 from .legacy_claims import link_history_records, versions_by_playbook, write_fact_claims, write_procedures
 from .legacy_deletions import plan_deletions, write_deletions
+from .legacy_episode_membership import plan_legacy_episode_memberships
 from .legacy_lifecycle import apply_lifecycle_suppression
 from .legacy_plan import Blocked, Conversion, Row
 from .legacy_sources import (
@@ -57,6 +49,14 @@ from .legacy_sources import (
     own_scope_id,
     scope_descriptor,
     text_or_none,
+)
+from .legacy_v2_compat import (
+    BRIDGE_TABLE,
+    IMPORT_LEDGER_TABLE,
+    LegacyCompatibilityError,
+    prepare_memory_storage_authority,
+    verify_completed_bridge_archive,
+    verify_import_ledger_archive,
 )
 from .migration_activation import existing_target_scopes, load_installation_handoff, resolve_scope_mapping
 from .migration_records import (

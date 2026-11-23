@@ -116,13 +116,13 @@ A cold rollback can return to the pre-upgrade snapshot when no later deletion, w
 
 ## Preview and compact SQLite storage
 
-Preview reclaimable data while the store is running. The command copies one committed SQLite snapshot, including its write-ahead log, and releases the source before counting rows and search terms. For stores over 16 MiB, the system temporary directory needs room for one database copy. The temporary file receives the source's access restrictions before any data is copied and is removed when the command exits normally.
+Preview reclaimable data while the store is running. The command copies one committed SQLite snapshot, including its write-ahead log, and releases the source before counting rows and search terms. For stores over 16 MiB, the temporary directory needs room for one full database copy plus 64 MiB of safety headroom; pass `--temp-dir /path/to/temp` when the system temporary directory does not have enough free space. The temporary file receives the source's access restrictions before any data is copied and is removed when the command exits normally.
 
 ```sh
 scope-recall compact-store --source /path/to/memory.sqlite3 --dry-run
 ```
 
-To create a smaller file, stop every process using the source database and choose a new path in an existing directory. On Linux and macOS, the account needs write permission on the source file to acquire SQLite's exclusive lock. The command verifies the new database and its foreign keys before publishing it.
+To create a smaller file, stop every process using the source database and choose a new path in an existing directory. The output directory needs free space for roughly twice the source file size plus 64 MiB while staging and running `VACUUM`. If `-wal`, `-shm` or `-journal` sidecars are still present, open and close the store normally so SQLite checkpoints cleanly; never delete `-wal` or `-journal` files manually. On Linux and macOS, the account needs write permission on the source file to acquire SQLite's exclusive lock. The command verifies the new database and its foreign keys before publishing it and records `source_sha256` in the receipt.
 
 ```sh
 scope-recall compact-store --source /path/to/memory.sqlite3 --apply --output /path/to/archive/compacted.sqlite3
@@ -133,3 +133,12 @@ The default retention period is 30 days. Use `--retention-days` to change when r
 The command rebuilds stale search postings for already indexed long tool outputs using their first and last excerpts. For historical tool outputs of any length, it removes indexed terms outside the public text. Detected credentials in the public text remove that source's postings. Cleaning a private section or transport envelope can only narrow its existing terms. Blocked and held sources keep their access protections. Raw source text and deletion records stay in the copy. A full backup also includes the store's other files.
 
 The receipt gives logical row and byte counts. Payload estimates count stored values. The lexical estimate counts 16 bytes per source posting and eight bytes plus the UTF-8 text length per term, with new postings and terms deducted. Terms still used by a source or fact remain in the dictionary. SQLite pages, record overhead, reverse indexes and already free pages affect physical savings. For a completed copy, compare `output_bytes` with `source_bytes` to see the actual SQLite file size change.
+
+### Replacing the live store with a compacted copy
+
+`compact-store --apply` writes a separate file and never overwrites `memory.sqlite3` in place. Keep every host, daemon and worker stopped across the entire compaction and replacement window so no interim captures or deletions arrive after `compacted.sqlite3` is written:
+
+1. Confirm every process using the store remains stopped and no `memory.sqlite3-wal`, `memory.sqlite3-shm` or `memory.sqlite3-journal` sidecars exist beside `memory.sqlite3`.
+2. Verify that the SHA-256 digest of `memory.sqlite3` matches `source_sha256` in the compaction receipt. If the digest differs, discard `compacted.sqlite3` because the live store received changes after compaction.
+3. Move `memory.sqlite3` to a backup path on the same filesystem, then move `compacted.sqlite3` to `memory.sqlite3` while preserving its directory and file permissions.
+4. Run `doctor` and verify recent memories before restarting hosts and workers; remove the backup copy only after verification succeeds.

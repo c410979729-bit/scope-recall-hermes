@@ -64,14 +64,14 @@ from scope_recall.core.restore import RESTORE_SCHEMA_FLOOR as RESTORE_SCHEMA_FLO
 from scope_recall.core.schema import APPLICATION_ID, SCHEMA_VERSION
 from scope_recall.core.storage import SQLiteStorage
 from scope_recall.core.truth_connection import connect_truth_database
-from scope_recall.maintenance.shared import store_binding
+from scope_recall.host_registry import INSTALL_HOSTS
 from scope_recall.runtime.running_code import live_records
 
-from ..host_registry import INSTALL_HOSTS
 from .backup import BackupError, backup_sqlite, exclusive_store, safe_path
 from .disaster_restore import DisasterRestoreError, apply_disaster_restore, plan_disaster_restore
 from .doctor import load_binding
 from .install_common import HostChoice
+from .shared import store_binding
 from .shared_run import SharedStoreError, encoded, store_lock
 
 #: How long one of the store's own transactions waits for SQLite's lock, and the replay for readers to leave the

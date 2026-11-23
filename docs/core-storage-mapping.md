@@ -4,7 +4,7 @@
 
 Core 入口使用显式 `InstanceBinding`、`TrustedContext`、存储、时钟、ID 生成器、向量端口与辅助模型端口。构造和 import 不创建数据库或发起网络请求。访问支持的旧结构时，默认通过升级协调器先保存核验过的快照，再完成结构升级；调用预算不足时拒绝本次访问并留下后台维护信号。关闭 `upgrade_on_open` 的诊断读取不会升级存储。
 
-`truth_connection.connect_truth_database` 提供路径保护、FK、只读连接与连接级 writer lease。每次短事务单独打开并关闭连接，外部模型调用不持有连接或 lease。SQL 仅在 `core/storage.py` 及其存储职责文件内；应用只接触受控事务对象，不能执行任意 SQL、commit 或 rollback。借用事务使用受控 savepoint。释放成功后立即注销 savepoint，commit 失败不清理已释放的 savepoint；清理异常作为主异常的附加诊断保留，连接弃用。
+`truth_connection.connect_truth_database` 提供路径保护、FK、只读连接与连接级 writer lease。每次短事务单独打开并关闭连接，外部模型调用不持有连接或 lease。SQL 仅在 `core/storage.py`、`core/transaction.py` 及其存储职责文件内；应用只接触受控事务对象，不能执行任意 SQL、commit 或 rollback。借用事务使用受控 savepoint。释放成功后立即注销 savepoint，commit 失败不清理已释放的 savepoint；清理异常作为主异常的附加诊断保留，连接弃用。
 
 Core 使用版本化的新库而不直接复用旧 DDL，原因有三个：旧 Journal 唯一键包含正文哈希，不能约束同发生身份同版本的冲突；旧 fact_claims 混合事实身份与版本且关联 memories，不能让它与新 claims.current_revision 同时作为可写或可查询的当前权威（旧表可作只读迁移输入和历史存档）；Journal/nightly/vector 三套任务原生表需要收敛为一个 work 状态所有者。沿用这些表的来源、时间、删除、幂等语义和已验证的连接保护，不把两个 schema 同时接入运行入口。
 

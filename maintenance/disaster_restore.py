@@ -19,19 +19,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from scope_recall.adapters.hermes.shared_entries import read_shared_payload
 from scope_recall.contracts import InstanceBinding, TrustedContext
+from scope_recall.core.backup_primitives import BackupError, atomic_json, first_link, safe_path
+from scope_recall.core.deletion_mirror import DELETION_MIRROR_FILENAME, installation_mirror
+from scope_recall.core.recall_policy import EMBEDDING_SPACE, embedding_space_id
 from scope_recall.core.restore import InstallationMaintenance, fence_disaster_recovery, finish_disaster_recovery
 from scope_recall.core.storage import SQLiteStorage, _directory
-from scope_recall.maintenance.backup_replay import replay_deletion_mirror
+from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
+from scope_recall.runtime.backup_archive import write_verified_members
+from scope_recall.runtime.backup_bundle import inspect_backup_archive, verify_backup_bundle
+from scope_recall.runtime.backup_resources import rewrite_budget_fields
 
-from ..adapters.hermes.shared_entries import read_shared_payload
-from ..core.backup_primitives import BackupError, atomic_json, first_link, safe_path
-from ..core.deletion_mirror import DELETION_MIRROR_FILENAME, installation_mirror
-from ..core.recall_policy import EMBEDDING_SPACE, embedding_space_id
-from ..runtime.auxiliary import AuxiliaryRuntimeConfig
-from ..runtime.backup_archive import write_verified_members
-from ..runtime.backup_bundle import inspect_backup_archive, verify_backup_bundle
-from ..runtime.backup_resources import rewrite_budget_fields
 from .backup_relocation import (
     RestoreLayout,
     command_text,
@@ -40,6 +39,7 @@ from .backup_relocation import (
     reregistration_arguments,
     restore_layout,
 )
+from .backup_replay import replay_deletion_mirror
 from .doctor import load_binding
 from .doctor_report import DoctorReport
 from .doctor_store import (

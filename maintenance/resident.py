@@ -12,7 +12,7 @@ import json
 import time
 from pathlib import Path
 
-from ..host_registry import HOOK_CLIENT_HOSTS
+from scope_recall.host_registry import HOOK_CLIENT_HOSTS
 
 #: How long ``stop`` waits for a stopped server to let go of the entry's lock.
 STOP_WAIT_SECONDS = 5.0
@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         home = Path(args.home).expanduser()
-        from ..adapters.clients.local_endpoint import endpoints
+        from scope_recall.adapters.clients.local_endpoint import endpoints
 
         endpoints(home)
     except RuntimeError:
@@ -35,9 +35,14 @@ def main(argv: list[str] | None = None) -> int:
     if not home.is_absolute():
         print(json.dumps({"status": "error", "code": "home_not_absolute"}))
         return 2
-    from ..adapters.clients.config import CodexConfigError, load_shared_client
-    from ..adapters.clients.local_endpoint import live_residents, resident_minutes, resident_running, stop_residents
-    from ..runtime.worker_entry import read_worker_metadata, resident_recall_result
+    from scope_recall.adapters.clients.config import CodexConfigError, load_shared_client
+    from scope_recall.adapters.clients.local_endpoint import (
+        live_residents,
+        resident_minutes,
+        resident_running,
+        stop_residents,
+    )
+    from scope_recall.runtime.worker_entry import read_worker_metadata, resident_recall_result
 
     stopped = stop_residents(home, args.host) if args.action == "stop" else []
     # A stopped process lets go of the entry's lock as it ends: what is said after, and an upgrade after that, waits

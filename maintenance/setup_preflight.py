@@ -7,9 +7,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import yaml
+from scope_recall.core.secret_patterns import structure_contains_secret_like_text
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig, configuration_value
 
-from ..core.secret_patterns import structure_contains_secret_like_text
-from ..runtime.instance_config import RuntimeInstanceConfig, configuration_value
 from .doctor import load_binding
 from .hermes_config import provider_configuration
 from .install import plan_installation
@@ -27,7 +27,8 @@ def installation_plan(row: dict, plan, *, pending: bool = False):
         binding, _directory = load_binding(row["host"], home)
         agent = binding.agent_id
         if row["host"] == "hermes":
-            from ..adapters.hermes.shared_entries import load_binding_for_home
+            from scope_recall.adapters.hermes.shared_entries import load_binding_for_home
+
             from .install_hermes import bound_workspace
 
             options["agent_workspace"] = bound_workspace(load_binding_for_home(home))

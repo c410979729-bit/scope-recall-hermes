@@ -19,7 +19,8 @@ import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..core.file_lock import advisory_file_lock
+from scope_recall.core.file_lock import advisory_file_lock
+
 from .backup import atomic_json as _write_receipt
 from .backup import safe_path, sha256
 from .install_common import safe_interpreter

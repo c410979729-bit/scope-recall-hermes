@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 
 import yaml
+from scope_recall.adapters.shared_entries import attachment_path, read_attachment
+from scope_recall.host_registry import HOSTS
 
-from ..adapters.shared_entries import attachment_path, read_attachment
-from ..host_registry import HOSTS
 from .install_common import RUNTIME_CONFIG_LIMIT, InstallError, require_absolute
 from .install_receipt import receipt_file
 

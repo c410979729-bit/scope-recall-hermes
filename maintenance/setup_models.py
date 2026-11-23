@@ -5,9 +5,10 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
-from ..core.recall_policy import BUILTIN_VECTOR_THRESHOLD
-from ..runtime.auxiliary import AuxiliaryRuntimeConfig
-from ..runtime.instance_config import VectorRuntimeConfig
+from scope_recall.core.recall_policy import BUILTIN_VECTOR_THRESHOLD
+from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
+from scope_recall.runtime.instance_config import VectorRuntimeConfig
+
 from .setup_configuration import validate_models
 from .setup_workload import recommended_totals, recommended_workload
 

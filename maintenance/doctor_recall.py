@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 
-from ..contracts import ContractError, TrustedContext
-from ..core import CoreConfig, MemoryCore
-from ..core.management import MemoryManagement
-from ..core.recall_log_writer import read_health
-from ..core.restore import InstallationMaintenance
-from ..core.storage import SQLiteStorage
+from scope_recall.contracts import ContractError, TrustedContext
+from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.management import MemoryManagement
+from scope_recall.core.recall_log_writer import read_health
+from scope_recall.core.restore import InstallationMaintenance
+from scope_recall.core.storage import SQLiteStorage
+
 from .doctor_report import record_check
 
 

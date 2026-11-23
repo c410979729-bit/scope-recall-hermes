@@ -10,21 +10,21 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from scope_recall.adapters.hermes.shared_entries import read_shared_payload
 from scope_recall.contracts import InstanceBinding
-from scope_recall.maintenance.shared import store_binding
-
-from ..adapters.hermes.shared_entries import read_shared_payload
-from ..runtime.backup_bundle import (
+from scope_recall.runtime.backup_bundle import (
     BUNDLE_FORMAT,
     BackupBundleError,
     create_backup_bundle,
 )
-from ..runtime.backup_bundle import (
+from scope_recall.runtime.backup_bundle import (
     verify_backup_bundle as verify_archive,
 )
+
 from .disaster_restore import apply_disaster_restore
 from .doctor import load_binding
 from .doctor_report import HostChoice
+from .shared import store_binding
 
 
 def verify_backup_bundle(

@@ -13,13 +13,14 @@ from collections import OrderedDict
 from threading import RLock
 from typing import Any
 
-from ..contracts import ContractError
-from ..core.deletion_mirror import configured_backup_dir
-from ..core.handoff import manage as manage_handoffs
-from ..core.installation_copy import installation_copy_id
-from ..core.management_query import MemoryFilter
-from ..runtime import backup_upkeep
-from ..runtime.backup_rotation import find_owned_backup_bundles
+from scope_recall.contracts import ContractError
+from scope_recall.core.deletion_mirror import configured_backup_dir
+from scope_recall.core.handoff import manage as manage_handoffs
+from scope_recall.core.installation_copy import installation_copy_id
+from scope_recall.core.management_query import MemoryFilter
+from scope_recall.runtime import backup_upkeep
+from scope_recall.runtime.backup_rotation import find_owned_backup_bundles
+
 from .doctor_report import DoctorReport
 from .doctor_store import check_deletion_mirror, check_footprint, check_storage
 from .memory_export import write_export

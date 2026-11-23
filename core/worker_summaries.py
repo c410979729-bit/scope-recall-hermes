@@ -27,11 +27,14 @@ from .summary_validity import (
 )
 from .worker_outcomes import (
     budget_left,
+    call_model_before_deadline,
+    deadline_result,
     defer_model_pass,
     finalize_work,
     hold_for_entry_state,
     hold_for_private_mode,
     model_failure,
+    provider_prepare_budget,
     record_error_detail,
     stale_result,
     work_result,
@@ -248,11 +251,15 @@ def _process_summary_page(storage, clock, context, item, *, model, started, budg
         submitted = tuple(source for source in sources if source.event["content"].strip())
         sentences, spans = [], []
         if submitted:
+            request_end = provider_prepare_budget(clock, started, budget)
             with private.using_outbound_check(guard):
                 private.require_outbound()
-                raw = model.judge(
+                raw = call_model_before_deadline(
+                    model.judge,
+                    clock,
+                    started,
+                    request_end,
                     summary_messages(submitted, episode_ref=task),
-                    remaining_seconds=budget_left(started, clock, budget),
                 )
             value = json.loads(raw) if isinstance(raw, str) else raw
             sentences, spans = grounded_sentences(
@@ -304,8 +311,15 @@ def _summary_error(storage, clock, context, item, exc, *, started, budget):
     if field == "entry_state:paused":
         return hold_for_entry_state(storage, clock, context, item, started=started, budget=budget)
     code = getattr(exc, "code", None) or "DERIVATION_INVALID"
+    if code == "DEADLINE_EXCEEDED":
+        return finalize_work(
+            storage, clock, context, item, "retry", code, started=started, budget=budget, error_detail=field
+        )
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return deadline_result(storage, context, item)
     failure = validation_feedback(code, field or "summary_invalid")["field"]
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    with storage.write(context, remaining_seconds=left) as tx:
         if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
             return stale_result(tx, item)
         current = _job(tx, item)
@@ -344,8 +358,11 @@ def _summary_error(storage, clock, context, item, exc, *, started, budget):
 
 def _publish_summary(storage, clock, context, item, prepared, *, started, budget):
     """Publish a grounded page and its next job in one fenced transaction."""
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return deadline_result(storage, context, item)
     group, coverage, sentences, spans, hint_omitted, entries = prepared
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    with storage.write(context, remaining_seconds=left) as tx:
         if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
             return stale_result(tx, item)
         if paused_since(tx, entries):

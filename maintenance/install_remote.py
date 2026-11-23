@@ -15,8 +15,9 @@ from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..adapters.clients.remote_client import RemoteClientError, absolute_path, load_client_config
-from ..host_registry import HOOK_TIMEOUTS, HOSTS
+from scope_recall.adapters.clients.remote_client import RemoteClientError, absolute_path, load_client_config
+from scope_recall.host_registry import HOOK_TIMEOUTS, HOSTS
+
 from . import install_antigravity as antigravity
 from . import install_dsh as dsh
 from . import install_workbuddy as workbuddy
@@ -56,7 +57,8 @@ def hermes_files(config: dict[str, Any], home: Path) -> dict[Path, str]:
     directory the catalog installed keeps its pin in ``plugin.yaml``; an existing authored project keeps its
     ``pyproject.toml``. Fresh wrappers use the manifest form in both local and remote installation.
     """
-    from ..adapters.hermes.remote import config_path
+    from scope_recall.adapters.hermes.remote import config_path
+
     from .hermes_config import provider_configuration
     from .install_hermes import home_plugin_dir, wrapper_files
 

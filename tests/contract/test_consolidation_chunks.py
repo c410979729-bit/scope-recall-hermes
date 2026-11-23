@@ -468,3 +468,40 @@ def test_embed_and_projection_leases_start_after_writer_lock_wait(worker_app, mo
     proj_receipt = core.drain_worker(ctx, max_items=1, remaining_seconds=25, lease_seconds=8)
     assert proj_receipt.completed == 1
     assert projection_windows == [8.0]
+
+
+def test_zero_budget_after_commit_or_during_member_returns_clean_receipt(worker_app, monkeypatch):
+    """Exhausting pass budget right after commit or inside a member must never leak DEADLINE_EXCEEDED."""
+    from scope_recall.core import worker, worker_consolidation
+
+    core, ctx, clock = worker_app
+    source = capture(core, ctx, "TEST 提交后预算耗尽仍正常返回收据。")
+    _mark_embed_done(core)
+    real_accept = worker_consolidation.accept_consolidation
+
+    def accept_and_exhaust_budget(*args, **kwargs):
+        result = real_accept(*args, **kwargs)
+        _advance_worker_clock(clock, 30)
+        return result
+
+    monkeypatch.setattr(worker_consolidation, "accept_consolidation", accept_and_exhaust_budget)
+    model = FakeConsolidation(lambda sources, **_: consolidation_payload(*sources))
+    receipt = core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=25, lease_seconds=25)
+    assert receipt.completed == 1
+    assert [(item.disposition, item.error_code, item.state) for item in receipt.items] == [("completed", None, "done")]
+    assert row(core, source)[0] == "done"
+
+    later = capture(core, ctx, "TEST 成员执行中途触发超时边界。")
+    _mark_embed_done(core)
+
+    def raise_deadline(*args, **kwargs):
+        _advance_worker_clock(clock, 30)
+        raise ContractError("DEADLINE_EXCEEDED", "model_request")
+
+    monkeypatch.setattr(worker, "process_consolidate", raise_deadline)
+    deadline_receipt = core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=25, lease_seconds=25)
+    assert deadline_receipt.skipped == 1
+    assert [(item.disposition, item.error_code) for item in deadline_receipt.items] == [
+        ("skipped", "DEADLINE_EXCEEDED")
+    ]
+    assert row(core, later)[0] == "leased"

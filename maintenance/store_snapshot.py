@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -11,13 +12,50 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
-from scope_recall.core.backup_primitives import create_output, safe_path
+from scope_recall.core.backup_primitives import BackupError, create_output, safe_path
 from scope_recall.core.file_access import preserve_file_access
 from scope_recall.core.truth_connection import require_query_only
 
 from ._compact_pager import SCRIPT_PATH
 
 _MEMORY_SNAPSHOT_BYTES = 16 * 1024 * 1024
+_MIN_SNAPSHOT_HEADROOM_BYTES = 64 * 1024 * 1024
+
+SNAPSHOT_OPERATIONAL_MESSAGES = frozenset(
+    {
+        "symlink or reparse paths are not allowed",
+        "unexpected SQLite journal file",
+        "SQLite WAL and shared memory are incomplete; retry the preview",
+        "SQLite journal format does not match the database; recovery is required",
+        "database is locked or cannot be read",
+        "the checkpoint changed during the read; retry the preview",
+    }
+)
+
+
+def require_disk_space(directory: Path, required_bytes: int, *, label: str) -> None:
+    """Refuse to stage a multi-megabyte SQLite copy when free space lacks safety headroom."""
+    needed = max(required_bytes, 0) + _MIN_SNAPSHOT_HEADROOM_BYTES
+    free = shutil.disk_usage(directory).free
+    if free < needed:
+        raise BackupError(
+            f"insufficient free disk space in {label} ({directory}): "
+            f"need at least {needed} bytes including safety headroom, found {free} bytes"
+        )
+
+
+def _resolve_temp_root(temp_dir: Path | None) -> Path:
+    if temp_dir is None:
+        # The OS temporary directory may have a system alias such as /var on macOS.
+        # Resolve that trusted root before enforcing link checks on our own new file.
+        return Path(tempfile.gettempdir()).resolve(strict=True)
+    try:
+        resolved = safe_path(temp_dir, must_exist=True)
+    except FileNotFoundError as exc:
+        raise BackupError("preview temporary directory must be an existing directory") from exc
+    if not resolved.is_dir():
+        raise BackupError("preview temporary directory must be an existing directory")
+    return resolved
 
 
 def _revision(database: Path) -> tuple[int, int, int, int, int]:
@@ -73,18 +111,21 @@ def read_store_snapshot(database: Path) -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def detached_store_snapshot(
-    database: Path, validate: Callable[[sqlite3.Connection], None]
+    database: Path,
+    validate: Callable[[sqlite3.Connection], None],
+    *,
+    temp_dir: Path | None = None,
 ) -> Iterator[sqlite3.Connection]:
     """Release the source pager after copying committed pages, before expensive analysis starts."""
+    explicit_root = _resolve_temp_root(temp_dir) if temp_dir is not None else None
     with ExitStack() as cleanup:
         with read_store_snapshot(database) as source:
             validate(source)
             size = source.execute("PRAGMA page_size").fetchone()[0] * source.execute("PRAGMA page_count").fetchone()[0]
             target: Path | str = ":memory:"
             if size > _MEMORY_SNAPSHOT_BYTES:
-                # The OS temporary directory may have a system alias such as /var on macOS.
-                # Resolve that trusted root before enforcing link checks on our own new file.
-                temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+                temporary_root = explicit_root if explicit_root is not None else _resolve_temp_root(None)
+                require_disk_space(temporary_root, size, label="preview temporary directory")
                 directory = Path(tempfile.mkdtemp(prefix="scope-recall-preview-", dir=temporary_root))
                 cleanup.callback(directory.rmdir)
                 target = directory / "snapshot.sqlite3"

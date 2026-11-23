@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import webbrowser
 
-from ..contracts import ContractError
-from ..host_registry import INSTALL_HOSTS
+from scope_recall.contracts import ContractError
+from scope_recall.host_registry import INSTALL_HOSTS
+
 from .memory import open_management
 from .restore import RestoreError
 from .ui_api import UIApi

@@ -7,9 +7,10 @@ import json
 import sqlite3
 from pathlib import Path
 
-from ..contracts import ContractError
-from ..core.quarantine_management import injection_settings, set_injection_settings
-from ..core.source_review import apply_sources, preview_sources
+from scope_recall.contracts import ContractError
+from scope_recall.core.quarantine_management import injection_settings, set_injection_settings
+from scope_recall.core.source_review import apply_sources, preview_sources
+
 from .memory import _common, open_management
 from .restore import RestoreError
 

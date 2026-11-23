@@ -7,11 +7,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ..adapters.hermes.shared_entries import attachment_path, read_shared_payload
-from ..contracts import ENTRY_ID
-from ..core.schema import SCHEMA_VERSION
-from ..runtime.instance_config import RuntimeInstanceConfig
-from ..runtime.model_budget import initialize_auxiliary_budget_ledger
+from scope_recall.adapters.hermes.shared_entries import attachment_path, read_shared_payload
+from scope_recall.contracts import ENTRY_ID
+from scope_recall.core.schema import SCHEMA_VERSION
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+from scope_recall.runtime.model_budget import initialize_auxiliary_budget_ledger
+
 from .backup import atomic_write, sha256
 from .doctor import load_binding, run_doctor
 from .hermes_config import provider_configuration

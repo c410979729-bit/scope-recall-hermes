@@ -7,7 +7,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from ..contracts import ContractError
+from ..contracts import ContractError, decode_payload
 from . import private
 from .candidate_lifecycle import model_subject
 from .evidence_support import SupportVerdict, positioned, support_fingerprint, validate_positions
@@ -68,21 +68,43 @@ def prepare_support(value, sources, judge, *, candidates=(), remaining_seconds=1
             state = "unavailable_" + failure_category(failure_code)
             verdicts.append(SupportVerdict(fingerprint, state, failure_code=failure_code))
             continue
-        result = judgement_result(raw, eligible)
+        try:
+            result = judgement_result(raw, eligible)
+        except (ContractError, ValueError, TypeError):
+            if adoption or observation:
+                raise
+            verdicts.append(SupportVerdict(fingerprint, "unavailable"))
+            continue
         state, action = result["support"], result["action"]
         verdicts.append(SupportVerdict(fingerprint, state, result["target_ref"], result["target_revision"], action))
     return tuple(verdicts)
 
 
+def strip_json_fence(raw: str, *, error_name: str = "judgement_result") -> str:
+    """Unwrap optional Markdown code fences around a single JSON object response."""
+    if type(raw) is not str:
+        raise ValueError(f"{error_name}_not_text")
+    encoded = raw.strip()
+    if encoded.startswith("```"):
+        lines = encoded.splitlines()
+        if len(lines) < 3 or lines[0].strip() not in {"```", "```json"} or lines[-1].strip() != "```":
+            raise ValueError(f"{error_name}_fence")
+        return "\n".join(lines[1:-1]).strip()
+    return encoded
+
+
 def judgement_result(raw, candidates):
     """Validate the shared support/action decision against only the supplied versions."""
-    return validate_judgement(json.loads(raw), candidates)
+    return validate_judgement(decode_payload(strip_json_fence(raw)), candidates)
 
 
-def validate_judgement(result, candidates):
+def validate_judgement(result: dict[str, Any], candidates):
     """Check a decoded verdict's symbols and exact candidate version."""
     if not isinstance(result, dict) or set(result) != {"support", "action", "target_ref", "target_revision"}:
         raise ContractError("DERIVATION_INVALID", "support_verdict")
+    if result["action"] == "new" and result["target_ref"] == "":
+        result = dict(result)
+        result["target_ref"] = None
     if result["support"] not in ("supported", "unsupported", "uncertain") or result["action"] not in (
         "new",
         "update",

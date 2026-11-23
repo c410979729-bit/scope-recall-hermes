@@ -14,10 +14,10 @@ from collections import defaultdict
 from typing import Any, Mapping, cast
 
 from scope_recall.core.events import MAX_SEGMENT_CHARS, segment_key
-from scope_recall.maintenance.legacy_v2_compat import resolve_memory_scope
 
 from .legacy_catalog import DIGEST_TABLES, HISTORY_TABLES
 from .legacy_plan import Conversion, Row
+from .legacy_v2_compat import resolve_memory_scope
 from .migration_records import (
     LEGACY_BASELINE,
     canonical_digest,

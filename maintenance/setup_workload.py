@@ -6,8 +6,8 @@ from decimal import ROUND_CEILING, Decimal
 from math import ceil
 from typing import Any
 
-from ..runtime.embedding_models import EMBED_RESERVE_FLOOR
-from ..runtime.model_budget import default_budget_policy
+from scope_recall.runtime.embedding_models import EMBED_RESERVE_FLOOR
+from scope_recall.runtime.model_budget import default_budget_policy
 
 # One hundred user/assistant exchanges across four idle-ended sessions, with a
 # completed task, six adoptions, four corrections with label drift and one explicit query per exchange. Importance

@@ -15,9 +15,10 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..contracts import ContractError, TrustedContext
-from ..core.file_lock import advisory_file_lock
-from ..core.storage import SQLiteStorage
+from scope_recall.contracts import ContractError, TrustedContext
+from scope_recall.core.file_lock import advisory_file_lock
+from scope_recall.core.storage import SQLiteStorage
+
 from .backup import atomic_json as _write
 from .backup import backup_sqlite, safe_path, sha256
 from .legacy_v2_compat import (

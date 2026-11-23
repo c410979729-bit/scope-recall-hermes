@@ -12,8 +12,8 @@ import json
 
 from scope_recall.contracts import ContractError, validate_payload
 from scope_recall.core.private import MODES, parse_duration
+from scope_recall.host_registry import INSTALL_HOSTS
 
-from ..host_registry import INSTALL_HOSTS
 from .memory import open_management, table
 from .restore import RestoreError
 

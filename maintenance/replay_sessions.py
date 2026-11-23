@@ -16,7 +16,7 @@ def _emit(payload: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Without --yes, list what would be replayed and its preview id; with --yes and that id, replay it."""
-    from ..adapters.clients.replay_sessions import replay
+    from scope_recall.adapters.clients.replay_sessions import replay
 
     parser = argparse.ArgumentParser(prog="scope-recall replay-sessions")
     parser.add_argument("--host", choices=("claude-code", "codex", "workbuddy"), required=True)

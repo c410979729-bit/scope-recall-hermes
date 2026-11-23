@@ -25,17 +25,16 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from ..adapters.attachment_paths import local_attachment_stat, same_local_path
-from ..adapters.clients.config import CONFIG_FILENAME as CODEX_CONFIG_FILENAME
-from ..adapters.hermes.audiences import LOCAL_USER_ID
-from ..adapters.hermes.identity import HermesRuntimeScope, resolve_runtime_audience
-from ..adapters.hermes.installation import (
+from scope_recall.adapters.attachment_paths import local_attachment_stat, same_local_path
+from scope_recall.adapters.clients.config import CONFIG_FILENAME as CODEX_CONFIG_FILENAME
+from scope_recall.adapters.hermes.audiences import LOCAL_USER_ID
+from scope_recall.adapters.hermes.installation import (
     MANIFEST_FILENAME,
     HermesIdentityError,
     InstallationManifest,
     load_archived_installation,
 )
-from ..adapters.hermes.shared_entries import (
+from scope_recall.adapters.hermes.shared_entries import (
     CLIENT_HOSTS,
     ENTRY_HOSTS,
     GRANTS_SCHEMA,
@@ -53,13 +52,21 @@ from ..adapters.hermes.shared_entries import (
     shared_entry_record,
     write_shared_payload,
 )
-from ..adapters.shared_entries import check_attachment_target, may_inspect_entry_home
-from ..contracts import HOOK_CLIENT_HOSTS, READ_ONLY_CLIENT_HOSTS, ContractError, InstanceBinding, TrustedContext
-from ..core.storage import SQLiteStorage
-from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
-from ..runtime.instance_config import RuntimeInstanceConfig
-from ..runtime.model_budget import initialize_auxiliary_budget_ledger
-from ..runtime.worker_launch import RUNTIME_CONFIG_FILENAME
+from scope_recall.adapters.host_identity import HermesRuntimeScope, resolve_runtime_audience
+from scope_recall.adapters.shared_entries import check_attachment_target, may_inspect_entry_home
+from scope_recall.contracts import (
+    HOOK_CLIENT_HOSTS,
+    READ_ONLY_CLIENT_HOSTS,
+    ContractError,
+    InstanceBinding,
+    TrustedContext,
+)
+from scope_recall.core.storage import SQLiteStorage
+from scope_recall.runtime.auxiliary import DEFAULT_LEDGER_NAME
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+from scope_recall.runtime.model_budget import initialize_auxiliary_budget_ledger
+from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
+
 from .backup_relocation import command_text
 from .install_common import RUNTIME_CONFIG_LIMIT
 from .shared_grants import client_grants as _client_grants

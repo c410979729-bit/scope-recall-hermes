@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from ..adapters.hermes.installation import load_installation_manifest
-from ..adapters.installation_identity import path_identity
-from ..core.backup_primitives import BackupError
-from ..core.installation_copy import installation_copy_id
-from ..runtime.backup_archive import ArchiveMember
-from ..runtime.backup_resources import restored_resource_path
+from scope_recall.adapters.hermes.installation import load_installation_manifest
+from scope_recall.adapters.installation_identity import path_identity
+from scope_recall.core.backup_primitives import BackupError
+from scope_recall.core.installation_copy import installation_copy_id
+from scope_recall.runtime.backup_archive import ArchiveMember
+from scope_recall.runtime.backup_resources import restored_resource_path
+
 from .install_hermes import bound_workspace
 
 

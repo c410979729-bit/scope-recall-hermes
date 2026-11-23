@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from ..core.secret_patterns import structure_contains_secret_like_text
-from ..runtime.auxiliary import AuxiliaryRuntimeConfig
-from ..runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig, configuration_value
+from scope_recall.core.secret_patterns import structure_contains_secret_like_text
+from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig, configuration_value
+
 from .backup import adjacent_backup, write_private_configuration
 from .install_common import InstallError
 from .shared import WORKER_OWNER, WORKER_SESSION, bind_runtime_configuration

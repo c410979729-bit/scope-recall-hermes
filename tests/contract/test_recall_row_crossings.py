@@ -14,7 +14,7 @@ from dataclasses import replace
 import pytest
 from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
-from scope_recall.core import storage as storage_module
+from scope_recall.core import transaction as transaction_module
 from scope_recall.core.source_records import SourceWrite
 from scope_recall.core.source_storage import source_reference
 from scope_recall.core.storage import SQLiteStorage, Transaction
@@ -172,7 +172,7 @@ def test_past_its_limits_a_read_transaction_answers_alike_and_keeps_no_more(app,
     sources = _sources(core, ctx, 6)
     with core.storage.read(ctx) as alone:
         expected = [alone.source(*pair) for pair in _pairs(sources)]
-    monkeypatch.setattr(storage_module, "_MEMO_ENTRIES", 4)
+    monkeypatch.setattr(transaction_module, "_MEMO_ENTRIES", 4)
     with core.storage.read(ctx) as tx:
         tx.prefetch_sources(_pairs(sources))
         assert [tx.source(*pair) for pair in _pairs(sources)] == expected
@@ -184,8 +184,8 @@ def test_past_its_limits_a_read_transaction_answers_alike_and_keeps_no_more(app,
             )
             <= 4
         )
-    monkeypatch.setattr(storage_module, "_MEMO_ENTRIES", 16384)
-    monkeypatch.setattr(storage_module, "_MEMO_BYTES", 10)
+    monkeypatch.setattr(transaction_module, "_MEMO_ENTRIES", 16384)
+    monkeypatch.setattr(transaction_module, "_MEMO_BYTES", 10)
     with core.storage.read(ctx) as tx:
         tx.prefetch_sources(_pairs(sources))
         assert [tx.source(*pair) for pair in _pairs(sources)] == expected

@@ -10,10 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from scope_recall.adapters.hermes.shared_entries import read_attachment, read_shared_payload
 from scope_recall.adapters.host_memory import inspect_host_memory
+from scope_recall.host_registry import HOSTS
 
-from ..adapters.hermes.shared_entries import read_attachment, read_shared_payload
-from ..host_registry import HOSTS
 from .install_common import InstallError, require_absolute
 from .install_receipt import load_receipt
 from .onboarding import inspect_installation, planning_database_state
@@ -153,8 +153,8 @@ def _check_model_change(store: Path, rows: list[dict], models: dict | None, bloc
     """Keep one embedding space until the existing explicit respace workflow coordinates all entries."""
     if models is None:
         return
-    from ..core.recall_policy import embedding_space_id
-    from ..runtime.auxiliary import AuxiliaryRuntimeConfig
+    from scope_recall.core.recall_policy import embedding_space_id
+    from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 
     route = AuxiliaryRuntimeConfig.from_mapping(models["auxiliary"]).embedding
     if route is None:

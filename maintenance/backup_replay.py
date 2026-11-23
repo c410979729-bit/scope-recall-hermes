@@ -5,15 +5,15 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from ..contracts import ContractError
-from ..core.restore import (
+from scope_recall.contracts import ContractError
+from scope_recall.core.restore import (
     InstallationMaintenance,
     export_deletion_ledger,
     reconcile_recovery_scopes,
     replay_deletion_ledger,
     stage_recovery_ledger,
 )
-from ..core.storage import SQLiteStorage
+from scope_recall.core.storage import SQLiteStorage
 
 
 def replay_deletion_mirror(storage, authority: InstallationMaintenance, records: list[dict]) -> dict:

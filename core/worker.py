@@ -39,6 +39,7 @@ from .worker_consolidation import (
 from .worker_outcomes import (
     FINALIZE_MARGIN_SECONDS,
     budget_left,
+    deadline_result,
     finalize_work,
     hold_for_private_mode,
     provider_prepare_budget,
@@ -205,32 +206,40 @@ def _resume_admission(
     storage, clock, context, config: WorkerConfig, started: float, budget: float, *, candidate_available: bool
 ) -> None:
     """Wake deferred captures and settle candidate pages before any claim."""
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return
     resume_deferred(
         storage,
         clock,
         context,
         config.admission_policy,
         limit=min(16, config.max_items),
-        remaining_seconds=min(1.0, budget_left(started, clock, budget)),
+        remaining_seconds=min(1.0, left),
     )
     # Each page is chosen in a read and linked in a write of its own, so a capture waits behind at most one
     # page's links, never its matching; the pages may take at most half of the pass, and at most
     # SOURCE_PAGE_SECONDS, on the pass's clock.
     pages_started = clock.monotonic()
     for _ in range(SOURCE_PAGES_PER_PASS):
-        if budget_left(started, clock, budget) <= budget / 2:
+        left = budget_left(started, clock, budget)
+        if left <= budget / 2:
             break
-        with storage.read(context, remaining_seconds=min(1.0, budget_left(started, clock, budget))) as tx:
+        with storage.read(context, remaining_seconds=min(1.0, left)) as tx:
             page = tx.candidates.next_source_page()
-        if page is None:
+        left = budget_left(started, clock, budget)
+        if page is None or left <= 0:
             break
-        with storage.write(context, remaining_seconds=min(1.0, budget_left(started, clock, budget))) as tx:
+        with storage.write(context, remaining_seconds=min(1.0, left)) as tx:
             tx.candidates.resume_source_pages(now=clock.utc_now(), page=page)
         time.sleep(PAGE_TURN_SECONDS)
         if clock.monotonic() - pages_started >= SOURCE_PAGE_SECONDS:
             break
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return
     page = min(config.candidate_batch_limit, config.max_items)
-    with storage.write(context, remaining_seconds=min(1.0, budget_left(started, clock, budget))) as tx:
+    with storage.write(context, remaining_seconds=min(1.0, left)) as tx:
         tx.candidates.backfill(now=clock.utc_now(), limit=page)
         tx.candidates.retire_unresolved_backlog(now=clock.utc_now())
         tx.candidates.archive_dormant(now=clock.utc_now(), limit=page)
@@ -240,9 +249,10 @@ def _resume_admission(
 
 def _queued_work_types(storage, clock, context, started: float, budget: float, kinds: list[str]) -> tuple[str, ...]:
     """Which of ``kinds`` have queued rows, so the receipt reports only real gaps."""
-    if not kinds:
+    left = budget_left(started, clock, budget)
+    if not kinds or left <= 0:
         return ()
-    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    with storage.read(context, remaining_seconds=left) as tx:
         visible, params = tx.work._visible_filter()
         queued = {
             row[0]
@@ -304,7 +314,10 @@ def _release_group(
 
 def _private_allowed(storage, clock, context, allowed: frozenset[str], started: float, budget: float) -> frozenset[str]:
     """Drop every optional outbound work type while a store-wide full interval is open."""
-    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return frozenset()
+    with storage.read(context, remaining_seconds=left) as tx:
         now = clock.utc_now()
         rules = private.active_intervals(tx, now)
     if private.source_blocked(rules, None):
@@ -313,17 +326,25 @@ def _private_allowed(storage, clock, context, allowed: frozenset[str], started: 
 
 
 def _run_member(storage, clock, context, member, *, run, started: float, budget: float):
-    """Run one processor, unless a full interval covers its subject: then hold it without a provider call."""
-    if private.work_blocked(storage, clock, context, member):
-        return hold_for_private_mode(storage, clock, context, member, started=started, budget=budget)
-    return run(storage, clock, context, member, started=started, budget=budget)
+    """Run one processor, returning a bounded deadline outcome if the budget expires mid-flight."""
+    if budget_left(started, clock, budget) <= 0:
+        return deadline_result(storage, context, member)
+    try:
+        if private.work_blocked(storage, clock, context, member):
+            return hold_for_private_mode(storage, clock, context, member, started=started, budget=budget)
+        return run(storage, clock, context, member, started=started, budget=budget)
+    except ContractError as exc:
+        if exc.code == "DEADLINE_EXCEEDED":
+            return deadline_result(storage, context, member)
+        raise
 
 
 def _other_work_ready(storage, clock, context, started: float, budget: float, kinds: frozenset[str]) -> bool:
     """Whether work this pass can still do, other than candidate evaluation, is ready now."""
-    if not kinds:
+    left = budget_left(started, clock, budget)
+    if not kinds or left <= 0:
         return False
-    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    with storage.read(context, remaining_seconds=left) as tx:
         return tx.work.other_work_ready(now=clock.utc_now(), kinds=kinds)
 
 
@@ -345,16 +366,22 @@ def _recover_failed_work(
     settled: tuple = ()
     stale: tuple = ()
     sweep = None
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return 0, None
     if "evaluate_candidate" in allowed:
         # Which settled candidates to queue is read before the write: finding them walks every candidate still
         # settling, and under the writer lease that was 7.6 s of each pass on a large shared store.
-        with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+        with storage.read(context, remaining_seconds=left) as tx:
             if tx.work.pending_depth("evaluate_candidate") < CANDIDATE_QUEUE_CEILING:
                 page = min(config.candidate_batch_limit, config.max_items)
                 settled = tx.candidates.settled_to_schedule(now=clock.utc_now(), limit=page)
                 sweep = "complete" if len(settled) < page else "partial"
             stale = tx.candidates.stale_pending(now=clock.utc_now(), limit=STALE_PENDING_PAGE)
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return 0, sweep
+    with storage.write(context, remaining_seconds=left) as tx:
         recovery_page = min(MAX_RECOVERY_PAGE, config.max_items)
         backfill_importance(tx, limit=128)
         backfill_secret_scans(
@@ -530,9 +557,10 @@ def _claim_embed_members(
 ) -> tuple:
     """Claim the rest of one embedding group under the pass's original budget."""
     room = min(config.embed_batch_limit, remaining_items) - 1
-    if room <= 0:
+    left = budget_left(started, clock, budget)
+    if room <= 0 or left <= 0:
         return (first,)
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    with storage.write(context, remaining_seconds=left) as tx:
         return (
             first,
             *tx.work.claim_next(
@@ -552,14 +580,20 @@ def _group_request_floor(budget: float, lease_seconds: float) -> float:
 
 def _refresh_briefs(storage, clock, context, started, budget):
     """Backfill manifests at worker wakeup without calling an auxiliary model."""
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return
+    with storage.write(context, remaining_seconds=left) as tx:
         for scope_id in sorted(context.allowed_scope_ids):
             rebuild_scope(tx, scope_id, clock.utc_now())
 
 
 def _claim_idle(storage, clock, context, config, allowed, fresh_lane, started, budget):
     """Return a claim and its monotonic start, after obtaining the writer lock."""
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return (), clock.monotonic()
+    with storage.write(context, remaining_seconds=left) as tx:
         lease_started = clock.monotonic()
         claim = partial(
             tx.work.claim_next,

@@ -241,6 +241,110 @@ def _bare_source_ref(span: dict, source_text: dict) -> None:
         span["source_ref"] = bare
 
 
+def _unique_source_revisions(sources) -> dict[str, int]:
+    counts: dict[str, set[int]] = {}
+    for source in sources:
+        counts.setdefault(source.ref, set()).add(source.revision)
+    return {ref: next(iter(revs)) for ref, revs in counts.items() if len(revs) == 1}
+
+
+def _normalize_ref_list(refs: object, unique_revisions: dict[str, int]) -> None:
+    """Complete bare source references when the batch holds a single revision of that source."""
+    if not isinstance(refs, list) or not unique_revisions:
+        return
+    changed = False
+    for idx, item in enumerate(refs):
+        if type(item) is str and "@" not in item and item in unique_revisions:
+            refs[idx] = f"{item}@{unique_revisions[item]}"
+            changed = True
+    if changed and all(isinstance(item, str) for item in refs):
+        refs[:] = list(dict.fromkeys(refs))
+
+
+def _normalize_claim_refs(claims: object, unique_revisions: dict[str, int]) -> None:
+    for claim in claims if isinstance(claims, list) else ():
+        if not isinstance(claim, dict):
+            continue
+        for section, key in (("procedure", "counterexample_refs"), ("intention", "state_evidence_refs")):
+            nested = claim.get(section)
+            if isinstance(nested, dict):
+                _normalize_ref_list(nested.get(key), unique_revisions)
+
+
+def _normalize_resume_refs(resumes: object, unique_revisions: dict[str, int]) -> None:
+    for resume in resumes if isinstance(resumes, list) else ():
+        if not isinstance(resume, dict):
+            continue
+        goal = resume.get("goal")
+        if isinstance(goal, dict):
+            _normalize_ref_list(goal.get("evidence_refs"), unique_revisions)
+        for field in ("decisions", "verified_progress", "open_items", "blockers"):
+            entries = resume.get(field)
+            for entry in entries if isinstance(entries, list) else ():
+                if isinstance(entry, dict):
+                    _normalize_ref_list(entry.get("evidence_refs"), unique_revisions)
+
+
+def _normalize_envelope_refs(value: dict, unique_revisions: dict[str, int]) -> None:
+    if not unique_revisions:
+        return
+    _normalize_claim_refs(value.get("claim_proposals"), unique_revisions)
+    _normalize_resume_refs(value.get("resume_proposals"), unique_revisions)
+    bindings = value.get("reference_proposals")
+    for binding in bindings if isinstance(bindings, list) else ():
+        if isinstance(binding, dict):
+            _normalize_ref_list(binding.get("evidence_refs"), unique_revisions)
+
+
+def _filter_batch_references(
+    value: dict, available: dict[tuple[str, int], StoredSource], rejected_items: list[RejectedProposal]
+) -> None:
+    """Isolate individual proposals citing undeclared sources or invalid progress origins."""
+    if not available:
+        return
+    declared = set(value["source_refs"])
+    by_key = {f"{s.ref}@{s.revision}": s for s in available.values()}
+    kept_claims = []
+    for claim in value["claim_proposals"]:
+        counterexamples = claim.get("procedure", {}).get("counterexample_refs", [])
+        state_refs = claim.get("intention", {}).get("state_evidence_refs", [])
+        if not set(counterexamples) <= declared:
+            rejected_items.append(RejectedProposal("claim", "DERIVATION_INVALID", "counterexample_refs"))
+            continue
+        if not set(state_refs) <= declared:
+            rejected_items.append(RejectedProposal("claim", "DERIVATION_INVALID", "state_evidence_refs"))
+            continue
+        kept_claims.append(claim)
+    value["claim_proposals"] = kept_claims
+
+    kept_resumes = []
+    for resume in value["resume_proposals"]:
+        refs = list(resume["evidence_refs"]) + resume["goal"]["evidence_refs"]
+        for field in ("decisions", "verified_progress", "open_items", "blockers"):
+            for item in resume[field]:
+                refs.extend(item["evidence_refs"])
+        if not set(refs) <= declared:
+            rejected_items.append(RejectedProposal("summary", "DERIVATION_INVALID", "resume_evidence_refs"))
+            continue
+        progress_ok = all(
+            any(source_origin(by_key[ref]) in {"human_direct", "tool_observation"} for ref in item["evidence_refs"])
+            for item in resume["verified_progress"]
+        )
+        if not progress_ok:
+            rejected_items.append(RejectedProposal("summary", "DERIVATION_INVALID", "verified_progress_origin"))
+            continue
+        kept_resumes.append(resume)
+    value["resume_proposals"] = kept_resumes
+
+    kept_refs = []
+    for binding in value["reference_proposals"]:
+        if not set(binding["evidence_refs"]) <= declared:
+            rejected_items.append(RejectedProposal("summary", "DERIVATION_INVALID", "reference_evidence_refs"))
+            continue
+        kept_refs.append(binding)
+    value["reference_proposals"] = kept_refs
+
+
 def _restore_request_fields(value, sources, episode_ref, candidate):
     """Rebuild request constants; selected evidence and values remain model choices."""
     # Missing/null arrays express no proposals; other types must reach validation.
@@ -288,6 +392,7 @@ def decode_consolidation_result(
         encoded = "\n".join(lines[1:-1]).strip()
     value = decode_payload(encoded)
     _restore_request_fields(value, sources, episode_ref, candidate)
+    _normalize_envelope_refs(value, _unique_source_revisions(sources))
     source_text = {(s.ref, s.revision): s.event["content"] for s in sources}
     available = {(s.ref, s.revision): s for s in sources}
     claims = value.get("claim_proposals")
@@ -316,6 +421,7 @@ def decode_consolidation_result(
     malformed = partition_consolidation_items(value, align_claim=align)
     value["claim_proposals"] = _keep_model_items(value, "claim_proposals", "claim", malformed, rejected_items)
     value["resume_proposals"] = _keep_model_items(value, "resume_proposals", "summary", malformed, rejected_items)
+    _filter_batch_references(value, available, rejected_items)
     return value
 
 
@@ -615,12 +721,9 @@ def _process_ordinary(storage, clock, context, item, prepared, *, model, started
             clock=clock,
         )
     except (ContractError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        # A suppression replay can block support preparation before publication's
-        # dependency check. Missing sources remain an obsolete authority fence.
-        if isinstance(exc, ContractError) and exc.code == "ACCESS_DENIED":
-            with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
-                if derivation_changed(tx, read.dependencies) is not None:
-                    exc = ContractError("VERSION_CONFLICT", "memory_epoch")
+        exc = _reconcile_publication_conflict(
+            storage, context, item, read, exc, left=budget_left(started, clock, budget)
+        )
         return _decode_refused(
             finish,
             exc,
@@ -662,14 +765,38 @@ def _process_ordinary(storage, clock, context, item, prepared, *, model, started
     )
 
 
+def _reconcile_publication_conflict(storage, context, item, read, exc: Exception, *, left: float) -> Exception:
+    """Convert concurrent sibling-source or suppression changes into a retryable epoch conflict."""
+    if not isinstance(exc, ContractError) or exc.code not in {"ACCESS_DENIED", "SOURCE_MISSING", "VERSION_CONFLICT"}:
+        return exc
+    if exc.field == "private_mode" or left <= 0:
+        return exc
+    with storage.read(context, remaining_seconds=left) as tx:
+        if exc.code == "ACCESS_DENIED":
+            if derivation_changed(tx, read.dependencies) is not None:
+                return ContractError("VERSION_CONFLICT", "memory_epoch")
+            return exc
+        try:
+            tx.claims.require_live_source(item.subject_ref, item.subject_revision)
+        except ContractError:
+            return exc
+        if derivation_changed(tx, read.dependencies) is not None:
+            return ContractError("VERSION_CONFLICT", "memory_epoch")
+    return exc
+
+
 def _consolidation_outcome(storage, context, item, verdicts, chunk, *, remaining_seconds):
     """Reflect the durable row when ordinary work handed off to adoption stages."""
     support_failure = next((v.failure_code for v in verdicts if v.failure_code), None)
     if chunk is not None and not chunk.final:
         return "deferred", support_failure, "pending"
-    with storage.read(context, remaining_seconds=remaining_seconds) as tx:
-        if tx.work.read_state(item.work_id) == "pending":
-            return "deferred", support_failure, "pending"
+    try:
+        with storage.read(context, remaining_seconds=max(remaining_seconds, 1.0)) as tx:
+            if tx.work.read_state(item.work_id) == "pending":
+                return "deferred", support_failure, "pending"
+    except ContractError as exc:
+        if exc.code != "DEADLINE_EXCEEDED":
+            raise
     disposition = "deferred" if support_failure and failure_category(support_failure) == "capability" else "completed"
     return disposition, support_failure, "done"
 

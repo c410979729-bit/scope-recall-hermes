@@ -51,20 +51,21 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 from urllib.request import pathname2url
 
-from ..adapters.hermes.shared_entries import read_shared_payload
-from ..contracts import InstanceBinding, TrustedContext
-from ..core import lexical_index
-from ..core.delete_storage import group_digest
-from ..core.events import indexed_terms, tool_observation_excerpt, withheld_tool_output
-from ..core.requalify import settle_brought_denials
-from ..core.schema import SCHEMA_VERSION
-from ..core.source_records import restart_body_scan_maintenance
-from ..core.storage import Transaction
-from ..core.summary_validity import CONVERSATION_SUMMARY_REASONS
-from ..core.truth_connection import connect_truth_database
-from ..core.writer_lease import TruthWriterBusyError
-from ..runtime.running_code import live_records
-from ..runtime.vector_retention import OMITTED_TOOL_OUTPUT, REPEATED_TOOL_OUTPUT
+from scope_recall.adapters.hermes.shared_entries import read_shared_payload
+from scope_recall.contracts import InstanceBinding, TrustedContext
+from scope_recall.core import lexical_index
+from scope_recall.core.delete_storage import group_digest
+from scope_recall.core.events import indexed_terms, tool_observation_excerpt, withheld_tool_output
+from scope_recall.core.requalify import settle_brought_denials
+from scope_recall.core.schema import SCHEMA_VERSION
+from scope_recall.core.source_records import restart_body_scan_maintenance
+from scope_recall.core.storage import Transaction
+from scope_recall.core.summary_validity import CONVERSATION_SUMMARY_REASONS
+from scope_recall.core.truth_connection import connect_truth_database
+from scope_recall.core.writer_lease import TruthWriterBusyError
+from scope_recall.runtime.running_code import live_records
+from scope_recall.runtime.vector_retention import OMITTED_TOOL_OUTPUT, REPEATED_TOOL_OUTPUT
+
 from .shared_run import Run, SharedStoreError, store_lock
 
 #: Store versions whose tables this import reads.  An older store is upgraded first.
@@ -627,7 +628,7 @@ def _brought_in(conn, src, names: _Names, *, payload: dict[str, Any], root: Path
         )
         tx = Transaction(conn, TrustedContext(binding, "import-entry", scopes, "host_generated"), writable=True)
         try:
-            from ..core.injection_import import screen_imported_sources
+            from scope_recall.core.injection_import import screen_imported_sources
 
             screen_imported_sources(tx, names, now)
             copied["counts"]["denials_settled"] = settle_brought_denials(tx, brought, now=now)

@@ -1225,3 +1225,197 @@ def test_later_date_echo_from_imports_without_source_times_does_not_prove_order(
     latest = core.claim_history(ctx, old.ref)[-1]
     assert latest.reason == "conflicting_evidence_order_unknown"
     assert latest.valid_from == "2026-11-20T00:00:00.000000+00:00"
+
+
+def test_fenced_verdict_and_empty_new_target_ref_validate_cleanly(app):
+    from scope_recall.core.semantic_proposals import judgement_result
+    from scope_recall.core.worker_entities import _decode_decision
+
+    fenced_new = '```json\n{"support": "supported", "action": "new", "target_ref": "", "target_revision": null}\n```'
+    parsed = judgement_result(fenced_new, ())
+    assert parsed == {"support": "supported", "action": "new", "target_ref": None, "target_revision": None}
+
+    entity_fenced = '```\n{"support": "supported", "action": "new", "target_ref": "", "target_revision": null}\n```'
+    verdict = _decode_decision(entity_fenced, ())
+    assert (verdict.state, verdict.action, verdict.target_ref) == ("supported", "new", None)
+
+    core, ctx = app
+    source = capture(core, ctx, "TEST-project 的数据库采用 postgres。")
+    proposal = normalized(source)
+    for flag in ({"observation": True}, {"adoption": True}):
+        with pytest.raises(ContractError):
+            prepare_support(
+                envelope(proposal),
+                (source,),
+                lambda *_args, **_kw: '{"support":"invalid","action":"new","target_ref":null,"target_revision":null}',
+                **flag,
+            )
+
+
+def test_malformed_single_claim_verdict_is_isolated_in_batch_support(app):
+    from scope_recall.core.consolidate import ConsolidationWorkFence, accept_consolidation
+    from scope_recall.core.semantic_proposals import prepare_publication
+    from scope_recall.core.worker_outcomes import read_derivation_fence
+
+    core, ctx = app
+    prior = capture(core, ctx, "TEST-project 早期缓存采用 Memcached。", when="2026-09-01T12:00:00Z")
+    accept(core, ctx, draft(prior, subject="TEST-project", predicate="cache", value="Memcached"))
+    source = capture(
+        core,
+        ctx,
+        "TEST-project 的数据库采用 postgres，缓存采用 Redis，队列采用 Kafka。",
+        when="2026-09-02T12:00:00Z",
+    )
+    bad_paraphrase = normalized(source, predicate="database", value_text="PostgreSQL")
+    good_paraphrase = normalized(source, predicate="queue", value_text="Apache Kafka")
+    literal_claim = normalized(source, predicate="cache", value_text="Redis")
+    batch = dict(
+        protocol_version="1.1",
+        source_refs=[f"{source.ref}@{source.revision}"],
+        claim_proposals=[bad_paraphrase, good_paraphrase, literal_claim],
+        resume_proposals=[],
+        reference_proposals=[],
+    )
+
+    def mixed_judge(messages, **kwargs):
+        value_text = json.loads(messages[-1]["content"])["proposal"]["value_text"]
+        if value_text == "Apache Kafka":
+            return '```json\n{"support":"supported","action":"new","target_ref":"","target_revision":null}\n```'
+        return '{"support":"invalid_enum","action":"new","target_ref":null,"target_revision":null}'
+
+    verdicts = prepare_publication(core.storage, ctx, batch, (source,), mixed_judge)
+    assert [v.state for v in verdicts] == ["unavailable", "supported", "unavailable"]
+
+    with core.storage.write(ctx) as tx:
+        work_id = (
+            tx._check(write=True)
+            .execute(
+                "SELECT work_id FROM work_items WHERE work_type='consolidate' AND subject_ref=?",
+                (source.ref,),
+            )
+            .fetchone()[0]
+        )
+        claimed = tx.work.claim_next("TEST-worker", core.clock.utc_now(), lease_seconds=30, limit=10)
+        item = next(entry for entry in claimed if entry.work_id == work_id)
+        deps = read_derivation_fence(tx, scope_id=source.scope_id, sources=(source,))
+
+    fence = ConsolidationWorkFence(
+        item.work_id,
+        item.lease_token,
+        item.lease_owner,
+        source.ref,
+        source.revision,
+        deps,
+        frozenset({f"{source.ref}@{source.revision}"}),
+    )
+    with using_support(verdicts):
+        receipt = accept_consolidation(
+            core.storage,
+            core.clock,
+            ctx,
+            batch,
+            scope_id=source.scope_id,
+            work_fence=fence,
+        )
+    stored_values = {core.current_claim(ctx, m.ref).payload["value_text"] for m in receipt.items}
+    assert stored_values == {"Apache Kafka", "Redis"}
+
+
+def test_decode_consolidation_completes_bare_refs_and_isolates_undeclared_refs(app):
+    from scope_recall.core.worker_consolidation import decode_consolidation_result
+
+    core, ctx = app
+    source = capture(core, ctx, "TEST-owner 计划下周升级数据库。")
+    good_intention = dict(
+        kind="intention",
+        subject="TEST-owner",
+        predicate="upgrade_plan",
+        value_text="升级数据库",
+        conditions=[],
+        statement_kind="assertion",
+        valid_from=None,
+        valid_to=None,
+        evidence_spans=[
+            dict(
+                source_ref=f"{source.ref}@{source.revision}",
+                source_revision=source.revision,
+                quote=source.event["content"],
+            )
+        ],
+        intention=dict(
+            cue="下周",
+            target="升级数据库",
+            conditions=[],
+            state="pending",
+            state_evidence_refs=[source.ref, f"{source.ref}@{source.revision}"],
+        ),
+    )
+    bad_intention = deepcopy(good_intention)
+    bad_intention["predicate"] = "other_plan"
+    bad_intention["intention"]["state_evidence_refs"] = ["evt-undeclared@1"]
+    bad_ref = dict(
+        mention="那台机器",
+        resolution="unresolved",
+        candidate_refs=[],
+        resolved_ref=None,
+        evidence_refs=["evt-undeclared@1"],
+    )
+    payload = dict(
+        protocol_version="1.1",
+        source_refs=[f"{source.ref}@{source.revision}"],
+        claim_proposals=[good_intention, bad_intention],
+        resume_proposals=[],
+        reference_proposals=[bad_ref],
+    )
+    rejected = []
+    decoded = decode_consolidation_result(json.dumps(payload, ensure_ascii=False), (source,), rejected_items=rejected)
+    assert len(decoded["claim_proposals"]) == 1
+    assert decoded["claim_proposals"][0]["intention"]["state_evidence_refs"] == [f"{source.ref}@{source.revision}"]
+    assert decoded["reference_proposals"] == []
+    assert [(item.stage, item.field) for item in rejected] == [
+        ("claim", "state_evidence_refs"),
+        ("summary", "reference_evidence_refs"),
+    ]
+
+
+def test_sibling_source_withdrawal_during_consolidation_retries_live_subject(app):
+    from test_deletion import authorize, request
+
+    core, ctx = app
+    first = capture(core, ctx, "TEST-project adopts Redis.", key="TEST-batch/1")
+    second = capture(core, ctx, "TEST-project adopts Kafka.", key="TEST-batch/2")
+    authorize(core, ctx, second)
+    with core.storage.write(ctx) as tx:
+        tx._check(write=True).execute("UPDATE work_items SET state='done' WHERE work_type='embed'")
+
+    calls = []
+
+    class SiblingWithdrawModel:
+        def propose(self, sources, *, episode_ref=None, remaining_seconds=1.0, validation_feedback=None):
+            calls.append([s.ref for s in sources])
+            if len(calls) == 1:
+                assert second.ref in calls[0]
+                assert core.forget(ctx, request(second), remaining_seconds=10)["read_blocked"]
+            kept = sources[0]
+            claim = draft(kept, subject="TEST-project", predicate="cache", value="Redis")
+            return json.dumps(
+                dict(
+                    protocol_version="1.1",
+                    source_refs=[f"{s.ref}@{s.revision}" for s in sources],
+                    claim_proposals=[claim],
+                    resume_proposals=[],
+                    reference_proposals=[],
+                )
+            )
+
+    receipt = core.drain_worker(ctx, max_items=1, remaining_seconds=30, consolidation=SiblingWithdrawModel())
+    assert [(item.disposition, item.error_code, item.state) for item in receipt.items] == [
+        ("retry", "memory_epoch_changed", "pending")
+    ]
+    with core.storage.read(ctx) as tx:
+        state = (
+            tx._check()
+            .execute("SELECT state FROM work_items WHERE work_type='consolidate' AND subject_ref=?", (first.ref,))
+            .fetchone()[0]
+        )
+    assert state == "pending"

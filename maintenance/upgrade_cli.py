@@ -8,12 +8,13 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from ..core.process_environment import configure_numeric_threads
+from scope_recall.core.process_environment import configure_numeric_threads
 
 configure_numeric_threads()
 
-from ..adapters.hermes.audiences import HermesIdentityError
-from ..contracts import ContractError
+from scope_recall.adapters.hermes.audiences import HermesIdentityError
+from scope_recall.contracts import ContractError
+
 from .backup import BackupError
 from .legacy_episode_membership import MembershipProjectionError
 from .legacy_v2_compat import LegacyCompatibilityError

@@ -11,9 +11,10 @@ from importlib.metadata import distribution
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from .._version import __version__
-from ..adapters.audiences import HermesIdentityError
-from ..adapters.shared_entries import Attachment, read_shared_payload, shared_entry_for_home
+from scope_recall._version import __version__
+from scope_recall.adapters.audiences import HermesIdentityError
+from scope_recall.adapters.shared_entries import Attachment, read_shared_payload, shared_entry_for_home
+
 from .doctor import probe_python_package
 from .install_common import InstallError
 

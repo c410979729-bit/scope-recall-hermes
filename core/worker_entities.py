@@ -26,7 +26,7 @@ from .evidence_support import SupportVerdict
 from .failure_retry import validation_feedback
 from .injection_guard import blocked_refs
 from .retrieval import SearchContext, SearchLimits
-from .semantic_proposals import _publication_blocked, merge_candidates, validate_judgement
+from .semantic_proposals import _publication_blocked, merge_candidates, strip_json_fence, validate_judgement
 from .worker_outcomes import (
     Outcome,
     budget_left,
@@ -35,6 +35,7 @@ from .worker_outcomes import (
     hold_for_entry_state,
     hold_for_private_mode,
     model_failure,
+    provider_prepare_budget,
     record_error_detail,
     stale_result,
     work_result,
@@ -113,9 +114,10 @@ def _decode_decision(raw, candidates):
     if type(raw) is not str:
         raise ContractError("DERIVATION_INVALID", "model_output_content")
     try:
-        parsed = decode_payload(raw)
-    except ContractError as exc:
-        raise ContractError("DERIVATION_INVALID", exc.field) from None
+        parsed = decode_payload(strip_json_fence(raw, error_name="entity_decision"))
+    except (ContractError, ValueError) as exc:
+        field = exc.field if isinstance(exc, ContractError) else "payload"
+        raise ContractError("DERIVATION_INVALID", field) from None
     answer = validate_judgement(parsed, candidates)
     support, action = answer["support"], answer["action"]
     if action == "update" or (action == "duplicate" and support != "supported"):
@@ -298,8 +300,18 @@ def process_entity_projection(storage, clock, context, item, *, model, started: 
         source, _sources, names, entries = prepared
         evidenced_names = tuple(name for name in names if entity_name_evidenced(source, name))
         stage = "entity_judge"
+        request_end = provider_prepare_budget(clock, started, budget)
         decision, gap = (
-            _judge(storage, clock, context, item, model, prepared, started + budget, evidenced_names=evidenced_names)
+            _judge(
+                storage,
+                clock,
+                context,
+                item,
+                model,
+                prepared,
+                started + request_end,
+                evidenced_names=evidenced_names,
+            )
             if evidenced_names
             else (None, None)
         )

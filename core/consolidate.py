@@ -345,6 +345,21 @@ def candidate_evaluation_messages(
     return messages
 
 
+def _require_batch_sources(tx, value, fence: ConsolidationWorkFence) -> None:
+    """Verify sibling sources in the batch; convert concurrent sibling withdrawals into a retryable epoch conflict."""
+    try:
+        for ref in fence.skipped_source_refs:
+            tx.claims.require_live_source(*parse_source_ref(ref))
+        for ref in value["source_refs"]:
+            if ref not in fence.allowed_source_refs:
+                raise ContractError("DERIVATION_INVALID", "source_refs")
+            tx.claims.require_live_source(*parse_source_ref(ref))
+    except ContractError as exc:
+        if exc.code in {"SOURCE_MISSING", "ACCESS_DENIED", "VERSION_CONFLICT"}:
+            raise ContractError("VERSION_CONFLICT", "memory_epoch") from exc
+        raise
+
+
 def _fence_consolidation(tx, value, fence: ConsolidationWorkFence, *, now: str) -> list[str]:
     """Check a worker's result against its lease and, for one page of a long source, against that page; return what
     the page proposed that it does not ground, which is dropped."""
@@ -359,12 +374,7 @@ def _fence_consolidation(tx, value, fence: ConsolidationWorkFence, *, now: str) 
     covered = frozenset(value["source_refs"]) | fence.skipped_source_refs
     if f"{fence.subject_ref}@{fence.subject_revision}" not in covered:
         raise ContractError("DERIVATION_INVALID", "consolidation_subject_uncovered")
-    for ref in fence.skipped_source_refs:
-        tx.claims.require_live_source(*parse_source_ref(ref))
-    for ref in value["source_refs"]:
-        if ref not in fence.allowed_source_refs:
-            raise ContractError("DERIVATION_INVALID", "source_refs")
-        tx.claims.require_live_source(*parse_source_ref(ref))
+    _require_batch_sources(tx, value, fence)
     # Captures and unrelated writes move memory_epoch without touching anything
     # this result was derived from.  Only a changed dependency rejects it, as
     # the retryable ``VERSION_CONFLICT`` (``memory_epoch``).  A non-final

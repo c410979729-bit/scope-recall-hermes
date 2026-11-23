@@ -6,9 +6,10 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from ..adapters.hermes.installation import build_installation_manifest
-from ..adapters.hermes.shared_entries import read_shared_payload
-from ..contracts import READ_ONLY_CLIENT_HOSTS
+from scope_recall.adapters.hermes.installation import build_installation_manifest
+from scope_recall.adapters.hermes.shared_entries import read_shared_payload
+from scope_recall.contracts import READ_ONLY_CLIENT_HOSTS
+
 from .install_common import InstallError
 from .install_hermes import profile_identity
 
@@ -24,7 +25,7 @@ SETUP_LOCAL_PLATFORMS = ("desktop",)
 
 def profile_repair(home: Path) -> dict | None:
     """Allow an old default setup identity to change only after checking its captured sources."""
-    from ..adapters.shared_entries import read_attachment
+    from scope_recall.adapters.shared_entries import read_attachment
 
     pointer = read_attachment(home)
     if pointer is None or pointer.host != "hermes":
@@ -49,7 +50,8 @@ def profile_repair(home: Path) -> dict | None:
 
 def repair_profile(home: Path) -> dict | None:
     """Back up and correct an unused entry without rekeying the shared database or its grants."""
-    from ..adapters.shared_entries import read_attachment, write_shared_payload
+    from scope_recall.adapters.shared_entries import read_attachment, write_shared_payload
+
     from .shared_run import Run, home_lock, store_lock
 
     pointer = read_attachment(home)

@@ -373,7 +373,7 @@ def _candidate_queue_checks(report: DoctorReport, tx):
 
 def _injection_checks(report, conn):
     """Report held source counts without reading or copying their words."""
-    from ..core.injection_policy import load_policy
+    from scope_recall.core.injection_policy import load_policy
 
     try:
         load_policy(conn)
@@ -413,7 +413,7 @@ def _injection_review_summary(conn):
     from collections import Counter
     from types import SimpleNamespace
 
-    from ..core.source_records import source_origin
+    from scope_recall.core.source_records import source_origin
 
     rules, origins = Counter(), Counter()
     now = datetime.now(UTC)
@@ -742,7 +742,7 @@ def check_unreached(report: DoctorReport, config) -> None:
     is named too, and the finding asks for attention rather than degrading the report.  The detail line counts; the
     scope ids, which carry chat and account ids, are only in ``unreached``.
     """
-    from ..runtime.scheduling import capable_work_types
+    from scope_recall.runtime.scheduling import capable_work_types
 
     capable = capable_work_types(config) if config is not None else {"purge", "rebuild_projection"}
     if config is not None:
@@ -1074,14 +1074,14 @@ def check_deletion_mirror(report: DoctorReport, data_directory: Path) -> None:
     A store that has never been backed up has no archive that could bring a
     deleted memory back, so its missing mirror is recorded without a gap.
     """
-    from ..core.deletion_mirror import (
+    from scope_recall.core.deletion_mirror import (
         MIRROR_ERRORS,
         configured_backup_dir,
         deletion_protection_expected,
         mirror_pending,
         read_mirror_lag,
     )
-    from ..runtime.backup_upkeep import backup_job_problem
+    from scope_recall.runtime.backup_upkeep import backup_job_problem
 
     if problem := backup_job_problem(data_directory):
         report.capability_gaps.append("scheduled_backup_incomplete")

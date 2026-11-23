@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..host_registry import HOSTS
+from scope_recall.host_registry import HOSTS
 
 # Keep discovery order stable: the first fresh entry supplies the store's default grants.
 HOST_DIRECTORIES = {

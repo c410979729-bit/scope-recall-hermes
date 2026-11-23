@@ -17,10 +17,13 @@ from .reflection_validity import check_dependencies
 from .semantic_proposals import prepare_support
 from .worker_outcomes import (
     budget_left,
+    call_model_before_deadline,
+    deadline_result,
     defer_model_pass,
     finalize_work,
     hold_for_entry_state,
     model_failure,
+    provider_prepare_budget,
     stale_result,
     work_result,
 )
@@ -95,15 +98,19 @@ def process_reflection(storage, clock, context, item, *, model, started, budget)
         rejections = []
         judge = partial(_judge, storage, clock, context, group, model)
         proposals = json.loads(group["proposals_json"]) if group["proposals_json"] is not None else None
+        request_end = provider_prepare_budget(clock, started, budget)
         with private.using_outbound_check(guard):
             private.require_outbound()
             if proposals is None:
-                raw = judge(
+                raw = call_model_before_deadline(
+                    judge,
+                    clock,
+                    started,
+                    request_end,
                     reflection_messages(
                         [dict(m, content=s.event["content"][:512]) for m, s in zip(members, sources, strict=True)],
                         subject=model_subject(group["subject"], sources),
                     ),
-                    remaining_seconds=budget_left(started, clock, budget),
                 )
                 proposals = decode_observations(raw, members, sources, rejections=rejections)
                 public_subject = model_subject(group["subject"], sources)
@@ -113,11 +120,12 @@ def process_reflection(storage, clock, context, item, *, model, started, budget)
                     ):
                         proposal["subject"] = group["subject"]
             else:
+                bounded_judge = partial(call_model_before_deadline, judge, clock, started, request_end)
                 verdicts = prepare_support(
                     dict(claim_proposals=[proposals[group["next_proposal"]]]),
                     sources,
-                    judge,
-                    remaining_seconds=budget_left(started, clock, budget),
+                    bounded_judge,
+                    remaining_seconds=max(0.001, budget_left(started, clock, request_end)),
                     observation=True,
                 )
         return _publish_stage(
@@ -142,8 +150,11 @@ def process_reflection(storage, clock, context, item, *, model, started, budget)
 
 def _publish_stage(storage, clock, context, item, prepared, *, started, budget):
     """Commit a paid stage once, only under unchanged sources, privacy and lease."""
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return deadline_result(storage, context, item)
     group, proposals, verdicts, rejections, entries = prepared
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    with storage.write(context, remaining_seconds=left) as tx:
         if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
             return stale_result(tx, item)
         if paused_since(tx, entries):
@@ -173,10 +184,12 @@ def _publish_stage(storage, clock, context, item, prepared, *, started, budget):
             )
         else:
             failure = next((v.failure_code for v in verdicts if v.failure_code), None)
-            if failure:
+            unavailable = any(v.state.startswith("unavailable") for v in verdicts)
+            if failure or unavailable:
+                code = failure or "DEADLINE_EXCEEDED"
                 return work_result(
-                    tx.work.fail(*item.lease, now=clock.utc_now(), error_code=failure, recoverable=True),
-                    error_code=failure,
+                    tx.work.fail(*item.lease, now=clock.utc_now(), error_code=code, recoverable=True),
+                    error_code=code,
                 )
             with using_support(verdicts):
                 publish_observation(tx, group, proposals[index], now=clock.utc_now())
@@ -196,7 +209,10 @@ def _publish_stage(storage, clock, context, item, prepared, *, started, budget):
 
 def _discard_stage(storage, clock, context, item, *, started, budget):
     """Release an invalid dependency batch so fresh evidence can schedule another one."""
-    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+    left = budget_left(started, clock, budget)
+    if left <= 0:
+        return deadline_result(storage, context, item)
+    with storage.write(context, remaining_seconds=left) as tx:
         if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
             return stale_result(tx, item)
         tx._check().execute(
