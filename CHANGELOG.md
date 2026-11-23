@@ -14,10 +14,10 @@
 - Installed packages include the reflection prompt and the memory-management schema.
 - Worker leases start after acquiring the write lock, and long-message consolidation shares its remaining lease between extraction and evidence checks, leaving time to save a page or record a timeout.
 - Doctor checks the read-only shared-store binding for Cherry Studio.
-- Consolidation keeps valid facts when another proposal fails validation. Repeated literal quotes use the indicated occurrence or the first one. A typographic match must be unique.
+- Consolidation keeps valid facts when another proposal fails validation, isolates malformed single-claim support verdicts and undeclared batch source references, and retries live subjects when sibling batch sources change concurrently. Repeated literal quotes use the indicated occurrence or the first one. A typographic match must be unique.
 - Long tool output is indexed from its beginning and end. The full text stays available as evidence.
 - Failed entity checks release their names for other jobs. A worker waiting for a live name reservation resumes after the lease and keeps its daily queue allowance.
-- Storage previews release the live database before scanning the snapshot. Compaction trims redundant candidate evidence and withdraws stale tool-output search terms. Windows maintenance commands emit UTF-8 receipts through redirected output.
+- Storage previews release the live database before scanning the snapshot, accept `--temp-dir`, and verify available disk space before snapshots or offline compaction. Compaction trims redundant candidate evidence and withdraws stale tool-output search terms. Windows maintenance commands emit UTF-8 receipts through redirected output.
 - Local entry checks recognize verified case and Unicode aliases of the same directory on shared-store volumes.
 
 ## [4.0.5]

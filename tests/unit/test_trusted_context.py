@@ -167,3 +167,15 @@ def test_windows_extended_paths_are_normalized_without_expanding_test_authority(
     for device in ("\\\\.\\PhysicalDrive0", "\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1"):
         with pytest.raises(PermissionError, match="TEST_BOUNDARY"):
             _check_path(device)
+
+
+def test_linux_mountinfo_read_is_allowed_without_exposing_other_proc_files(monkeypatch):
+    import v11_guard
+
+    monkeypatch.setattr(v11_guard.sys, "platform", "linux")
+    v11_guard._check_path("/proc/self/mountinfo")
+    with pytest.raises(PermissionError, match="TEST_BOUNDARY"):
+        v11_guard._check_path("/proc/self/mountinfo", writing=True)
+    for forbidden in ("/proc/self/environ", "/proc/self/cmdline", f"/proc/{os.getpid() + 1}/mountinfo"):
+        with pytest.raises(PermissionError, match="TEST_BOUNDARY: protected data access"):
+            v11_guard._check_path(forbidden)

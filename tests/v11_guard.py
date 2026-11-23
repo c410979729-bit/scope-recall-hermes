@@ -241,6 +241,10 @@ def _check_path(value, writing=False):
             flush=True,
         )
         raise PermissionError("TEST_BOUNDARY: write outside isolated test directory (%s)" % path)
+    if not writing and sys.platform == "linux" and path == Path("/proc/self/mountinfo").resolve(strict=False):
+        # ``adapters.attachment_paths`` reads the current process's mount table to reject remote mounts without
+        # statting paths inside them; other ``/proc`` files (such as ``environ``) remain denied.
+        return
     if any(path.is_relative_to(root) for root in (_ROOT, _ISOLATED, *_RUNTIME, _SYSTEM, *_ZONEINFO)):
         return
     raise PermissionError("TEST_BOUNDARY: protected data access")
