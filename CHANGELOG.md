@@ -1,6 +1,6 @@
 # Changelog
 
-## [4.0.6.dev0]
+## [4.0.6]
 
 ### Added
 
@@ -24,7 +24,7 @@
 - Failed entity checks release their names for other jobs. A worker waiting for a live name reservation resumes after the lease and keeps its daily queue allowance.
 - Storage previews release the live database before scanning the snapshot, accept `--temp-dir`, and verify available disk space before snapshots or offline compaction. Compaction trims redundant candidate evidence and withdraws stale tool-output search terms. Windows maintenance commands emit UTF-8 receipts through redirected output.
 - Local entry checks recognize verified case and Unicode aliases of the same directory on shared-store volumes.
-- Automatic lexical recall weighs query terms by empirical store document frequency while ignoring unseen query fragments, requiring a specific term match when one exists in the store and tighter overlap when every query term is common.
+- Automatic recall bounds CJK cross-word boundary bigrams, scales query self-information and marginal vector thresholds with store size, requires primary-anchor coherence on large-corpus marginal vector hits, filters embedded non-owner lexical collisions absent from completed vector searches, and keeps settled machine telemetry and unanchored cross-session chatter out of ambient injection.
 - Support judgements carry structured speaker attribution, polarity and scope traits so first-person and omitted-subject statements in any language bind through verified source identity, while third-party, unasserted and single-turn proposals remain unpromoted and quarantined from automatic injection.
 
 ## [4.0.5]
