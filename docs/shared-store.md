@@ -26,7 +26,7 @@ Remote channel routes continue to require their exact platform sender grants.
 ```
 <root>\                       the shared store; everything memory needs is in here
   installation.json           the store's id, and every entry's grants
-  memory.sqlite3              the one store (current schema 1134)
+  memory.sqlite3              the one store (current schema 1135)
   vectors\<space>\            vector companions of the one store
   runtime-config.json         the shared worker's config: every scope, the worker's model routes
   .env                        the shared worker's credentials (you write this)
