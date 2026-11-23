@@ -24,7 +24,7 @@ Agent 首先执行 `scope-recall setup --host hermes --home /path/to/hermes-home
 3.16 使用 Core 存储，走包升级和协调结构升级，不走旧格式转换。先停止共享库的全部宿主、远程服务、常驻召回进程和 worker，备份 SQLite、宿主配置、清单及旧包，再将 worker 与各入口升级到同一版本。
 
 共享库可通过已挂接的入口运行 `scope-recall upgrade-store --host codex --instance-root /path/to/attached-codex-home --backup-dir /path/to/new-upgrade-backups`。
-该命令的 `--host` 只接受 hermes 或 codex，本地库也用对应宿主的 home；其他入口通过 setup 或普通访问触发协调升级。当前结构号为 1134；升级会先保存核验快照，前台命令没有总时限，索引回填完成前普通召回可能不可用。
+该命令的 `--host` 只接受 hermes 或 codex，本地库也用对应宿主的 home；其他入口通过 setup 或普通访问触发协调升级。当前结构号为 1135；升级会先保存核验快照，前台命令没有总时限，索引回填完成前普通召回可能不可用。
 
 每个入口重新运行 setup，刷新复制的插件和钩子。Hermes 包管理器自建的插件环境还需[单独重建](install/hermes.md#package-managed-plugin-environments)：版本不在包索引时，每次重建都要提供包含精确 wheel 的 `UV_FIND_LINKS` 目录，包括 `hermes update` 之后。最后逐入口运行 doctor，启动新会话，验证实际宿主捕获和召回。保留升级前快照、旧包和配置供退回使用。
 
