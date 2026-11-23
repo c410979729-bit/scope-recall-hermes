@@ -7,9 +7,9 @@ import json
 import math
 import re
 import unicodedata
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
 from urllib.parse import urlsplit
 
 from ..contracts import ContractError
@@ -94,8 +94,13 @@ def canonical_embedding_space(value: dict) -> dict:
         raise ContractError("INPUT_INVALID", "embedding_space")
     if type(value.get("prompt_encoding")) is not dict or set(value["prompt_encoding"]) != {"document", "query"}:
         raise ContractError("INPUT_INVALID", "embedding_space")
-    if value["prompt_encoding"] != EMBEDDING_SPACE["prompt_encoding"]:
-        raise ContractError("INPUT_INVALID", "embedding_space")
+    for prompt_value in value["prompt_encoding"].values():
+        if (
+            type(prompt_value) is not str
+            or not 1 <= len(prompt_value) <= 200
+            or any(ch in prompt_value for ch in ("\n", "\r", "\x00"))
+        ):
+            raise ContractError("INPUT_INVALID", "embedding_space")
     if type(value.get("input_preprocessing")) is not dict or set(value["input_preprocessing"]) != {
         "id",
         "unicode_version",
@@ -160,7 +165,14 @@ def embedding_space_id(value: dict) -> str:
 EMBEDDING_DIALECTS = frozenset({"gemini", "openai"})
 
 
-def build_embedding_space(*, model: str, dimensions: int, endpoint: str, dialect: str = "gemini") -> dict:
+def build_embedding_space(
+    *,
+    model: str,
+    dimensions: int,
+    endpoint: str,
+    dialect: str = "gemini",
+    prompt_encoding: Mapping[str, str] | None = None,
+) -> dict:
     """Describe one embedding space so its digest can key the vector store.
 
     Everything about how text reaches a model belongs in this descriptor,
@@ -172,13 +184,19 @@ def build_embedding_space(*, model: str, dimensions: int, endpoint: str, dialect
     """
     if dialect not in EMBEDDING_DIALECTS:
         raise ContractError("INPUT_INVALID", "embedding_dialect")
+    resolved_encoding = dict(EMBEDDING_SPACE["prompt_encoding"]) if prompt_encoding is None else dict(prompt_encoding)
+    encoding_id = (
+        EMBEDDING_SPACE["request_encoding"]["prompt_encoding"]
+        if resolved_encoding == EMBEDDING_SPACE["prompt_encoding"]
+        else "configured-prefix-v1"
+    )
     return canonical_embedding_space(
         {
             "model": model,
             "dimensions": dimensions,
             "endpoint": endpoint,
             "task_type": None,
-            "prompt_encoding": dict(EMBEDDING_SPACE["prompt_encoding"]),
+            "prompt_encoding": resolved_encoding,
             "input_preprocessing": dict(EMBEDDING_SPACE["input_preprocessing"]),
             "metric": "cosine",
             "vector_normalization": "l2_at_scoring",
@@ -186,7 +204,7 @@ def build_embedding_space(*, model: str, dimensions: int, endpoint: str, dialect
                 "id": f"{dialect}-embed-v1",
                 "task_type_field": None,
                 "task_type_location": None,
-                "prompt_encoding": EMBEDDING_SPACE["request_encoding"]["prompt_encoding"],
+                "prompt_encoding": encoding_id,
             },
         }
     )
@@ -199,8 +217,10 @@ def _bound_input(raw_text: object) -> str:
     return unicodedata.normalize("NFKC", raw_text)
 
 
-def encode_embedding_text(raw_text: str, *, kind: str) -> str:
-    """Encode raw source/query text for Gem2 without changing raw identity.
+def encode_embedding_text(
+    raw_text: str, *, kind: str, prompt_encoding: Mapping[str, str] | None = None
+) -> str:
+    """Encode raw source/query text without changing raw identity.
 
     The one choke point every embedded body passes through -- source, claim and
     query alike -- which is why the input bound lives here rather than in each
@@ -211,6 +231,13 @@ def encode_embedding_text(raw_text: str, *, kind: str) -> str:
     if kind not in {"document", "query"}:
         raise ContractError("INPUT_INVALID", "embedding_text")
     bounded, _truncated = bounded_embedding_text(_bound_input(raw_text))
+    if prompt_encoding is not None:
+        template = prompt_encoding.get(kind)
+        if type(template) is str:
+            for placeholder in ("{NFKC query}", "{NFKC source}", "{text}"):
+                if placeholder in template:
+                    return template.replace(placeholder, bounded, 1)
+            return f"{template}{bounded}"
     if kind == "query":
         return f"task: question answering | query: {bounded}"
     return f"title: none | text: {bounded}"

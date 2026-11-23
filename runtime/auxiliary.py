@@ -257,7 +257,7 @@ def _embedding_route_from_mapping(raw: object) -> EmbeddingRouteConfig | None:
     if raw is None:
         return None
     raw = mapping("embedding_mapping_required", raw)
-    credential_env = text("credential_env", raw.get("credential_env"))
+    credential_env = None if raw.get("credential_env") is None else text("credential_env", raw.get("credential_env"))
     # model/endpoint/dimensions/dialect move together: omit all four for the
     # shipped Gemini space, or state all four to address another provider.
     # EmbeddingRouteConfig rejects a partial descriptor.
@@ -265,10 +265,14 @@ def _embedding_route_from_mapping(raw: object) -> EmbeddingRouteConfig | None:
     dimensions_field = (
         None if raw.get("dimensions_field") is None else text("embedding_dimensions_field", raw.get("dimensions_field"))
     )
+    query_prefix = raw.get("query_prefix")
+    document_prefix = raw.get("document_prefix")
     if all(raw.get(key) is None for key in ("model", "endpoint", "dimensions", "dialect")):
         return EmbeddingRouteConfig(
             credential_env=credential_env,
             dimensions_field=dimensions_field or "dimensions",
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
         )
     return EmbeddingRouteConfig(
         credential_env=credential_env,
@@ -282,6 +286,8 @@ def _embedding_route_from_mapping(raw: object) -> EmbeddingRouteConfig | None:
             "embedding_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False)
         ),
         dimensions_field=dimensions_field or "dimensions",
+        query_prefix=query_prefix,
+        document_prefix=document_prefix,
     )
 
 

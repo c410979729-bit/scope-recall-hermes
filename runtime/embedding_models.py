@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import re
 import time
+import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-from ..core.endpoint_policy import endpoint_scheme_allowed
+from ..core.endpoint_policy import endpoint_scheme_allowed, is_loopback_host
 from ..core.events import tool_observation_excerpt
 from ..core.recall_policy import (
     EMBEDDING_DIALECTS,
@@ -231,7 +232,7 @@ class EmbeddingRouteConfig:
     #: directory; naming a different model produces a different digest, which
     #: moves the store and refuses the old vectors rather than comparing across
     #: incompatible geometries.
-    credential_env: str
+    credential_env: str | None = None
     model: str | None = None
     endpoint: str | None = None
     dimensions: int | None = None
@@ -247,9 +248,12 @@ class EmbeddingRouteConfig:
     #: model server on its host does so over a bridge address (``172.17.0.1``), which is not loopback.  Loopback HTTP
     #: needs no opt-in.  Only a literal ``True`` reads as permission, so a string ``"true"`` cannot open it.
     allow_insecure_endpoint: bool = False
+    #: Optional query/document prompt prefixes for local or non-Gemini embedding models
+    #: (e.g. ``"Query: "`` and ``"Document: "``, or ``""`` for raw text). Must move as a pair; enters the space digest.
+    query_prefix: str | None = None
+    document_prefix: str | None = None
 
     def __post_init__(self) -> None:
-        validate_credential_env_name(self.credential_env)
         if type(self.allow_insecure_endpoint) is not bool:
             raise ValueError("embedding_route_allow_insecure_endpoint")
         stated = [self.model, self.endpoint, self.dimensions, self.dialect]
@@ -267,28 +271,57 @@ class EmbeddingRouteConfig:
             # where the config is read, so a refused endpoint is named at load.  A consolidation route has its own
             # rule, HTTPS only (``ConsolidationRouteConfig``).
             raise ValueError("embedding_route_endpoint")
+        if self.credential_env is None:
+            loopback = self.endpoint is not None and is_loopback_host(urllib.parse.urlsplit(self.endpoint).hostname)
+            if not loopback:
+                raise ValueError("credential_env")
+        else:
+            validate_credential_env_name(self.credential_env)
         if type(self.dimensions_field) is not str or not _REQUEST_FIELD_RE.fullmatch(self.dimensions_field):
             raise ValueError("embedding_route_dimensions_field")
+        if (self.query_prefix is None) != (self.document_prefix is None):
+            raise ValueError("embedding_route_prompt_prefix")
+        for prefix in (self.query_prefix, self.document_prefix):
+            if prefix is not None and (
+                type(prefix) is not str
+                or len(prefix) > 128
+                or any(ch in prefix for ch in ("\n", "\r", "\x00"))
+            ):
+                raise ValueError("embedding_route_prompt_prefix")
 
     def space(self) -> dict:
         """The embedding space this route addresses, defaults included."""
+        prompt_encoding = (
+            None
+            if self.query_prefix is None
+            else {"query": f"{self.query_prefix}{{NFKC query}}", "document": f"{self.document_prefix}{{NFKC source}}"}
+        )
         if self.model is None:
-            return dict(EMBEDDING_SPACE)
+            if prompt_encoding is None:
+                return dict(EMBEDDING_SPACE)
+            return build_embedding_space(
+                model=EMBEDDING_SPACE["model"],
+                dimensions=EMBEDDING_SPACE["dimensions"],
+                endpoint=EMBEDDING_SPACE["endpoint"],
+                dialect="gemini",
+                prompt_encoding=prompt_encoding,
+            )
         return build_embedding_space(
             model=self.model,
             dimensions=self.dimensions,
             endpoint=self.endpoint,
             dialect=self.dialect,
+            prompt_encoding=prompt_encoding,
         )
 
     def wire_dialect(self) -> str:
         return self.dialect or "gemini"
 
 
-def _encoded_document(text: str) -> str:
+def _encoded_document(text: str, *, prompt_encoding: Mapping[str, str] | None = None) -> str:
     """``text`` encoded as a document, refused before anything is sent when the part of it the request carries holds
     secret-like text (``embedding_sends_secret_like_text``)."""
-    encoded = encode_embedding_text(text, kind="document")
+    encoded = encode_embedding_text(text, kind="document", prompt_encoding=prompt_encoding)
     if embedding_sends_secret_like_text(text):
         raise AuxiliaryModelError("sensitive_request")
     return encoded
@@ -330,6 +363,7 @@ class GeminiEmbeddingAdapter:
         self._owns_transport = transport is None
         space = route.space()
         self._space = space
+        self._prompt_encoding = space["prompt_encoding"]
         self._endpoint = space["endpoint"]
         self._model = space["model"]
         self._dimensions = space["dimensions"]
@@ -340,7 +374,7 @@ class GeminiEmbeddingAdapter:
         # The whole query, before the input bound cuts it, so a key the cut runs through is not sent in part.  A query
         # is the owner's message as typed, screened by nothing before this.
         reject_secrets(text)
-        encoded = encode_embedding_text(text, kind="query")
+        encoded = encode_embedding_text(text, kind="query", prompt_encoding=self._prompt_encoding)
         return self._embed(encoded, remaining_seconds=remaining_seconds, transport=self._query_transport)
 
     def embed_queries(self, texts: Sequence[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
@@ -348,7 +382,7 @@ class GeminiEmbeddingAdapter:
         for text in texts:
             # The whole query, before the input bound cuts it; the screen reads it normalised, as it is sent.
             reject_secrets(text)
-        encoded = [encode_embedding_text(text, kind="query") for text in texts]
+        encoded = [encode_embedding_text(text, kind="query", prompt_encoding=self._prompt_encoding) for text in texts]
         if not encoded:
             return ()
         deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
@@ -367,7 +401,10 @@ class GeminiEmbeddingAdapter:
 
     def embed_source(self, source: StoredSource, *, remaining_seconds: float) -> Sequence[float]:
         """Embed the source's bounded search text through the guarded document route."""
-        return self._embed(_encoded_document(_source_document(source)), remaining_seconds=remaining_seconds)
+        return self._embed(
+            _encoded_document(_source_document(source), prompt_encoding=self._prompt_encoding),
+            remaining_seconds=remaining_seconds,
+        )
 
     def embed_sources(
         self, sources: Sequence[StoredSource], *, remaining_seconds: float
@@ -392,7 +429,7 @@ class GeminiEmbeddingAdapter:
         if not texts:
             return ()
         deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
-        encoded = [_encoded_document(text) for text in texts]
+        encoded = [_encoded_document(text, prompt_encoding=self._prompt_encoding) for text in texts]
         chunks = request_chunks(encoded, body=self._request_body, limit=self._ledger.policy.max_request_bytes)
         if len(chunks) == 1:
             return tuple(self._embed_many(chunks[0], remaining_seconds=seconds_left(deadline)))
@@ -418,7 +455,10 @@ class GeminiEmbeddingAdapter:
         here as the rendered assertion. Same encoding as a source, so both land
         in one comparable space.
         """
-        return self._embed(_encoded_document(text), remaining_seconds=remaining_seconds)
+        return self._embed(
+            _encoded_document(text, prompt_encoding=self._prompt_encoding),
+            remaining_seconds=remaining_seconds,
+        )
 
     def _request_body(self, texts: Sequence[str]) -> bytes:
         """The request body for ``texts`` in this route's dialect."""
@@ -461,10 +501,13 @@ class GeminiEmbeddingAdapter:
             # The provider refused the calls just before this one; asking again
             # now only adds a refusal (runtime/model_budget.py).
             raise AuxiliaryModelError("provider_hold")
-        key = load_credential(self._route.credential_env, self._credential_getter)
-        # Google authenticates with its own header; every OpenAI-compatible
-        # provider uses bearer auth.
-        auth = {"x-goog-api-key": key} if self._dialect == "gemini" else {"Authorization": f"Bearer {key}"}
+        if self._route.credential_env is None:
+            auth = {}
+        else:
+            key = load_credential(self._route.credential_env, self._credential_getter)
+            # Google authenticates with its own header; every OpenAI-compatible
+            # provider uses bearer auth.
+            auth = {"x-goog-api-key": key} if self._dialect == "gemini" else {"Authorization": f"Bearer {key}"}
         return metered_post(
             ledger=self._ledger,
             settle=self._ledger.finish_embedding,

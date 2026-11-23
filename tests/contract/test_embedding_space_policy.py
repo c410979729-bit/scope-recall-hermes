@@ -406,3 +406,139 @@ def test_builtin_space_admits_vectors_without_an_explicit_threshold():
         False,
         "vector_threshold_unconfigured",
     )
+
+
+def test_configured_prompt_prefixes_and_loopback_no_credential(tmp_path):
+    import json
+
+    from scope_recall.core.recall_policy import build_embedding_space
+    from scope_recall.runtime.auxiliary import (
+        AuxiliaryRuntimeConfig,
+        _embedding_route_from_mapping,
+        build_auxiliary_runtime,
+    )
+    from scope_recall.runtime.embedding_models import EmbeddingRouteConfig
+    from scope_recall.runtime.model_budget import initialize_auxiliary_budget_ledger
+
+    # Custom prefixes move the space digest cleanly and format query/document text without brace errors.
+    route = _embedding_route_from_mapping(
+        {
+            "model": "local-embed-model",
+            "endpoint": "http://127.0.0.1:8787/v1/embeddings",
+            "dimensions": 768,
+            "dialect": "openai",
+            "query_prefix": "Query: ",
+            "document_prefix": "Document: ",
+        }
+    )
+    assert route is not None
+    assert route.credential_env is None
+    space = route.space()
+    assert space["prompt_encoding"] == {
+        "query": "Query: {NFKC query}",
+        "document": "Document: {NFKC source}",
+    }
+    assert embedding_space_id(space) != embedding_space_id(
+        build_embedding_space(
+            model="local-embed-model",
+            endpoint="http://127.0.0.1:8787/v1/embeddings",
+            dimensions=768,
+            dialect="openai",
+        )
+    )
+    assert encode_embedding_text("check {x}　Ａ", kind="query", prompt_encoding=space["prompt_encoding"]) == (
+        "Query: check {x} A"
+    )
+    assert encode_embedding_text("doc {y}　Ａ", kind="document", prompt_encoding=space["prompt_encoding"]) == (
+        "Document: doc {y} A"
+    )
+
+    # Empty string prefixes are valid for models expecting raw unprefixed input.
+    raw_route = _embedding_route_from_mapping(
+        {
+            "model": "local-embed-model",
+            "endpoint": "http://localhost:8787/v1/embeddings",
+            "dimensions": 8,
+            "dialect": "openai",
+            "query_prefix": "",
+            "document_prefix": "",
+        }
+    )
+    assert raw_route is not None
+    assert encode_embedding_text("plain text", kind="query", prompt_encoding=raw_route.space()["prompt_encoding"]) == (
+        "plain text"
+    )
+
+    # Partial prefix pair is rejected, and omitting credential_env stays rejected off loopback.
+    with pytest.raises(ValueError, match="embedding_route_prompt_prefix"):
+        EmbeddingRouteConfig(
+            model="m",
+            endpoint="http://127.0.0.1:8787/v1/embeddings",
+            dimensions=768,
+            dialect="openai",
+            query_prefix="Query: ",
+        )
+    with pytest.raises(ValueError, match="credential_env"):
+        EmbeddingRouteConfig(
+            model="m",
+            endpoint="https://api.example.com/v1/embeddings",
+            dimensions=768,
+            dialect="openai",
+        )
+
+    # Adapter round-trip omits auth headers on loopback no-cred routes and applies configured prefixes.
+    seen_requests: list[tuple[dict[str, str], dict]] = []
+
+    class _FakeTransport:
+        def post(self, url, *, headers, body, timeout_seconds, max_response_bytes):
+            payload = json.loads(body.decode("utf-8"))
+            seen_requests.append((dict(headers), payload))
+            inputs = payload["input"] if isinstance(payload["input"], list) else [payload["input"]]
+            data = [{"index": i, "embedding": [0.25] * 8} for i in range(len(inputs))]
+            raw = json.dumps({"data": data, "usage": {"prompt_tokens": 4, "total_tokens": 4}}).encode("utf-8")
+            return 200, raw
+
+    cfg = AuxiliaryRuntimeConfig.from_mapping(
+        {
+            "external_embedding": True,
+            "external_consolidation": False,
+            "ledger_path": str(tmp_path / "auxiliary-budget.sqlite3"),
+            "budget": {
+                "approved_models": ["local-embed-model"],
+                "pricing": {
+                    "local-embed-model": {
+                        "input_usd_per_million": "0",
+                        "output_usd_per_million": "0",
+                    }
+                },
+                "cap_micro_usd": None,
+                "total_input_cap": None,
+                "total_output_cap": None,
+                "total_call_cap": None,
+            },
+            "embedding": {
+                "model": "local-embed-model",
+                "endpoint": "http://127.0.0.1:8787/v1/embeddings",
+                "dimensions": 8,
+                "dialect": "openai",
+                "query_prefix": "Query: ",
+                "document_prefix": "Document: ",
+            },
+        }
+    )
+    initialize_auxiliary_budget_ledger(cfg.ledger_path, cfg.budget)
+    aux = build_auxiliary_runtime(cfg, transport=_FakeTransport())
+    try:
+        assert aux.credential_holds() == frozenset()
+        qvec = aux.query_embedding.embed_query("check {brace}", remaining_seconds=2.0)
+        dvecs = aux.source_embedding.embed_texts(["doc one", "doc two"], remaining_seconds=2.0)
+        assert len(qvec) == 8
+        assert len(dvecs) == 2 and all(len(v) == 8 for v in dvecs)
+        for headers, _payload in seen_requests:
+            assert "Authorization" not in headers
+            assert "x-goog-api-key" not in headers
+        assert seen_requests[0][1]["input"] == ["Query: check {brace}"]
+        assert seen_requests[1][1]["input"] == ["Document: doc one", "Document: doc two"]
+    finally:
+        aux.close()
+
