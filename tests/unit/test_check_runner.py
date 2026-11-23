@@ -32,8 +32,10 @@ def test_pytest_temp_path_stays_short_inside_owned_run(tmp_path: Path) -> None:
 def test_pytest_command_dumps_slow_test_threads_without_exiting(tmp_path: Path) -> None:
     """Slow-test diagnostics keep the guard and leave failure policy to the watchdog."""
     command = check.pytest_command(["tests/unit/pass_test.py"], tmp_path / "junit.xml")
+    heavy = check.pytest_command(["tests/recall_bench/test_recall_bench.py"], tmp_path / "junit.xml")
 
     assert command[command.index("-o") + 1] == "faulthandler_timeout=300"
+    assert heavy[heavy.index("-o") + 1] == "faulthandler_timeout=600"
     assert command[command.index("-p") + 1] == "v11_guard"
     assert not any("faulthandler_exit_on_timeout" in argument for argument in command)
 

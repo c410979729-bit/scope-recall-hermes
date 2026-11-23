@@ -80,7 +80,15 @@ class ReplayPolicy(RecallPolicy):
         settings["vector_threshold"] = threshold
         return cls(**settings, scheme=scheme, statistics=statistics)
 
-    def automatic_admission(self, candidate, query: str, *, term_weights=None) -> bool:
+    def automatic_admission(
+        self,
+        candidate,
+        query: str,
+        *,
+        term_weights=None,
+        term_frequencies: dict[str, int] | None = None,
+        corpus_size: int = 0,
+    ) -> bool:
         """Apply a selected coverage normalization after the unchanged matched-term gate."""
         if self.scheme == "A" or candidate.source in {"vector", "exact_ref", "scoped", "relation"}:
             return RecallPolicy.automatic_admission(self, candidate, query)

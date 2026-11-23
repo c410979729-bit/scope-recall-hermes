@@ -92,6 +92,25 @@ class Operations:
                 tx, now=self._core.clock.utc_now(), after_ref=after_ref, limit=limit, dry_run=dry_run
             ).to_dict()
 
+    def retire_invalid_aliases(
+        self,
+        context: TrustedContext,
+        *,
+        after_ref: str = "",
+        limit: int = 16,
+        dry_run: bool = True,
+        remaining_seconds: float | None = None,
+    ):
+        """Preview or retract one bounded page of unreviewed invalid entity aliases."""
+        from .requalify import retire_invalid_aliases as _retire_aliases
+
+        seconds = self._core.config.write_timeout_seconds if remaining_seconds is None else remaining_seconds
+        opener = self._core.storage.read if dry_run else self._core.storage.write
+        with opener(context, remaining_seconds=seconds) as tx:
+            return _retire_aliases(
+                tx, now=self._core.clock.utc_now(), after_ref=after_ref, limit=limit, dry_run=dry_run
+            ).to_dict()
+
     def unindex_withheld_outputs(
         self,
         context: TrustedContext,

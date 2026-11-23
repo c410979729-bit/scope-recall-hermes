@@ -36,7 +36,10 @@
       "support": "supported",
       "action": "new",
       "target_ref": null,
-      "target_revision": null
+      "target_revision": null,
+      "attribution": "author",
+      "polarity": "affirmative",
+      "scope": "durable"
     }
   },
   {
@@ -76,7 +79,10 @@
       "support": "unsupported",
       "action": "new",
       "target_ref": null,
-      "target_revision": null
+      "target_revision": null,
+      "attribution": "author",
+      "polarity": "affirmative",
+      "scope": "durable"
     }
   },
   {
@@ -116,7 +122,10 @@
       "support": "uncertain",
       "action": "new",
       "target_ref": null,
-      "target_revision": null
+      "target_revision": null,
+      "attribution": "author",
+      "polarity": "affirmative",
+      "scope": "unasserted"
     }
   }
 ]

@@ -21,7 +21,7 @@ MEASURED_100 = {
     "task_summary": (2, 3426, 132),
     "locate_adoption": (96, 48439, 1110),
     "describe_adoption": (6, 2508, 216),
-    "adoption_support": (6, 4678, 234),
+    "adoption_support": (6, 5734, 234),
 }
 # Each recorded suite contains twenty-four cases. These are server usage totals,
 # not reservation sizes. Aggregate usage cannot establish a stage-specific tokenizer ratio.

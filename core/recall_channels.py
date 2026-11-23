@@ -7,9 +7,10 @@ import sqlite3
 import time
 from dataclasses import dataclass, field, replace
 from itertools import islice
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from ..contracts import ContractError
+from . import lexical_index
 from .deadline import RequestDeadline, using_request_deadline
 from .events import lexical_terms
 from .owner_view import OwnerView, owner_names, owner_view
@@ -62,6 +63,31 @@ _VECTOR_REJECTION_GAPS = {
 
 
 _VECTOR_SILENT_REJECTIONS = frozenset({"vector_below_threshold", "vector_id_missing", "vector_score_invalid"})
+
+
+def _corpus_term_stats(tx: Any, question: str) -> tuple[dict[str, int] | None, int]:
+    """Read and cache per-term document frequency and exact source count once per recall snapshot."""
+    if not hasattr(tx, "_check") or not hasattr(tx, "remembered"):
+        return None, 0
+    terms = meaningful_query_terms(question)
+    if not terms:
+        return {}, 0
+
+    def load() -> tuple[dict[str, int], int]:
+        conn = tx._check()
+        total = int(
+            tx.remembered(
+                ("lexical_corpus_size",),
+                lambda: int(conn.execute("SELECT COUNT(*) FROM source_events").fetchone()[0] or 0),
+            )
+        )
+        if total < 64:
+            return {}, total
+        freqs = lexical_index.document_frequency(conn, terms, limit=max(64, total + 1))
+        return freqs, total
+
+    stats: tuple[dict[str, int], int] = tx.remembered(("auto_term_stats", terms), load)
+    return stats
 
 
 def _note_below_floor(gaps: list[str], channel: str) -> None:
@@ -354,13 +380,16 @@ class RecallChannels:
         question = self._admission_query(context)
         if candidate.source == "dated" and context.time is not None:
             question = context.time.rest
+        freqs: dict[str, int] | None = None
+        corpus_size = 0
         if candidate.source not in {"vector", "exact_ref", "scoped", "relation"}:
             if candidate.matched_query_terms is None:
                 obj = self.storage_reader.hydrate(tx, candidate, context)
                 hits = meaningful_query_terms(question)
                 matched = set(hits).intersection(lexical_terms(statement_text(obj))) if obj is not None else set()
                 candidate = replace(candidate, matched_query_terms=tuple(sorted(matched)))
-        if self.policy.automatic_admission(candidate, question):
+            freqs, corpus_size = _corpus_term_stats(tx, question)
+        if self.policy.automatic_admission(candidate, question, term_frequencies=freqs, corpus_size=corpus_size):
             return True
         note_candidate(candidate, "threshold")
         _note_below_floor(gaps, candidate.source)

@@ -256,6 +256,7 @@ SUITES = {
         "tests/contract/test_private_mode.py",
         "tests/contract/test_fragment_quote_recovery.py",
         "tests/contract/test_normalized_evidence.py",
+        "tests/contract/test_language_agnostic_rules.py",
         "tests/contract/test_model_evidence_alignment.py",
         "tests/contract/test_consolidation_chunks.py",
         "tests/contract/test_consolidation_metadata.py",
@@ -1249,12 +1250,14 @@ def pytest_command(selected: list[str], junit: Path) -> list[str]:
     Re-entering a directory after selecting a file in its parent can create another collector for it. Normalize
     separators before sorting so Windows selections form the same contiguous subtrees as POSIX selections.
     """
+    normalized = sorted({path.replace("\\", "/") for path in selected})
+    faulthandler_seconds = max(300, *(HEAVY_FILE_SECONDS.get(path, 0) for path in normalized))
     return [
         sys.executable,
         "-B",
         "-m",
         "pytest",
-        *sorted({path.replace("\\", "/") for path in selected}),
+        *normalized,
         "-q",
         "--import-mode=importlib",
         "-p",
@@ -1262,10 +1265,10 @@ def pytest_command(selected: list[str], junit: Path) -> list[str]:
         "-p",
         "no:cacheprovider",
         "--durations=10",
-        # Healthy Windows tests take up to about 122 seconds. Five minutes
-        # leaves headroom while dumping every thread well before the integration watchdog.
+        # Heavy store-building files (such as test_recall_bench.py on slow Windows runners) need their declared
+        # allowance before faulthandler's native timer thread dumps frames across active threads.
         "-o",
-        "faulthandler_timeout=300",
+        f"faulthandler_timeout={faulthandler_seconds}",
         # Keep generated fixture paths short while retaining the same owned boundary.
         f"--basetemp={junit.parent / 't'}",
         f"--junitxml={junit}",

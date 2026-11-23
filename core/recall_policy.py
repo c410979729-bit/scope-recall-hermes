@@ -322,12 +322,23 @@ class RecallPolicy:
         ):
             raise ContractError("INPUT_INVALID", "owner_names")
 
-    def automatic_admission(self, candidate: CandidateRef, query: str) -> bool:
+    def automatic_admission(
+        self,
+        candidate: CandidateRef,
+        query: str,
+        *,
+        term_frequencies: dict[str, int] | None = None,
+        corpus_size: int = 0,
+    ) -> bool:
         """Whether a channel's evidence is strong enough for automatic injection.
 
         Named references and a named day's scoped conversation are already
         narrowed by the request. Relations inherit admission from their seed.
-        One-term questions may match one term; longer ones need several.
+        One-term questions may match one term; longer ones need several. When
+        corpus document frequencies are supplied, unseen terms (such as CJK
+        cross-word boundary bigrams) are excluded from the specificity bar, a
+        query with store-specific terms must match at least one of them, and
+        queries composed solely of high-frequency terms require tighter overlap.
         """
         if candidate.source in {"exact_ref", "scoped", "relation"}:
             return True
@@ -338,15 +349,35 @@ class RecallPolicy:
         matched = terms.intersection(candidate.matched_query_terms or ())
         if not terms or len(matched) < min(len(terms), self.auto_lexical_min_terms):
             return False
-        if len(matched) / len(terms) >= self.auto_lexical_min_coverage:
-            return True
-        # A substantive question can precede a long attachment. Its anchors
-        # must meet the same clause-specificity rule as lexical admission;
-        # unrelated attachment terms do not dilute that question's evidence.
-        return any(
-            hits >= min(count, self.auto_lexical_min_terms) and hits / count >= self.auto_lexical_min_coverage
-            for hits, count in _matched_substantive_clauses(query, matched)
-        )
+        substantive_clauses = [
+            clause
+            for clause in _substantive_chinese_clauses(query)
+            if (hits := len(matched.intersection(clause)))
+            >= max(5, _specificity_required(len(clause)), min(len(clause), self.auto_lexical_min_terms))
+            and hits / len(clause) >= self.auto_lexical_min_coverage
+        ]
+        if not substantive_clauses and len(matched) / len(terms) < self.auto_lexical_min_coverage:
+            return False
+        if term_frequencies is not None and corpus_size >= 64:
+            ceiling = max(64, int(corpus_size * 0.10))
+
+            def _idf_admits(scope_terms: set[str] | tuple[str, ...]) -> bool:
+                present = {term for term in scope_terms if term_frequencies.get(term, 0) > 0}
+                if not present:
+                    return True
+                specific = {term for term in present if term_frequencies[term] < ceiling}
+                if specific and not matched.intersection(specific):
+                    return False
+                floor = self.auto_lexical_min_coverage if specific else max(0.60, self.auto_lexical_min_coverage)
+                present_info = sum(math.log((corpus_size + 1) / (term_frequencies[t] + 1)) + 1.0 for t in present)
+                matched_info = sum(
+                    math.log((corpus_size + 1) / (term_frequencies[t] + 1)) + 1.0 for t in matched.intersection(present)
+                )
+                return present_info > 0 and matched_info / present_info >= floor
+
+            whole_ok = len(matched) / len(terms) >= self.auto_lexical_min_coverage and _idf_admits(terms)
+            return whole_ok or any(_idf_admits(clause) for clause in substantive_clauses)
+        return True
 
     def vector_best(self, candidates) -> float | None:
         """The best valid score among ``candidates`` in this policy's space; None when there is none."""

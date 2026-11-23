@@ -326,9 +326,11 @@ def _end_denied_value(tx, proposal, roots, previous, held, qualification, scope_
 def _merge_target(tx, proposal: ClaimProposal, verdict, scope_id, now) -> ClaimProposal | None:
     """The payload of the claim version a prepared judgement merges ``proposal`` into, if it still is a candidate of
     it in this transaction; None when the judgement names none."""
-    if verdict is None or verdict.target_ref is None:
+    if verdict is None or verdict.target_ref is None or verdict.state != "supported":
         return None
-    choices = merge_candidates(tx, proposal, scope_id, now=now)
+    if verdict.attribution in {"third_party", "quoted_or_example"} or verdict.scope in {"ephemeral_turn", "unasserted"}:
+        return None
+    choices = merge_candidates(tx, proposal, scope_id, now=now, verdict=verdict)
     target = next(
         (c for c in choices if (c["ref"], c["revision"]) == (verdict.target_ref, verdict.target_revision)), None
     )
@@ -357,9 +359,10 @@ def _qualify_incoming(
         subject_bound, binding_issue = True, None
     else:
         proposal, subject_bound, binding_issue = bind_claim_subject(
-            proposal, roots, semantic_support=positioned(proposal)
+            proposal, roots, semantic_support=positioned(proposal), verdict=verdict
         )
     if binding_issue is not None:
+        target = None
         qualification = Qualification("proposed", "inferred_suggestion", binding_issue)
     else:
         qualification = qualify(
@@ -368,6 +371,7 @@ def _qualify_incoming(
             project_id=tx.context.project_id,
             _subject_bound=subject_bound,
             _support_state=support_state,
+            _verdict=verdict,
         )
     if proposal["kind"] == "alias" and not _alias_verified(tx, proposal, roots, scope_id, now):
         qualification = Qualification("proposed", "inferred_suggestion", "alias_target_or_relation_unverified")

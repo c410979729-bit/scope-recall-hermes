@@ -298,7 +298,7 @@ def process_entity_projection(storage, clock, context, item, *, model, started: 
             return early
         assert prepared is not None
         source, _sources, names, entries = prepared
-        evidenced_names = tuple(name for name in names if entity_name_evidenced(source, name))
+        evidenced_names = tuple(name for name in names if entity_name_evidenced(source, name, sources=_sources))
         stage = "entity_judge"
         request_end = provider_prepare_budget(clock, started, budget)
         decision, gap = (

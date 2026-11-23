@@ -286,6 +286,19 @@ def _restore_displaced(args: argparse.Namespace) -> int:
     )
 
 
+def _retire_invalid_aliases(args: argparse.Namespace) -> int:
+    return _run_core(
+        args,
+        lambda core, config: core.operations.retire_invalid_aliases(
+            config.context(),
+            after_ref=args.after_ref,
+            limit=args.limit,
+            dry_run=not args.apply,
+            remaining_seconds=config.request_seconds,
+        ),
+    )
+
+
 #: Seconds between two pages of ``unindex-withheld-outputs --until-done``.
 _UNINDEX_PAGE_PAUSE = 0.2
 
@@ -765,6 +778,12 @@ _COMMANDS: tuple[
         "withdraw a page of denials holding a claim's head without being its value, restoring what they displaced",
         _add_requalify_arguments,
         _restore_displaced,
+    ),
+    (
+        "retire-invalid-aliases",
+        "preview or retract a bounded page of unreviewed entity aliases that fail structural or source grounding",
+        _add_requalify_arguments,
+        _retire_invalid_aliases,
     ),
     (
         "unindex-withheld-outputs",

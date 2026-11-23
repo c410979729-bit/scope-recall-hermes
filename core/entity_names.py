@@ -7,8 +7,44 @@ from difflib import SequenceMatcher
 
 from ..contracts import ContractError
 from .aliases import ENTITY_KINDS
+from .candidate_lifecycle import SELF_SUBJECTS
 from .fact_identity import normalize_fact_component
+from .subject_binding import names_a_thing
 from .work_storage import _lease_remaining
+
+_FIRST_PERSON_LABELS = SELF_SUBJECTS | frozenset({"i", "me", "my", "mine", "myself"})
+
+
+def _is_bare_version_or_hex(cleaned: str) -> bool:
+    if len(cleaned) >= 7 and all(ch in "0123456789abcdefABCDEF" for ch in cleaned):
+        return True
+    body = cleaned[1:] if cleaned[:1] in {"v", "V"} else cleaned
+    head, _, suffix = body.partition("-")
+    parts = head.split(".")
+    return (
+        2 <= len(parts) <= 4
+        and all(part.isdigit() for part in parts)
+        and (not suffix or all(ch.isalnum() or ch in "._" for ch in suffix))
+    )
+
+
+def eligible_entity_name(name: object) -> bool:
+    """Language-agnostic structural eligibility for a named entity without lexical wordlists."""
+    if type(name) is not str:
+        return False
+    raw = name.strip()
+    if not 1 <= len(raw) <= 240 or raw.startswith(("principal:", "summary:", "unresolved-source:")):
+        return False
+    cleaned = " ".join(raw.strip("`\"'“”‘’").split())
+    if len(cleaned) < 2 or cleaned.casefold() in _FIRST_PERSON_LABELS or not names_a_thing(cleaned):
+        return False
+    if cleaned.startswith("-") and len(cleaned) > 1 and (cleaned[1].isalnum() or cleaned[1] == "-"):
+        return False
+    if "=" in cleaned:
+        lhs = cleaned.partition("=")[0]
+        if lhs and all(ch.isalnum() or ch == "_" for ch in lhs) and not lhs[0].isdigit():
+            return False
+    return not _is_bare_version_or_hex(cleaned)
 
 
 def audience(context, scope):
@@ -92,7 +128,7 @@ def index_claim(tx, version):
     ordinal = conn.execute("SELECT rowid FROM claims WHERE claim_id=?", (version.ref,)).fetchone()[0]
     usable = int(not version.payload.get("conditions") and not version.payload["subject"].startswith("principal:"))
     for name in sorted({version.payload["subject"], *version.payload.get("entity_names", [])}):
-        if not name or len(name) > 240:
+        if not eligible_entity_name(name):
             continue
         key = audience(tx.context, version.scope_id)
         existing = conn.execute(

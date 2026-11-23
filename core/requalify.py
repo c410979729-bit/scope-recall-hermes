@@ -25,6 +25,7 @@ cursor (the caller does, exactly as ``repair_frames`` does it).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -381,6 +382,123 @@ def settle_brought_denials(tx, refs, *, now: str) -> int:
     return settled
 
 
+def _invalid_alias_reason(tx, head) -> tuple[str, str, str | None]:
+    from .entity_names import eligible_entity_name
+    from .entity_resolution import entity_name_evidenced
+
+    alias_meta = head.payload.get("alias") or {}
+    name = str(alias_meta.get("name") or head.payload.get("value_text") or "")
+    target_subject = str(head.payload.get("subject") or "")
+    if not eligible_entity_name(name) or not eligible_entity_name(target_subject):
+        return name, target_subject, "entity_name_ineligible"
+    proof = (
+        tx._check()
+        .execute(
+            "SELECT source_ref,source_revision FROM entity_alias_proofs WHERE alias_ref=? AND alias_revision=?",
+            (head.ref, head.revision),
+        )
+        .fetchone()
+    )
+    if proof is None:
+        return name, target_subject, None
+    source_ver = tx.claims.version(proof[0], proof[1])
+    if source_ver is None:
+        return name, target_subject, "entity_source_missing"
+    roots = tx.claims.roots(evidence_refs(source_ver.payload))
+    if not entity_name_evidenced(source_ver, name, sources=roots):
+        return name, target_subject, "entity_name_ungrounded"
+    return name, target_subject, None
+
+
+def _management_approved_refs(tx: Transaction) -> set[str]:
+    approved: set[str] = set()
+    rows = (
+        tx._check()
+        .execute(
+            "SELECT action, targets_json FROM management_actions "
+            "WHERE action IN ('health_entity_merge', 'review_decide')"
+        )
+        .fetchall()
+    )
+    for action, raw in rows:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if action == "health_entity_merge" and isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and isinstance(item.get("ref"), str):
+                    approved.add(item["ref"])
+        elif action == "review_decide" and isinstance(parsed, dict) and parsed.get("decision") == "approve":
+            heads = parsed.get("effects", {}).get("heads")
+            if isinstance(heads, dict):
+                approved.update(ref for ref in heads if isinstance(ref, str))
+    return approved
+
+
+def retire_invalid_aliases(
+    tx: Transaction, *, now: str, after_ref: str = "", limit: int = 16, dry_run: bool = True
+) -> RequalifyReport:
+    """Preview or retract one bounded page of unreviewed entity aliases that fail structural or source grounding."""
+    if type(limit) is not int or type(limit) is bool or not 1 <= limit <= MAX_PAGE:
+        raise ContractError("INPUT_INVALID", "requalify_limit")
+    if type(after_ref) is not str:
+        raise ContractError("INPUT_INVALID", "requalify_cursor")
+    scopes = sorted(tx.context.allowed_scope_ids)
+    rows = (
+        tx._check()
+        .execute(
+            f"""SELECT claim_id FROM claims WHERE claim_id>? AND kind='alias' AND predicate LIKE 'entity_identity:%'
+            AND read_blocked=0 AND suppressed=0 AND scope_id IN ({",".join("?" for _ in scopes)})
+            AND project_id IS ? AND branch_id IS ? ORDER BY claim_id LIMIT ?""",
+            (after_ref, *scopes, tx.context.project_id, tx.context.branch_id, limit),
+        )
+        .fetchall()
+    )
+    preserved = _preserved_reasons() | REVIEW_REASONS | {"owner_revision"}
+    owner_merged = _management_approved_refs(tx)
+    report = RequalifyReport(applied=not dry_run)
+    for (ref,) in rows:
+        report.last_ref = ref
+        versions = tx.claims.versions(ref)
+        head = next((v for v in versions if v.revision == v.current_revision), None)
+        if head is None or head.state != "active":
+            continue
+        report.examined += 1
+        if head.basis != "derived_summary" or ref in owner_merged or any(v.reason in preserved for v in versions):
+            report.skipped.append({"ref": ref, "revision": head.revision, "reason": "owner_preserved"})
+            continue
+        name, target_subject, invalid_reason = _invalid_alias_reason(tx, head)
+        if invalid_reason is None:
+            continue
+        to_revision = head.revision + 1
+        if not dry_run:
+            saved = tx.claims.append(
+                head.scope_id,
+                head.payload,
+                Qualification("retracted", head.basis, invalid_reason),
+                recorded_at=now,
+                previous=head,
+            )
+            to_revision = saved.revision
+            tx._check(write=True).execute(
+                "UPDATE entity_names SET status='withdrawn',alias_ref=?,alias_revision=? "
+                "WHERE audience=hex(json_array(?,?,?)) AND name=?",
+                (saved.ref, saved.revision, head.scope_id, head.project_id, head.branch_id, name),
+            )
+        report.changed.append(
+            {
+                "ref": ref,
+                "from_revision": head.revision,
+                "to_revision": to_revision,
+                "name": name,
+                "target_subject": target_subject,
+                "reason": invalid_reason,
+            }
+        )
+    return report
+
+
 __all__ = [
     "MAX_PAGE",
     "REQUALIFIABLE_STATES",
@@ -388,6 +506,7 @@ __all__ = [
     "RequalifyReport",
     "requalify_claims",
     "restore_displaced_values",
+    "retire_invalid_aliases",
     "retire_rootless_proposals",
     "settle_brought_denials",
     "settle_denials",

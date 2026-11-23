@@ -6,6 +6,7 @@
 
 - `scope-recall compact-store` previews reclaimable data in a live store. On an offline copy it compacts expired candidate history and rebuilds the search index for long tool outputs.
 - `scope-recall attach` suggests a command when installed clients on the current machine agree on grants and the selected capture scope is readable by the other owners.
+- `scope-recall retire-invalid-aliases` previews and retracts unreviewed entity aliases whose endpoints fail structural eligibility or subject-adjacent source grounding, preserving owner-reviewed aliases and full revision history.
 
 ### Fixed
 
@@ -19,6 +20,8 @@
 - Failed entity checks release their names for other jobs. A worker waiting for a live name reservation resumes after the lease and keeps its daily queue allowance.
 - Storage previews release the live database before scanning the snapshot, accept `--temp-dir`, and verify available disk space before snapshots or offline compaction. Compaction trims redundant candidate evidence and withdraws stale tool-output search terms. Windows maintenance commands emit UTF-8 receipts through redirected output.
 - Local entry checks recognize verified case and Unicode aliases of the same directory on shared-store volumes.
+- Automatic lexical recall weighs query terms by empirical store document frequency while ignoring unseen query fragments, requiring a specific term match when one exists in the store and tighter overlap when every query term is common.
+- Support judgements carry structured speaker attribution, polarity and scope traits so first-person and omitted-subject statements in any language bind through verified source identity, while third-party, unasserted and single-turn proposals remain unpromoted and quarantined from automatic injection.
 
 ## [4.0.5]
 

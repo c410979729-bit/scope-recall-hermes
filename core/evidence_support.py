@@ -18,7 +18,7 @@ from ..contracts import validate_evidence_positions as validate_positions
 
 @dataclass(frozen=True)
 class SupportVerdict:
-    """One bounded support answer and optional merge target at a specific revision."""
+    """One bounded support answer, optional merge target, and optional structured semantic traits."""
 
     fingerprint: str
     state: str
@@ -26,6 +26,9 @@ class SupportVerdict:
     target_revision: int | None = None
     action: str = "new"
     failure_code: str | None = None
+    attribution: str | None = None
+    polarity: str | None = None
+    scope: str | None = None
 
 
 _VERDICTS: ContextVar[tuple[SupportVerdict, ...]] = ContextVar("evidence_support", default=())

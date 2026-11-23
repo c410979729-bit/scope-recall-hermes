@@ -30,7 +30,7 @@ from .claim_denial import Denial as Denial
 from .claim_denial import _negation, is_denial
 from .claim_denial import negates as negates
 from .claim_denial import read_denial as read_denial
-from .evidence_support import positioned, support_verdict
+from .evidence_support import SupportVerdict, positioned, support_verdict
 from .fact_actions import ClaimDraft, EvidenceReference
 from .fact_evidence import evidence_supports_claim, evidence_supports_relation
 from .fact_identity import fact_frame
@@ -252,26 +252,30 @@ def bind_claim_subject(
     *,
     stored: bool = False,
     semantic_support: bool = False,
+    verdict: SupportVerdict | None = None,
+    nominate_only: bool = False,
 ) -> tuple[ClaimProposal, bool, str | None]:
     """Bind a first-person model label to C1 evidence, or isolate it safely.
 
-    The model may repeat ``我`` or a legacy self label, but it cannot mint an
-    authority key. Unresolved sources receive a source-specific non-authority
-    slot so different speakers in one shared scope cannot collapse together.
-    A claim already in the store (``stored``) carries the principal its self
-    label was bound to when it was written, and is bound from that label again,
-    so re-judging reads the person's own claims as writing did.
+    The model may emit ``current_user`` (or legacy self labels) for any language's
+    first-person or omitted-subject self statement, but it cannot mint an authority
+    key. Unresolved sources receive a source-specific non-authority slot so different
+    speakers in one shared scope cannot collapse together.
     """
-    relevant = tuple(
+    cited_roots = tuple(
         root
         for root in roots
-        if effective_origin(root) == "human_direct"
-        and any(
+        if any(
             span["source_ref"] == root.ref and span["source_revision"] == root.revision
             for span in proposal["evidence_spans"]
         )
     )
-    written = stored and {verified_human_ref(root) for root in relevant} == {proposal["subject"]}
+    relevant = tuple(root for root in cited_roots if effective_origin(root) == "human_direct")
+    relevant_keys = {(root.ref, root.revision) for root in relevant}
+    all_human_direct = bool(proposal["evidence_spans"]) and all(
+        (span["source_ref"], span["source_revision"]) in relevant_keys for span in proposal["evidence_spans"]
+    )
+    written = stored and all_human_direct and {verified_human_ref(root) for root in relevant} == {proposal["subject"]}
     if proposal["subject"].startswith("principal:") and not written:
         return proposal, False, "subject_not_bound"
     if proposal["subject"].casefold() not in SELF_SUBJECTS and not written:
@@ -285,19 +289,43 @@ def bind_claim_subject(
             if span["source_ref"] == root.ref and span["source_revision"] == root.revision
         ]
 
+    not_pasted = all_human_direct and all(
+        not in_pasted_text(root.content, span["quote"], start=span.get("start"), end=span.get("end"))
+        for root in relevant
+        for span in spans_of(root)
+    )
+    if verdict is not None and verdict.attribution in {"third_party", "quoted_or_example"}:
+        bound["subject"] = _unresolved_subject(proposal, roots)
+        return bound, False, "other_speaker"
+    verdict_author_bound = (
+        semantic_support
+        and not_pasted
+        and (
+            nominate_only
+            or (
+                verdict is not None
+                and verdict.state == "supported"
+                and verdict.attribution == "author"
+                and verdict.scope in {"durable", "conditional"}
+            )
+        )
+    )
     # The context around a quote can leave out what marks pasted text, a speaker's label above it or the fence around
     # it: the whole message is asked.
-    if not relevant or not any(
-        self_report_bound(
-            "\n".join(evidence_span_context(root.content, span) for span in spans_of(root)),
-            spans_of(root)[0]["quote"] if semantic_support else proposal["value_text"],
-            kind=proposal["kind"],
-        )
+    if not relevant or (
+        not verdict_author_bound
         and not any(
-            in_pasted_text(root.content, span["quote"], start=span.get("start"), end=span.get("end"))
-            for span in spans_of(root)
+            self_report_bound(
+                "\n".join(evidence_span_context(root.content, span) for span in spans_of(root)),
+                spans_of(root)[0]["quote"] if semantic_support else proposal["value_text"],
+                kind=proposal["kind"],
+            )
+            and not any(
+                in_pasted_text(root.content, span["quote"], start=span.get("start"), end=span.get("end"))
+                for span in spans_of(root)
+            )
+            for root in relevant
         )
-        for root in relevant
     ):
         bound["subject"] = _unresolved_subject(proposal, roots)
         return bound, False, "subject_not_bound"
@@ -775,12 +803,47 @@ _REFUSALS = (
 )
 
 
-def _qualification_reason(cited, normalized, support_state):
+def _reconcile_structured_verdict(cited: _Cited, verdict: SupportVerdict) -> str | None:
+    """Enforce structural governance against a 7-key semantic support verdict without wordlists."""
+    if cited.proposal["statement_kind"] in UNASSERTED_STATEMENTS:
+        return "statement_not_asserted"
+    if verdict.attribution != "author":
+        return "other_speaker"
+    if verdict.scope == "unasserted":
+        clause = cited.asserted or cited.source_text
+        return "question_not_asserted" if ("?" in clause or "？" in clause) else "hypothetical_or_undecided"
+    if verdict.scope == "ephemeral_turn" and cited.proposal["valid_to"] is None and not cited.proposal["conditions"]:
+        return "relative_scope_not_preserved"
+    if verdict.scope == "conditional" and not cited.proposal["conditions"]:
+        return "qualified_statement"
+    for rule in (
+        _scope_preserved,
+        partial(_authority, semantic_support=True),
+        partial(_subject_binds, normalized=True),
+        _intention_proved,
+        _procedure_proved,
+        _time_scope_known,
+    ):
+        reason = rule(cited)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _qualification_reason(cited, normalized, support_state, verdict: SupportVerdict | None = None):
     """Select semantic support gates without allowing a model to override source governance."""
     rules = _REFUSALS
     # No semantic verdict must not erase a known literal refusal merely because
     # the quote now has positions. Capability failures retain their own state.
     if normalized and support_state != "unavailable":
+        has_traits = verdict is not None and all(
+            trait is not None for trait in (verdict.attribution, verdict.polarity, verdict.scope)
+        )
+        if has_traits:
+            assert verdict is not None
+            if support_state != "supported":
+                return "other_speaker" if verdict.attribution != "author" else "evidence_support_" + str(support_state)
+            return _reconcile_structured_verdict(cited, verdict)
         # Positions locate evidence; they do not invalidate a literal negative
         # state or a fully stated condition that the ordinary rules already prove.
         if support_state == "supported" and all(rule(cited) is None for rule in rules):
@@ -813,6 +876,7 @@ def qualify(
     explicit_attribute_correction: bool = False,
     _subject_bound: bool = False,
     _support_state: str | None = None,
+    _verdict: SupportVerdict | None = None,
     _legacy: bool = False,
 ) -> Qualification:
     """Source roles are necessary, never sufficient, to promote a proposal.
@@ -824,11 +888,15 @@ def qualify(
     if proposal["kind"] == "observation":
         return Qualification("proposed", "derived_summary", "reflection_pending")
     normalized = positioned(proposal) and not _legacy
-    if normalized and _support_state is None:
+    verdict = _verdict
+    if normalized and verdict is None:
         verdict = support_verdict(proposal, roots)
+    if normalized and _support_state is None:
         _support_state = verdict.state if verdict else "unavailable"
     if not _subject_bound:
-        bound_proposal, subject_bound, binding_issue = bind_claim_subject(proposal, roots, semantic_support=normalized)
+        bound_proposal, subject_bound, binding_issue = bind_claim_subject(
+            proposal, roots, semantic_support=normalized, verdict=verdict
+        )
         if binding_issue is not None:
             return Qualification("proposed", "inferred_suggestion", binding_issue)
         if subject_bound:
@@ -839,6 +907,7 @@ def qualify(
                 explicit_attribute_correction=explicit_attribute_correction,
                 _subject_bound=True,
                 _support_state=_support_state,
+                _verdict=verdict,
                 _legacy=_legacy,
             )
     cited = _cite(
@@ -846,7 +915,7 @@ def qualify(
     )
     if cited is None:
         return Qualification("proposed", "inferred_suggestion", "no_complete_root_span")
-    reason = _qualification_reason(cited, normalized, _support_state)
+    reason = _qualification_reason(cited, normalized, _support_state, verdict=verdict)
     if reason is not None:
         return Qualification("proposed", "inferred_suggestion", reason)
     if cited.human:

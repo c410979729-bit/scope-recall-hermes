@@ -694,9 +694,16 @@ class RetrievalHydration:
         evidence = self._evidence(tx, "claim", candidate.ref, candidate.revision, context)
         if evidence is None:
             return None
-        if admitted_proposal and not _has_first_hand_root(tx, evidence):
-            # Derived only from the system's own echo and never promoted:
-            # recalling it would let the assistant's output become memory.
+        quarantined_auto = context.automatic_injection and version.reason in {
+            "other_speaker",
+            "question_not_asserted",
+            "hypothetical_or_undecided",
+            "statement_not_asserted",
+            "relative_scope_not_preserved",
+            "evidence_support_unsupported",
+        }
+        if admitted_proposal and (not _has_first_hand_root(tx, evidence) or quarantined_auto):
+            # Derived only from assistant echo, or quarantined from third-party/unasserted/ephemeral input.
             return None
         current_effective = (
             context.mode in LIVE_MODES and effective is not None and effective.revision == version.revision

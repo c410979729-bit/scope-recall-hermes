@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from copy import deepcopy
 
 from ..contracts import Alias, ClaimProposal, ContractError, validate_payload
 from . import private
 from .aliases import ENTITY_KINDS, entity_alias_proof, validate_alias_target
 from .claims import Qualification, evidence_refs, valid_at
-from .entity_names import checked
+from .entity_names import checked, eligible_entity_name
 from .evidence_support import SupportVerdict
 from .language_resources import prompt_text
 from .review_policy import PENDING, held_proposal, owner_publication, publication_qualification
 from .semantic_proposals import support_messages
+from .source_qualification import bound_literal
+from .subject_binding import quote_neighbourhood
 
 
 def live_entity(tx, ref: str, revision: int, now: str):
@@ -67,12 +70,35 @@ def entity_messages(source, sources, candidates, *, names=None):
     return messages
 
 
-def entity_name_evidenced(source, name):
-    """Require a surface name to be declared and appear literally in the source fact's evidence."""
-    return name == source.payload["subject"] or (
-        name in source.payload.get("entity_names", [])
-        and any(name in span["quote"] for span in source.payload["evidence_spans"])
-    )
+def _source_text(item) -> str:
+    return item.content if hasattr(item, "content") else item.event["content"]
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
+def entity_name_evidenced(source, name, *, sources=()):
+    """Require structural eligibility and literal subject-adjacent grounding in the cited evidence."""
+    subject = source.payload["subject"]
+    if not eligible_entity_name(subject) or not eligible_entity_name(name):
+        return False
+    if name == subject:
+        return True
+    if name not in source.payload.get("entity_names", []):
+        return False
+    folded_subject = _fold(subject)
+    by_ref = {(item.ref, item.revision): _source_text(item) for item in sources}
+    for span in source.payload["evidence_spans"]:
+        quote = span["quote"]
+        if not bound_literal(quote, name):
+            continue
+        if bound_literal(_fold(quote), folded_subject) or not by_ref:
+            return True
+        content = by_ref.get((span["source_ref"], span["source_revision"]), "")
+        if content and bound_literal(_fold(quote_neighbourhood(content, quote)), folded_subject):
+            return True
+    return False
 
 
 def publish_entity_merge(tx, source, target, decision: SupportVerdict, *, now: str, name=None, only_unmerged=False):
@@ -92,12 +118,14 @@ def publish_entity_merge(tx, source, target, decision: SupportVerdict, *, now: s
     kinds = {v.payload.get("entity_type", "unknown") for v in (source, target)} - {"unknown"}
     if len(kinds) > 1:
         raise ContractError("DERIVATION_INVALID", "entity_type")
-    current, _ = live_entity(tx, source.ref, source.revision, now)
+    current, source_records = live_entity(tx, source.ref, source.revision, now)
     destination, _ = live_entity(tx, target.ref, target.revision, now)
     if current.payload != source.payload or destination.payload != target.payload:
         raise ContractError("VERSION_CONFLICT", "entity")
     name = source.payload["subject"] if name is None else name
-    if not entity_name_evidenced(source, name):
+    if not eligible_entity_name(target.payload["subject"]) or not entity_name_evidenced(
+        source, name, sources=source_records
+    ):
         raise ContractError("DERIVATION_INVALID", "entity_name")
     if name == target.payload["subject"]:
         checked(tx, source, name, target)

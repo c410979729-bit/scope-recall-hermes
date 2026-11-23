@@ -76,7 +76,18 @@ def prepare_support(value, sources, judge, *, candidates=(), remaining_seconds=1
             verdicts.append(SupportVerdict(fingerprint, "unavailable"))
             continue
         state, action = result["support"], result["action"]
-        verdicts.append(SupportVerdict(fingerprint, state, result["target_ref"], result["target_revision"], action))
+        verdicts.append(
+            SupportVerdict(
+                fingerprint,
+                state,
+                result["target_ref"],
+                result["target_revision"],
+                action,
+                attribution=result.get("attribution"),
+                polarity=result.get("polarity"),
+                scope=result.get("scope"),
+            )
+        )
     return tuple(verdicts)
 
 
@@ -98,10 +109,22 @@ def judgement_result(raw, candidates):
     return validate_judgement(decode_payload(strip_json_fence(raw)), candidates)
 
 
+_REQUIRED_VERDICT_KEYS = frozenset({"support", "action", "target_ref", "target_revision"})
+_OPTIONAL_SEMANTIC_KEYS = {
+    "attribution": ("author", "third_party", "quoted_or_example"),
+    "polarity": ("affirmative", "negative"),
+    "scope": ("durable", "conditional", "ephemeral_turn", "unasserted"),
+}
+
+
 def validate_judgement(result: dict[str, Any], candidates):
-    """Check a decoded verdict's symbols and exact candidate version."""
-    if not isinstance(result, dict) or set(result) != {"support", "action", "target_ref", "target_revision"}:
+    """Check a decoded verdict's symbols, optional semantic traits, and exact candidate version."""
+    full_keys = _REQUIRED_VERDICT_KEYS | set(_OPTIONAL_SEMANTIC_KEYS)
+    if not isinstance(result, dict) or set(result) not in (_REQUIRED_VERDICT_KEYS, full_keys):
         raise ContractError("DERIVATION_INVALID", "support_verdict")
+    for key, allowed_values in _OPTIONAL_SEMANTIC_KEYS.items():
+        if key in result and result[key] not in allowed_values:
+            raise ContractError("DERIVATION_INVALID", key)
     if result["action"] == "new" and result["target_ref"] == "":
         result = dict(result)
         result["target_ref"] = None
@@ -143,7 +166,10 @@ def _merge_alias_live(tx, alias, now):
     return target is not None and entity_alias_proof(tx, alias, target, now)
 
 
-def merge_candidates(tx, proposal, scope_id, *, now, entity=None, vector_hits=(), paging=None) -> Any:
+_NOMINATE = object()
+
+
+def merge_candidates(tx, proposal, scope_id, *, now, entity=None, vector_hits=(), paging=None, verdict=None) -> Any:
     """Find the claims in this audience whose slot reads as this proposal's (``claims.slot_reading``), under its own
     subject or one a verified alias names."""
     from .claims import bind_claim_subject, evidence_refs, slot_reading, valid_at
@@ -155,7 +181,14 @@ def merge_candidates(tx, proposal, scope_id, *, now, entity=None, vector_hits=()
 
         return entity_candidates(tx, entity, now=now, vector_hits=vector_hits)
     roots = tx.claims.roots(evidence_refs(proposal))
-    bound, _, issue = bind_claim_subject(proposal, roots, semantic_support=True)
+    nominate_only = verdict is _NOMINATE
+    bound, _, issue = bind_claim_subject(
+        proposal,
+        roots,
+        semantic_support=True,
+        verdict=None if nominate_only else verdict,
+        nominate_only=nominate_only,
+    )
     if issue:
         return ((), None) if page else ()
     subjects = {bound["subject"]}
@@ -209,7 +242,7 @@ def prepare_publication(storage, context, value, sources, judge, *, remaining_se
                     (s.scope_id for s in sources if s.ref == proposal["evidence_spans"][0]["source_ref"]), None
                 )
                 if scope_id is not None:
-                    candidates[id(proposal)] = merge_candidates(tx, proposal, scope_id, now=now)
+                    candidates[id(proposal)] = merge_candidates(tx, proposal, scope_id, now=now, verdict=_NOMINATE)
     targets = tuple((item["ref"], item["revision"]) for entries in candidates.values() for item in entries)
     with private.using_outbound_check(
         lambda: _publication_blocked(storage, context, tuple(full_sources), targets, clock)
