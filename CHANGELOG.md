@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- `doctor` names a Desktop surface whose owner's sessions bind no scope, as it already did for the transport's conversations, when that session carries the dashboard login of this machine's own account (the approval a store now awaits names that account, not the login).
 - Session and task summaries wait for complete sources, retire superseded pages and resume when the source becomes available. Pages with excess verified quotes retain a quote from each represented source within the claim's evidence limit. Expired worker leases cannot publish summary or entity changes.
 - Entity checks skip outdated candidates and retain supported names when another name lacks evidence. Checks wait for a fact to take effect and retire when it expires. Failed checks record the stage and field that prevented publication.
 - Installed packages include the reflection prompt and the memory-management schema.

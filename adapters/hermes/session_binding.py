@@ -20,6 +20,7 @@ from .identity import (
     SessionUnbound,
     assert_same_installation,
     bind_hermes_identity,
+    names_this_account,
     switch_hermes_identity,
     unbound_session_hint,
 )
@@ -234,7 +235,9 @@ class SessionBinding:
         codes only, never what was said, and nothing a login could make into a line of its own.
         """
         scope = identity.scope
-        owner = scope.user_id == LOCAL_USER_ID
+        # A dashboard login names this machine's own account; it is the person at the machine as an unnamed
+        # local session is, and its silence is theirs to hear about.  A login that is somebody else's is not.
+        owner = scope.user_id == LOCAL_USER_ID or names_this_account(scope.user_id)
         local = scope.platform in LOCAL_PLATFORMS or (
             scope.platform == "cli" and owner and not scope.gateway_session_key
         )
