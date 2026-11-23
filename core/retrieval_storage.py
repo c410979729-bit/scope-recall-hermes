@@ -554,7 +554,6 @@ class RetrievalStorage(RetrievalHydration):
         """
         if candidate.kind != "event" or (src := tx.source(candidate.ref, candidate.revision)) is None:
             return False
-        conn = tx._check()
         origin = str(src.event.get("origin") or "")
         role = str(src.event.get("role") or "")
         same_session = src.session_id == context.trusted_context.session_id
@@ -564,6 +563,17 @@ class RetrievalStorage(RetrievalHydration):
             "origin_unknown",
             "memory_reinjection",
         } or role in {"tool", "system", "unknown"}
+        conversational_candidate = (
+            corpus_size >= MATURE_CORPUS_SIZE
+            and not same_session
+            and (
+                (role != "user" and not query_anchored)
+                or (role == "user" and asks_without_answering(str(src.event.get("content") or "")))
+            )
+        )
+        if not (machine_row or conversational_candidate):
+            return False
+        conn = tx._check()
         adm_row = conn.execute(
             "SELECT json_extract(extra_json,'$._scope_recall_admission.disposition') "
             "FROM source_events WHERE event_id=? AND source_revision=?",
@@ -593,17 +603,7 @@ class RetrievalStorage(RetrievalHydration):
             ).fetchone()
             is not None
         )
-        if machine_row:
-            return not grounded
-        return (
-            corpus_size >= MATURE_CORPUS_SIZE
-            and not same_session
-            and not grounded
-            and (
-                (role != "user" and not query_anchored)
-                or (role == "user" and asks_without_answering(str(src.event.get("content") or "")))
-            )
-        )
+        return not grounded
 
     def epoch(self, tx) -> int:
         return tx.memory_epoch()

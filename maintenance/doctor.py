@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 from contextlib import closing
 from pathlib import Path
@@ -850,6 +851,16 @@ def _check_supervisor(report: DoctorReport, data_directory: Path) -> None:
         report.capability_gaps.append(f"worker_failures:{int(failures)}")
 
 
+def _probe_timer_python(timer_python: object) -> dict[str, Any]:
+    """Inspect an operator timer's registered interpreter, using in-process metadata when it is ``sys.executable``."""
+    if not (isinstance(timer_python, str) and Path(timer_python).is_absolute() and Path(timer_python).is_file()):
+        return {}
+    path = Path(timer_python)
+    if path.resolve() == Path(sys.executable).resolve():
+        return package_health.package_probe()
+    return probe_python_package(path)
+
+
 def _check_autostart(report: DoctorReport, binding, data_directory: Path) -> float | None:
     """Autostart registration, plus the budget state its runtime config points at.
 
@@ -880,12 +891,7 @@ def _check_autostart(report: DoctorReport, binding, data_directory: Path) -> flo
         if not control["enabled"]:
             report.autostart_status = "paused"
         elif control.get("registration") == "operator_timer":
-            timer_python = control.get("python_executable")
-            timer_probe = (
-                probe_python_package(Path(timer_python))
-                if isinstance(timer_python, str) and Path(timer_python).is_absolute() and Path(timer_python).is_file()
-                else {}
-            )
+            timer_probe = _probe_timer_python(control.get("python_executable"))
             expected_version = report.package_version or __version__
             if not timer_probe:
                 report.autostart_status = "operator_timer_python_invalid"
