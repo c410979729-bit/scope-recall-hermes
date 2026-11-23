@@ -62,6 +62,7 @@ _HARD_IDENTIFIER = re.compile(
 )
 _CJK_TEXT = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _IDENTIFIER_JOINT = re.compile(r"(?<=[A-Za-z])[ \t_-](?=\d)")
+_OPAQUE_IDENTIFIER = re.compile(r"^(?:[0-9a-f]{12,}|[a-z]{1,12}\d+[a-z0-9]{5,})$", re.I)
 _CLAUSE_BOUNDARY = re.compile(r"[，,；;。！？!?\n]+")
 # Stop at adjacent non-ASCII prose and common Markdown delimiters. Percent
 # escapes stay in the URL, so an encoded path segment retains its identity.
@@ -830,9 +831,25 @@ def synonym_expansions(query: str) -> dict[str, str]:
     return expansions
 
 
+def _is_opaque_identifier(token: str) -> bool:
+    """Ignore separator-free random session slugs and bare hex hashes as mandatory filters."""
+    return (
+        len(token) >= 12
+        and "." not in token
+        and "-" not in token
+        and "_" not in token
+        and "/" not in token
+        and _OPAQUE_IDENTIFIER.match(token) is not None
+    )
+
+
 def hard_identifiers(text: str) -> frozenset[str]:
     # A release is also identified by its version suffix: "rc28" for 3.1.0rc28.
-    matches = frozenset(match.group(0).casefold() for match in _HARD_IDENTIFIER.finditer(text))
+    matches = frozenset(
+        token
+        for match in _HARD_IDENTIFIER.finditer(text)
+        if not _is_opaque_identifier(token := match.group(0).casefold())
+    )
     return matches | version_suffixes(text)
 
 

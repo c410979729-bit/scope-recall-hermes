@@ -195,7 +195,9 @@ def automatic_recall_route(
     if not text:
         return "blank_prompt"
     if text.startswith("/"):
-        return "slash_command"
+        command = text.split(None, 1)[0]
+        if len(command) > 1 and "/" not in command[1:] and not command[1:].startswith("."):
+            return "slash_command"
     reason = _conversation_reason(text)
     if reason == "presence":
         return "unanchored_followup"
