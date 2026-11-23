@@ -88,6 +88,10 @@ def test_different_bodies_are_different_things():
     assert content_key(_Obj("甲")) != content_key(_Obj("乙"))
 
 
+def test_leading_or_trailing_whitespace_does_not_create_a_distinct_body():
+    assert content_key(_Obj("\n### 结论\n正文")) == content_key(_Obj("### 结论\n正文\n"))
+
+
 def test_a_claim_is_never_folded_into_an_event_quoting_it():
     """They carry different authority, so identical text is not the same item."""
     assert content_key(_Obj("同一段话", kind="claim")) != content_key(_Obj("同一段话", kind="event"))
@@ -167,6 +171,16 @@ def test_the_copies_that_were_folded_are_reported(app):
     collapsed = [parse_duplicate_gap(gap) for gap in result.gaps]
     found = [count for count in collapsed if count is not None]
     assert found and found[0] >= 1, f"copies were folded in silence: {result.gaps}"
+
+
+def test_whitespace_padded_copies_collapse_in_recall(app):
+    core, ctx = app
+    capture(core, ctx, "TEST-ws 调查结论 正文内容", key="TEST-dup-ws/0")
+    capture(core, ctx, "\nTEST-ws 调查结论 正文内容\n", key="TEST-dup-ws/1")
+    result = _recall(core, ctx, "TEST-ws 调查结论")
+    bodies = _bodies(result)
+    assert len(bodies) == 1, f"whitespace-padded duplicate leaked: {bodies}"
+    assert any(parse_duplicate_gap(g) == 1 for g in result.gaps), result.gaps
 
 
 def test_a_store_without_copies_reports_no_collapse(app):
