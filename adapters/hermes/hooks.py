@@ -144,7 +144,14 @@ def host_hook_timeout() -> float | None:
     return min(timeout, _HOST_HOOK_TIMEOUT_MAX_S) if timeout > 0 else None
 
 
-def _dispatch(event: str, kwargs: dict[str, Any], *, wait: float) -> Any | None:
+def _input_hook_deadline(started: float, timeout: float | None) -> float | None:
+    """Bound pre_llm_call and pre_api_request well inside Hermes' callback timeout so it never disables the hook."""
+    if timeout is None:
+        return None
+    return started + min(timeout * 0.85, max(0.35, min(timeout * 0.7, timeout - min(5.0, timeout * 0.25))))
+
+
+def _dispatch(event: str, kwargs: dict[str, Any], *, wait: float, deadline: float | None = None) -> Any | None:
     adapter = _active_adapter(kwargs)
     if adapter is None:
         return None
@@ -157,7 +164,9 @@ def _dispatch(event: str, kwargs: dict[str, Any], *, wait: float) -> Any | None:
         adapter.observe_post_llm_call(**kwargs)
         return adapter
     if event in {"pre_llm_call", "pre_api_request"}:
-        adapter._observe_input(event, kwargs, wait=wait, selected=lambda: _active_adapter(kwargs) is adapter)
+        adapter._observe_input(
+            event, kwargs, wait=wait, deadline=deadline, selected=lambda: _active_adapter(kwargs) is adapter
+        )
         return adapter
     # The hook waits for its own session only so long: waited out past the host's timeout, it is abandoned and the host
     # skips this hook for every session (a tool hook queued behind its session's prefetch can wait that long).  One it
@@ -188,7 +197,10 @@ def _global_callback(event: str) -> Callable[..., None]:
         native = getattr(selected, "_native_requests", None)
         candidate = native.observe(selected, kwargs) if native is not None else None
         adapter = _dispatch(
-            event, kwargs, wait=_SESSION_WAIT_CAP_S if timeout is None else min(_SESSION_WAIT_CAP_S, timeout / 3)
+            event,
+            kwargs,
+            wait=_SESSION_WAIT_CAP_S if timeout is None else min(_SESSION_WAIT_CAP_S, timeout / 3),
+            deadline=_input_hook_deadline(started, timeout) if event in {"pre_llm_call", "pre_api_request"} else None,
         )
         if native is not None and adapter is selected:
             native.finish(candidate)

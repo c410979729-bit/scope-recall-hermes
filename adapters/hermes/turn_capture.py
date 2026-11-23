@@ -86,6 +86,31 @@ def _budget(deadline: float) -> float:
     return min(CAPTURE_TIMEOUT_S, deadline - time.monotonic())
 
 
+def _acquire_lock(adapter, lock_deadline: float | None) -> bool:
+    """Acquire ``adapter._lock``, bounded by ``lock_deadline`` when running inside a timed host callback."""
+    if lock_deadline is None:
+        adapter._lock.acquire()
+        return True
+    wait = lock_deadline - time.monotonic()
+    return wait > 0 and adapter._lock.acquire(timeout=wait)
+
+
+def _unread_steers(steers, context, written) -> list[tuple[Steer, str]]:
+    """Deduplicate steers across routes while merging their observed ``alike`` timestamps."""
+    reads: dict[str, tuple[Steer, str]] = {}
+    for steer in steers:
+        key = steer_source_key(context, steer)
+        if key in written:
+            continue
+        if key in reads:
+            alike = set(reads[key][0].alike) | set(steer.alike)
+            steer = reads[key][0]._replace(
+                alike=tuple(sorted(alike, key=lambda moment: (moment is None, moment or "")))
+            )
+        reads[key] = (steer, key)
+    return list(reads.values())
+
+
 def _steers(identity, messages: object) -> tuple[Steer, ...]:
     """The steers in ``messages`` that the session's person sent (``person_steers``)."""
     scope = identity.scope
@@ -384,7 +409,7 @@ class TurnCapture:
                 dict(session_id=session_id, turn_id=turn_id, user_message=message), origin=origin, current=True
             )
 
-    def pre_api(self, **kwargs) -> bool:
+    def pre_api(self, *, deadline: float | None = None, **kwargs) -> bool:
         """Recover the started turn's missing opener before inference, under the request's UUID; True for that turn.
 
         Any other request writes nothing (``_request_binding``): a review's prompt would be stored as the person's
@@ -400,10 +425,10 @@ class TurnCapture:
         origin = self.remembered_origin(turn_id, extract_user_text(kwargs.get("user_message"))) or self.note_opener(
             turn_id, kwargs.get("conversation_history"), kwargs.get("user_message"), binding.identity
         )
-        self._capture_opener(kwargs, origin=origin, current=True, bound=binding.identity)
+        self._capture_opener(kwargs, origin=origin, current=True, bound=binding.identity, deadline=deadline)
         return True
 
-    def pre_llm(self, **kwargs) -> bool:
+    def pre_llm(self, *, deadline: float | None = None, **kwargs) -> bool:
         """Observe an opener UUID without binding the helper thread's context to a new turn."""
         with self._adapter._said_lock:
             supplied = str(kwargs.get("turn_id") or "").strip()
@@ -429,10 +454,14 @@ class TurnCapture:
             origin = _opener_origin(
                 identity, kwargs.get("conversation_history"), kwargs.get("user_message"), staged=True
             )
-        self._capture_opener(dict(kwargs, turn_id=turn_id), origin=origin, current=current, bound=identity)
+        self._capture_opener(
+            dict(kwargs, turn_id=turn_id), origin=origin, current=current, bound=identity, deadline=deadline
+        )
         return current
 
-    def _capture_opener(self, kwargs: dict, *, origin: str, current: bool, bound=None) -> None:
+    def _capture_opener(
+        self, kwargs: dict, *, origin: str, current: bool, bound=None, deadline: float | None = None
+    ) -> None:
         """Store a delivered opener under its UUID; late delivery cannot alter active bookkeeping."""
         identity = bound or self._adapter._require_identity()
         turn_id = str(kwargs.get("turn_id") or "turn")
@@ -470,12 +499,26 @@ class TurnCapture:
         )
         if event is None and not gaps:
             return
+        remaining_seconds = CAPTURE_TIMEOUT_S
+        if deadline is not None:
+            remaining_seconds = min(CAPTURE_TIMEOUT_S, deadline - time.monotonic())
+            if remaining_seconds <= 0.02:
+                self._adapter._writer.defer(
+                    context,
+                    event,
+                    identity=ledger_identity,
+                    gaps=gaps,
+                    scope_id=identity.local_scope_id,
+                    bound=identity,
+                )
+                return
         receipt = self._adapter._writer.write(
             context,
             event,
             identity=ledger_identity,
             gaps=gaps,
             scope_id=identity.local_scope_id,
+            remaining_seconds=remaining_seconds,
             bound=identity,
             opener_turn_id=turn_id,
         )
@@ -796,6 +839,7 @@ class TurnCapture:
         session_id: str = "",
         hook: str,
         deadline: float | None = None,
+        lock_deadline: float | None = None,
         bound=None,
         typed_only: bool = False,
     ) -> None:
@@ -807,31 +851,55 @@ class TurnCapture:
         recovery from request hooks. ``bound`` keeps the identity selected before releasing the admission lock.
         """
         adapter = self._adapter
-        with adapter._lock:
+        if not _acquire_lock(adapter, lock_deadline):
+            adapter._calls.busy(hook, {})
+            return
+        try:
             identity = bound or adapter._identity
             if identity is None or identity.read_only or not identity.runtime_audience.allowed_scope_ids:
                 return
             effective_session = session_id or identity.session_id
+        finally:
+            adapter._lock.release()
         found = _steers(identity, messages) if typed_only else _said_aside(identity, messages)
         if found:
             # The context of the person's steers and redirects; unanswered rows get one of their own (``_write_aside``).
             context = identity.trusted_context(
                 session_id=effective_session, actor_origin=identity.person_origin, mutation=True
             )
-            self._write_aside(found, identity, context, effective_session, hook, deadline)
+            self._write_aside(found, identity, context, effective_session, hook, deadline, lock_deadline=lock_deadline)
 
-    def _write_aside(self, found, identity, context, session_id: str, hook: str, deadline: float | None = None) -> None:
+    def _write_aside(
+        self,
+        found,
+        identity,
+        context,
+        session_id: str,
+        hook: str,
+        deadline: float | None = None,
+        *,
+        lock_deadline: float | None = None,
+    ) -> None:
         """Write attested steers and unattributed history with separate contexts and one admission budget."""
         deadline = steer_deadline() if deadline is None else deadline
         delivered = tuple(steer for steer in found if steer.kind != UNANSWERED_KIND)
         unanswered = tuple(steer for steer in found if steer.kind == UNANSWERED_KIND)
         if delivered:
-            self._write_steers(delivered, identity, context, hook, deadline)
+            self._write_steers(delivered, identity, context, hook, deadline, lock_deadline=lock_deadline)
         if unanswered:
             unknown = identity.trusted_context(session_id=session_id, actor_origin="origin_unknown", mutation=True)
-            self._write_steers(unanswered, identity, unknown, hook, deadline)
+            self._write_steers(unanswered, identity, unknown, hook, deadline, lock_deadline=lock_deadline)
 
-    def _write_steers(self, steers, identity, context, hook: str, deadline: float | None = None) -> None:
+    def _write_steers(
+        self,
+        steers,
+        identity,
+        context,
+        hook: str,
+        deadline: float | None = None,
+        *,
+        lock_deadline: float | None = None,
+    ) -> None:
         """Each steer the store does not hold yet (``_held``), one capture per hold of the lock, its store I/O
         without it, all by the hook's ``deadline``: one it has no time left for is kept to retry with no store call
         (``CaptureWriter.defer``).  Only a write the store took marks one written: a write still in
@@ -841,18 +909,7 @@ class TurnCapture:
         deadline = steer_deadline() if deadline is None else deadline
         # One message read by two routes (what post_llm_call kept, the conversation sync_turn is handed) is one,
         # with what either read said alike: the two may hold different stretches of the conversation.
-        reads: dict[str, tuple[Steer, str]] = {}
-        for steer in steers:
-            key = steer_source_key(context, steer)
-            if key in adapter._steers_written:
-                continue
-            if key in reads:
-                alike = set(reads[key][0].alike) | set(steer.alike)
-                steer = reads[key][0]._replace(
-                    alike=tuple(sorted(alike, key=lambda moment: (moment is None, moment or "")))
-                )
-            reads[key] = (steer, key)
-        unread = list(reads.values())
+        unread = _unread_steers(steers, context, adapter._steers_written)
         if not unread:
             return
         began = time.monotonic()
@@ -873,47 +930,56 @@ class TurnCapture:
                     # Without a stable original key, an unreadable lookup cannot
                     # distinguish new input from a source already held or deleted.
                     continue
-                with adapter._lock, adapter._calls.holding(hook):
-                    taken = held
-                    # Kept to retry: the buffer writes it, or gives it up and the next hook reads it again.
-                    if not held and (key, 1) not in adapter._retry.captures:
-                        event, gaps, ledger_identity = steer_source_event(
-                            adapter._ledger, context, steer=steer, recorded_at=adapter._utc_now()
-                        )
-                        if event is None:
-                            # Being stored by another hook, or the ledger is full for now.
-                            if gaps:
-                                adapter._merge_gaps(gaps)
-                        elif not fits(deadline, took):
-                            # The hook's time is spent, or what is left would not hold another write as long as the last
-                            # (``fits``): kept to retry with no store call.
-                            adapter._writer.defer(
-                                context,
-                                event,
-                                identity=ledger_identity,
-                                gaps=gaps,
-                                scope_id=identity.local_scope_id,
-                                bound=identity,
-                                guard=guard,
+                if lock_deadline is not None and time.monotonic() >= lock_deadline:
+                    adapter._merge_gaps(("capture_gap:input_hook_deadline",))
+                    break
+                if not _acquire_lock(adapter, lock_deadline):
+                    adapter._calls.busy(hook, {})
+                    break
+                try:
+                    with adapter._calls.holding(hook):
+                        taken = held
+                        # Kept to retry: the buffer writes it, or gives it up and the next hook reads it again.
+                        if not held and (key, 1) not in adapter._retry.captures:
+                            event, gaps, ledger_identity = steer_source_event(
+                                adapter._ledger, context, steer=steer, recorded_at=adapter._utc_now()
                             )
-                        else:
-                            began = time.monotonic()
-                            receipt = adapter._writer.write(
-                                context,
-                                event,
-                                identity=ledger_identity,
-                                gaps=gaps,
-                                scope_id=identity.local_scope_id,
-                                remaining_seconds=_budget(deadline),
-                                bound=identity,
-                                release=True,
-                            )
-                            took = time.monotonic() - began
-                            taken = receipt is not None
-                    if taken:
-                        adapter._steers_written[key] = None
-                        while len(adapter._steers_written) > _STEERS_WRITTEN:
-                            adapter._steers_written.pop(next(iter(adapter._steers_written)))
+                            if event is None:
+                                # Being stored by another hook, or the ledger is full for now.
+                                if gaps:
+                                    adapter._merge_gaps(gaps)
+                            elif not fits(deadline, took):
+                                # The hook's time is spent, or what is left would not hold another write as long as
+                                # the last (``fits``): kept to retry with no store call.
+                                adapter._writer.defer(
+                                    context,
+                                    event,
+                                    identity=ledger_identity,
+                                    gaps=gaps,
+                                    scope_id=identity.local_scope_id,
+                                    bound=identity,
+                                    guard=guard,
+                                )
+                            else:
+                                began = time.monotonic()
+                                receipt = adapter._writer.write(
+                                    context,
+                                    event,
+                                    identity=ledger_identity,
+                                    gaps=gaps,
+                                    scope_id=identity.local_scope_id,
+                                    remaining_seconds=_budget(deadline),
+                                    bound=identity,
+                                    release=True,
+                                )
+                                took = time.monotonic() - began
+                                taken = receipt is not None
+                        if taken:
+                            adapter._steers_written[key] = None
+                            while len(adapter._steers_written) > _STEERS_WRITTEN:
+                                adapter._steers_written.pop(next(iter(adapter._steers_written)))
+                finally:
+                    adapter._lock.release()
 
     def _held(self, unread, identity, context, deadline: float) -> tuple[bool | None, ...]:
         """Which steers or unattributed historical rows the store holds already or holds deleted: a compression

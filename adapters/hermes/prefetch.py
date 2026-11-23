@@ -16,7 +16,7 @@ from scope_recall.core.retrieval import AUTOMATIC_PACKET_BUDGET_UNITS
 
 from ..host_memory import read_host_memory
 from ..runtime_wiring import render_host_recall_context
-from .tool_surface import display_zone
+from .tool_surface import display_zone, resident_hermes_recall
 from .turn_capture import direct_owner_cli
 
 if TYPE_CHECKING:
@@ -156,44 +156,68 @@ class Prefetch:
         except Exception:  # noqa: BLE001 - optional host reading must not prevent prefetch
             entries = frozenset()
         host_context: dict[str, Any] = {"host_memory_entries": entries} if entries else {}
-        try:
-            packet = core.recall_packet(
-                context,
-                request,
-                current_source_refs=current_refs,
-                **host_context,
-                # A day the message names is read in the zone this profile tells its model, as its memories' times are.
-                zone=display_zone(),
-            )
-        except (ContractError, sqlite3.Error, OSError, RuntimeError, ValueError):
-            if not brief:
-                raise
-            text = "\n\n".join(part for part in (brief, notice) if part)
-            return self._confirm(
-                core, context, effective_session, turn, briefing, text, started, request_id=request["request_id"]
-            )
-        preparation = core.prepare_recall_render(context, packet)
+        zone = display_zone()
+        resident = resident_hermes_recall(
+            self._adapter,
+            identity,
+            context,
+            request,
+            session_id=effective_session,
+            current_refs=current_refs,
+            budget_seconds=float(getattr(core.config, "auto_recall_seconds", 5.0)),
+            host_memory_entries=entries,
+        )
         current = getattr(core, "recall_packet_current", None)
-        if packet.get("items") and callable(current) and not current(context, packet):
-            packet = core.recall_packet(
-                context, request, current_source_refs=current_refs, zone=display_zone(), **host_context
-            )
+        if resident is not None:
+            if resident.get("stale"):
+                return self._confirm(
+                    core, context, effective_session, turn, {}, notice, started, request_id=request["request_id"]
+                )
+            packet = resident["packet"]
+            render_ref = resident.get("render_ref")
+            canonical_text = resident.get("canonical_text")
+            render_context = resident.get("context")
+        else:
+            try:
+                packet = core.recall_packet(
+                    context,
+                    request,
+                    current_source_refs=current_refs,
+                    **host_context,
+                    # A day the message names is read in this profile's zone, matching its memories' times.
+                    zone=zone,
+                )
+            except (ContractError, sqlite3.Error, OSError, RuntimeError, ValueError):
+                if not brief:
+                    raise
+                text = "\n\n".join(part for part in (brief, notice) if part)
+                return self._confirm(
+                    core, context, effective_session, turn, briefing, text, started, request_id=request["request_id"]
+                )
             preparation = core.prepare_recall_render(context, packet)
+            if packet.get("items") and callable(current) and not current(context, packet):
+                packet = core.recall_packet(
+                    context, request, current_source_refs=current_refs, zone=zone, **host_context
+                )
+                preparation = core.prepare_recall_render(context, packet)
+            render_ref = preparation.render_ref
+            canonical_text = preparation.canonical_text
+            render_context = preparation.context
         with self._adapter._lock, self._adapter._said_lock:
             if self._adapter._active_turn_id == turn:
                 # A turn begun meanwhile, after Hermes gave up on this call, keeps its own state.
                 self._adapter._diagnostics.last_prefetch_request_id = packet["request_id"]
-                self._adapter._diagnostics.last_render_ref = preparation.render_ref
+                self._adapter._diagnostics.last_render_ref = render_ref
                 self._adapter._diagnostics.last_prefetch_skip_reason = next(
                     (gap.split(":", 1)[1] for gap in packet["gaps"] if gap.startswith("auto_recall_skipped:")), None
                 )
         rendered = render_host_recall_context(
-            preparation.canonical_text,
-            context=preparation.context,
+            canonical_text,
+            context=render_context,
             entry=(identity.entry_id, identity.manifest.entry_name) if identity.entry_id is not None else None,
-            zone=display_zone(),
+            zone=zone,
         )
-        if packet.get("items") and callable(current) and not current(context, packet):
+        if resident is None and packet.get("items") and callable(current) and not current(context, packet):
             return self._confirm(
                 core, context, effective_session, turn, {}, notice, started, request_id=request["request_id"]
             )

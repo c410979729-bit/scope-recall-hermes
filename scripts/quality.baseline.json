@@ -41,7 +41,7 @@
    "reportOptionalOperand": 1
   },
   "adapters/hermes/tool_surface.py": {
-   "reportAttributeAccessIssue": 13
+   "reportAttributeAccessIssue": 10
   },
   "adapters/runtime_wiring.py": {
    "reportArgumentType": 2

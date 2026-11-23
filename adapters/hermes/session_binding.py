@@ -75,6 +75,7 @@ class SessionBinding:
             raise
         with self._adapter._lock:
             assert_same_installation(self._adapter._identity, fresh)
+            self._adapter._explicit_runtime_config = bool(kwargs.get("trusted_runtime_config_path"))
             runtime_path = kwargs.get("trusted_runtime_config_path") or fresh.runtime_config_path
             if self._adapter._host_runtime is None:
                 self._adapter._host_runtime = attach_trusted_host_runtime(

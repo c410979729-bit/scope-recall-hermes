@@ -291,7 +291,7 @@ def test_the_runtime_config_bounds_resident_minutes():
 
     assert RESIDENT_RECALL_MINUTES_BOUNDS == (0, 1440)
     assert local_endpoint.RESIDENT_DEFAULT_MINUTES == dict.fromkeys(
-        ("codex", "claude-code", "workbuddy", "dsh", "antigravity"), 120
+        ("hermes", "codex", "claude-code", "workbuddy", "dsh", "antigravity"), 120
     )
 
 

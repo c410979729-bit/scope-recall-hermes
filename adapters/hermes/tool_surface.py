@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Mapping
 from datetime import tzinfo
 from typing import Any, Dict, List
 
@@ -17,6 +18,8 @@ from scope_recall.core.handoff import tool_schemas as handoff_schemas
 from scope_recall.core.read_views import DEFAULT_BUDGET_TOKENS, DEFAULT_MAX_ITEMS
 from scope_recall.core.trace import fence_trace_epoch, trace_tool_schema
 
+from ..clients.hook_answer import server_own_vector_fault
+from ..clients.local_endpoint import Recaller, request_recall, resident_minutes
 from ..runtime_wiring import FORGET_GUIDANCE, READ_VIEW_BUDGET_GUIDANCE, RECALL_TOOL_GUIDANCE, REVISE_GUIDANCE
 from ..tool_common import (
     FENCED_ENTITY,
@@ -209,6 +212,79 @@ def display_zone() -> tzinfo | None:
     return get_timezone()
 
 
+def resident_hermes_recall(
+    adapter: Any,
+    identity: Any,
+    context: Any,
+    request: Mapping[str, Any],
+    *,
+    current_refs: tuple[str, ...],
+    budget_seconds: float,
+    session_id: str | None = None,
+    host_memory_entries: frozenset[str] | None = None,
+) -> dict[str, Any] | None:
+    """Ask the shared library's resident process for a read-only Hermes recall, or return None to recall locally."""
+    if (
+        identity.entry_id is None
+        or getattr(adapter, "_injected_core", False)
+        or getattr(adapter, "_explicit_runtime_config", False)
+    ):
+        return None
+    if resident_minutes(identity.hermes_home, "hermes") <= 0:
+        return None
+    request_recall(identity.hermes_home, "hermes")
+    prepare_render = host_memory_entries is not None
+    zone = display_zone()
+    scope = identity.scope
+    payload: dict[str, Any] = {
+        "scope": {
+            "platform": scope.platform,
+            "user_id": scope.user_id,
+            "chat_type": scope.chat_type,
+            "chat_id": scope.chat_id,
+            "thread_id": scope.thread_id,
+            "agent_identity": scope.agent_identity,
+            "agent_workspace": scope.agent_workspace,
+            "agent_context": scope.agent_context,
+            "gateway_session_key": scope.gateway_session_key,
+        },
+        "session_id": identity.session_id if session_id is None else session_id,
+        "user_name": identity.user_name,
+        "local_account_principal": identity.local_account_principal,
+        "recent_messages": list(context.recent_messages),
+        "compacted_at": context.compacted_at,
+        "compaction_seq": context.compaction_seq,
+        "compaction_epoch": context.compaction_epoch,
+        "host_memory_entries": sorted(host_memory_entries) if host_memory_entries else [],
+        "zone": getattr(zone, "key", None) if zone is not None else None,
+        "request": dict(request),
+        "prepare_render": prepare_render,
+        "background_without_evidence": prepare_render,
+    }
+    try:
+        answered = Recaller(identity.hermes_home, "hermes")(payload, current_refs, (), budget_seconds)
+    except Exception:  # noqa: BLE001 - fall back to direct in-process recall
+        return None
+    if answered is None:
+        return None
+    result, fields = answered
+    if not isinstance(result, dict) or not isinstance(result.get("packet"), dict):
+        return None
+    if fields.get("last_reason") in {"deadline_exceeded", "recall_exception", "recall_incomplete", "no_audience"}:
+        return None
+    host_runtime = getattr(adapter, "_host_runtime", None)
+    has_vectors = bool(getattr(host_runtime, "configured", False)) and (
+        getattr(getattr(host_runtime, "runtime", None), "vector", None) is not None
+    )
+    if (
+        fields.get("recall_vectors") is not True
+        and has_vectors
+        and server_own_vector_fault(fields.get("recall_vector_gap"))
+    ):
+        return None
+    return result
+
+
 def _unfenced_turn_packet(request_id: str) -> dict[str, Any]:
     """The contract's unavailable recall packet, for a turn that overflowed its source fence.
 
@@ -317,23 +393,83 @@ class HermesToolSurface:
             origin, gaps = "origin_unknown", ()
         return _error_output(code, field, request_id=request_id, origin=origin, capability_gaps=gaps, hint=hint)
 
-    def _handle_recall(self, args: object) -> str:
+    @staticmethod
+    def _gate_resident_packet(core: Any, context: Any, packet: dict[str, Any], entry_fence: Any) -> dict[str, Any]:
+        """Re-check entry pause and full-privacy fences in the gateway before releasing a resident packet."""
+        if not packet.get("items"):
+            return packet
+        blocked = getattr(core, "_entry_blocked", None)
+        if entry_fence is not None and callable(blocked) and blocked(context, entry_fence):
+            return {
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": packet["request_id"],
+                "status": "no_match",
+                "memory_epoch": None,
+                "items": [],
+                "gaps": ["entry_state:paused"],
+                "diagnostic_ref": None,
+                "answerability": "unknown",
+                "coverage": "unknown",
+                "unmet_needs": [],
+            }
+        read_mode = getattr(core, "private_mode", None)
+        if callable(read_mode) and read_mode(context) == "full":
+            return {
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": packet["request_id"],
+                "status": "no_match",
+                "memory_epoch": None,
+                "items": [],
+                "gaps": ["private_mode:full"],
+                "diagnostic_ref": None,
+                "answerability": "unknown",
+                "coverage": "unknown",
+                "unmet_needs": [],
+            }
+        return packet
+
+    def _handle_recall(self: Any, args: object) -> str:
         body = self._tool_body(args, "recall")
-        context = self._tool_context()
+        with self._lock, self._said_lock:
+            identity = self._require_identity()
+            context = self._tool_context()
+            overflow = self._current_source_refs_overflow
+            current_refs = tuple(self._current_source_refs)
+            core = self._require_core()
         validate_model_request("recall_request", body, context)
-        if self._current_source_refs_overflow:
+        if overflow:
             # Recalling without every ref of this turn could hand the turn's
             # own sources back; the provider reports the capability gap.
             return self._reply(body["request_id"], _unfenced_turn_packet(body["request_id"]))
-        core = self._require_core()
+        zone = display_zone()
+        fence_reader = getattr(core, "_entry_fence", None)
+        entry_fence = fence_reader(context) if callable(fence_reader) else None
+        resident = resident_hermes_recall(
+            self,
+            identity,
+            context,
+            body,
+            current_refs=current_refs,
+            budget_seconds=5.0,
+        )
+        if resident is not None:
+            packet = fence_epoch(
+                resident["packet"],
+                core.memory_epoch(context),
+                FENCED_RECALL,
+                retracted=lambda since: core.memory_retracted_since(context, since),
+            )
+            packet = self._gate_resident_packet(core, context, packet, entry_fence)
+            note_explicit_recall_fallback(packet, budget_tokens=body.get("budget_tokens"))
+            return self._reply(body["request_id"], packet)
         packet = core.recall_packet(
             context,
             body,
-            current_source_refs=tuple(self._current_source_refs),
+            current_source_refs=current_refs,
             # Explicit tool calls get the bounded deep-search ceiling.  Auto
             # mode is still clamped by the trusted CoreConfig budget.
             deadline_seconds=5.0,
-            zone=display_zone(),
+            zone=zone,
             # Lookup intent remains explicit even when the requested mode is auto.
             background_without_evidence=False,
         )

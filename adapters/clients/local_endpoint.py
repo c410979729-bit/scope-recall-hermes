@@ -24,14 +24,15 @@ from pathlib import Path
 from typing import Any
 
 from ..._version import __version__
-from ...host_registry import HOOK_CLIENT_HOSTS
+from ...host_registry import RESIDENT_HOSTS
 from ...runtime.instance_config import RESIDENT_RECALL_MINUTES_BOUNDS
 from ...runtime.validation import strict_int
 from ...runtime.worker_launch import detached_creationflags
 from ..installation import MANIFEST_FILENAME
 from ..shared_entries import attachment_path, read_attachment
-from .config import CodexConfigError, load_shared_client, shared_clients
+from .config import CodexConfigError, load_shared_client
 from .handler import CodexHookHandler
+from .hermes_resident import HermesResidentHandler, load_hermes_resident_target, shared_resident_entries
 
 #: What a hook may send: its payload (a hook's own stdin is at most 64 KiB, and written as ASCII JSON a character
 #: of it takes up to six bytes) and the refs and gaps of its capture.
@@ -70,7 +71,7 @@ MAX_CONCURRENT = 8
 #: prove itself in time would otherwise be left out for 30 s.
 ADVERTISE_SECONDS = 2.0
 #: Default library residence after the last client activity; entry configurations can opt out explicitly.
-RESIDENT_DEFAULT_MINUTES: dict[str, int] = dict.fromkeys(HOOK_CLIENT_HOSTS, 120)
+RESIDENT_DEFAULT_MINUTES: dict[str, int] = dict.fromkeys(RESIDENT_HOSTS, 120)
 #: Minimum interval between two worker attempts to launch or replace the library service.
 RESIDENT_START_EVERY_SECONDS = 60.0
 _NONCE = "X-Scope-Recall-Nonce"
@@ -431,6 +432,19 @@ def _nothing() -> None:
     return None
 
 
+def load_resident_target(home: Path | str, host: str):
+    """Resolve any local resident-capable entry (Hermes or a hook client) attached to a shared store."""
+    if host == "hermes":
+        return load_hermes_resident_target(home)
+    return load_shared_client(home, host)
+
+
+def _build_resident_handler(home: Path | str, host: str) -> Any:
+    if host == "hermes":
+        return HermesResidentHandler.from_home(home)
+    return CodexHookHandler.from_home(str(home), host)
+
+
 def _close_later(handler: Any) -> None:
     """Close a handler outside the request budget, including any runtime shutdown waits."""
 
@@ -638,7 +652,7 @@ class HookEndpoint:
         self.home = Path(home)
         self._initial_host = host
         self.host = "*" if library else host
-        self.binding = load_shared_client(self.home, host).to_binding() if library else None
+        self.binding = load_resident_target(self.home, host).to_binding() if library else None
         self.routes: dict[tuple[str, str], KeptRecaller] = {}
         self._route_lock = threading.Lock()
         #: A worker-owned service advertises one endpoint for the entire library.
@@ -679,8 +693,8 @@ class HookEndpoint:
         return file_stamp(*self._watched, *entry_files(self.home))
 
     def _handler(self) -> Any:
-        host = load_shared_client(self.home, self._initial_host).host if self.binding is not None else self.host
-        return CodexHookHandler.from_home(str(self.home), host)
+        host = load_resident_target(self.home, self._initial_host).host if self.binding is not None else self.host
+        return _build_resident_handler(self.home, host)
 
     def _refresh_credentials(self) -> None:
         with self.lock:
@@ -709,7 +723,7 @@ class HookEndpoint:
         self._refresh_credentials()
         recaller = self.kept
         if self.binding is not None:
-            config = load_shared_client(request["home"], request["host"])
+            config = load_resident_target(request["home"], request["host"])
             if any(
                 getattr(config.to_binding(), field) != getattr(self.binding, field)
                 for field in ("data_directory", "agent_id", "installation_id", "test_mode")
@@ -723,9 +737,7 @@ class HookEndpoint:
             result, diagnostics = kept
             return {"result": result, "diagnostics": diagnostics}, _nothing
         handler = (
-            CodexHookHandler.from_home(request["home"], request["host"])
-            if self.binding is not None
-            else self._handler()
+            _build_resident_handler(request["home"], request["host"]) if self.binding is not None else self._handler()
         )
         try:
             remaining = max(0.0, request["remaining"] - (time.monotonic() - received))
@@ -746,7 +758,7 @@ class HookEndpoint:
             recaller = self.routes.get(key)
             if recaller is None:
                 recaller = KeptRecaller(
-                    lambda: CodexHookHandler.from_home(key[0], key[1]),
+                    lambda: _build_resident_handler(key[0], key[1]),
                     stamp=lambda: file_stamp(config.runtime_config_path, *entry_files(config.home)),
                 )
                 self.routes[key] = recaller
@@ -757,7 +769,7 @@ class HookEndpoint:
         if self.binding is None:
             self.kept.warm()
         else:
-            for config, _attached in shared_clients(self.binding):
+            for config, _attached in shared_resident_entries(self.binding):
                 if resident_minutes(config.home, config.host) > 0:
                     self._route(config).warm()
 
@@ -892,7 +904,7 @@ def configured_minutes(home: Path | str, host: str, *, missing: int | None = 0) 
     missing file is ``missing``: 0 for a start, None for a running server, since an editor that saves by moving
     files leaves none for a moment."""
     try:
-        path = load_shared_client(Path(home), host).runtime_config_path
+        path = load_resident_target(Path(home), host).runtime_config_path
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return missing
@@ -914,7 +926,7 @@ def configured_minutes(home: Path | str, host: str, *, missing: int | None = 0) 
 def resident_lock(home: Path | str, host: str) -> Path:
     """Return the lifetime lock shared by every entry of the library."""
     try:
-        config = load_shared_client(Path(home), host)
+        config = load_resident_target(Path(home), host)
     except CodexConfigError:
         return endpoints(home) / "resident.lock"
     # The lock belongs to the library even when two operating-system accounts have separate endpoint tokens.

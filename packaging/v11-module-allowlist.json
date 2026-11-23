@@ -30,6 +30,7 @@
     "adapters/clients/handler.py",
     "adapters/clients/hermes_privacy.py",
     "adapters/clients/hermes_queue.py",
+    "adapters/clients/hermes_resident.py",
     "adapters/clients/hook_answer.py",
     "adapters/clients/hook_entry.py",
     "adapters/clients/hook_events.py",

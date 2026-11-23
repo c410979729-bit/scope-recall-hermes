@@ -384,6 +384,8 @@ class RecallChannels:
         corpus_size = 0
         if candidate.source not in {"vector", "exact_ref", "scoped", "relation"}:
             if candidate.matched_query_terms is None:
+                if self._remaining(context) <= 0:
+                    return False
                 obj = self.storage_reader.hydrate(tx, candidate, context)
                 hits = meaningful_query_terms(question)
                 matched = set(hits).intersection(lexical_terms(statement_text(obj))) if obj is not None else set()

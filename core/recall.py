@@ -266,6 +266,7 @@ class RetrievalPipeline(RecallChannels):
         *,
         original_query: str | None = None,
         aside: _Aside | None = None,
+        attempted: set[tuple[str, str, int]] | None = None,
     ) -> None:
         """Hydrate in rank order within the retrieval portion of the request."""
         known = {candidate.key for candidate, _obj in hydrated}
@@ -278,12 +279,15 @@ class RetrievalPipeline(RecallChannels):
             if self._remaining(context) <= 0:
                 gaps.append("deadline_exceeded_hydrate")
                 break
+            if attempted is not None:
+                attempted.add(candidate.key)
             if candidate.key in known:
                 continue
             obj = self._hydrate_admit(tx, candidate, context, original_query=original_query, aside=aside)
-            if obj is not None:
-                hydrated.append((candidate, obj))
-                known.add(candidate.key)
+            if obj is None:
+                continue
+            hydrated.append((candidate, obj))
+            known.add(candidate.key)
 
     #: A relation hit receives half the smaller of its own reciprocal-rank score and its seed's fusion score.
     #: With the default ``rrf_k=60`` and 48-candidate pool, its score is at most 1/124, below a direct hit at rank 48.
@@ -717,7 +721,12 @@ class RetrievalPipeline(RecallChannels):
             round_context = replace(working, query=follow_query, scope=None, time=None) if follow_query else working
             budget.hold(max_rounds - round_index - 1)
             # Collection leaves one hydration pass before retrieval itself stops.
-            hydration = min(self._remaining(working) / 2, release_reserve_seconds(working.limits.max_items) / 4)
+            remaining_work = self._remaining(working)
+            hydration = (
+                min(remaining_work * 0.25, 0.5)
+                if remaining_work >= 1.0
+                else min(remaining_work / 2, release_reserve_seconds(working.limits.max_items) / 4)
+            )
             collecting = replace(round_context, deadline=round_context.deadline - hydration)
             attempted: set[tuple[str, str, int]] = set()
 
@@ -733,9 +742,15 @@ class RetrievalPipeline(RecallChannels):
                     return
                 with timings.measure("hydrate"):
                     self._hydrate_all(
-                        tx, hydrated, fresh, round_context, gaps, original_query=original_query, aside=aside
+                        tx,
+                        hydrated,
+                        fresh,
+                        round_context,
+                        gaps,
+                        original_query=original_query,
+                        aside=aside,
+                        attempted=attempted,
                     )
-                attempted.update(candidate.key for candidate in candidates)
                 cutoff = self._release_cutoff(round_context, release_deadline, timings, hydrated)
                 return cutoff
 
@@ -750,7 +765,17 @@ class RetrievalPipeline(RecallChannels):
             timings.stages["collect"] -= timings.stages["hydrate"] - prior_hydration
             seed_count += len(seeds)
             seen.update(candidate.key for candidate in seeds)
-            hydrate_ready(seeds)
+            if not hydrated and seeds and self._remaining(round_context) <= 0:
+                # When GIL contention or a slow channel pushes past the retrieval cutoff, spend at most half of
+                # the remaining release reserve to hydrate the top already-collected seeds rather than returning 0.
+                reserve_left = release_deadline - self.clock.monotonic()
+                if reserve_left > 0.002:
+                    salvage = replace(round_context, deadline=self.clock.monotonic() + reserve_left / 2)
+                    hydrate_ready(seeds[: working.limits.max_items], round_context=salvage)
+                else:
+                    hydrate_ready(seeds)
+            else:
+                hydrate_ready(seeds)
             # Optional signals can improve a ready candidate's fused rank.
             # Refresh its rank without repeating hydration or echo side effects.
             # A ready candidate this round hydrated early that the final qualification dropped leaves with it.

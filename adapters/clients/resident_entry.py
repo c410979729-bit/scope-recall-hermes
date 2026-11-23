@@ -23,12 +23,12 @@ from pathlib import Path
 from ... import _version
 from ..._version import __version__
 from ...core.file_lock import advisory_file_lock
-from ...host_registry import HOOK_CLIENT_HOSTS
+from ...host_registry import RESIDENT_HOSTS
 from ...runtime.running_code import version_on_disk
 from ...runtime.worker_entry import host_process_credential_environment
-from .config import load_shared_client
 from .local_endpoint import (
     endpoints,
+    load_resident_target,
     package_upgrading,
     remove_quietly,
     resident_alive,
@@ -62,7 +62,7 @@ FUTURE_MARK_SECONDS = 60.0
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scope Recall resident prompt recall server")
     parser.add_argument("--home", type=Path, required=True, help="Absolute home of a client attached to a shared store")
-    parser.add_argument("--host", choices=HOOK_CLIENT_HOSTS, required=True)
+    parser.add_argument("--host", choices=RESIDENT_HOSTS, required=True)
     parser.add_argument(
         "--env-file",
         type=Path,
@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     from .store_service import library_minutes
 
     idle = (
-        (library_minutes(load_shared_client(home, args.host).to_binding()) or 0) * 60.0
+        (library_minutes(load_resident_target(home, args.host).to_binding()) or 0) * 60.0
         if configured
         else args.idle_seconds
     )
@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _serve_until_idle(home: Path, host: str, env_file: Path | None, idle: float, *, configured: bool) -> int:
-    config = load_shared_client(home, host)
+    config = load_resident_target(home, host)
     credentials: Callable[[], dict[str, str]] | None = None
     if env_file is not None:
 

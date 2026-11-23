@@ -12,7 +12,7 @@ import json
 import time
 from pathlib import Path
 
-from scope_recall.host_registry import HOOK_CLIENT_HOSTS
+from scope_recall.host_registry import RESIDENT_HOSTS
 
 #: How long ``stop`` waits for a stopped server to let go of the entry's lock.
 STOP_WAIT_SECONDS = 5.0
@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="scope-recall resident")
     parser.add_argument("action", choices=("status", "stop"))
     parser.add_argument("--home", required=True, help="absolute home of a client attached to a shared store")
-    parser.add_argument("--host", required=True, choices=HOOK_CLIENT_HOSTS)
+    parser.add_argument("--host", required=True, choices=RESIDENT_HOSTS)
     args = parser.parse_args(argv)
     try:
         home = Path(args.home).expanduser()
@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "error", "code": "home_not_absolute"}))
         return 2
     from scope_recall.adapters.clients.config import CodexConfigError, load_shared_client
+    from scope_recall.adapters.clients.hermes_resident import load_hermes_resident_target
     from scope_recall.adapters.clients.local_endpoint import (
         live_residents,
         resident_minutes,
@@ -57,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     running = resident_running(home, args.host)
     worker_recall = None
     try:
-        config = load_shared_client(home, args.host)
+        config = load_hermes_resident_target(home) if args.host == "hermes" else load_shared_client(home, args.host)
         worker = read_worker_metadata(config.data_directory / "runtime-worker-status.json")
         if (
             worker.get("installation_id") == config.installation_id

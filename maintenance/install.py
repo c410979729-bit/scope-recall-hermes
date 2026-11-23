@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
-from scope_recall.host_registry import HOOK_CLIENT_HOSTS, HOSTS
+from scope_recall.host_registry import HOSTS, RESIDENT_HOSTS
 
 from . import install_antigravity, install_claude_code, install_codex, install_dsh, install_hermes, install_workbuddy
 from .backup import adjacent_backup, atomic_write, sha256, write_private_configuration
@@ -406,7 +406,7 @@ def _stop_residents(host: str, instance_root: Path) -> None:
     """Stop the entry's resident recall servers, for a client that may keep one (``adapters/clients/resident_entry``).
     They write nothing.  One that cannot be stopped (its identity not proven, as on macOS, or this account may not end
     it) is said on stderr and left to its own end; nothing here fails the install."""
-    if host not in HOOK_CLIENT_HOSTS:
+    if host not in RESIDENT_HOSTS:
         return
     import sys
 

@@ -222,6 +222,7 @@ HOSTS: Mapping[str, HostProfile] = MappingProxyType(
 # These views keep the installed command, manifest and runtime-config vocabulary in sync.
 ENTRY_HOSTS = tuple(HOSTS)
 HOOK_CLIENT_HOSTS = tuple(host for host, profile in HOSTS.items() if profile.integration == "hook")
+RESIDENT_HOSTS = ("hermes", *HOOK_CLIENT_HOSTS)
 READ_ONLY_CLIENT_HOSTS = tuple(host for host, profile in HOSTS.items() if profile.integration == "mcp")
 CLIENT_HOSTS = (*HOOK_CLIENT_HOSTS, *READ_ONLY_CLIENT_HOSTS)
 INSTALL_HOSTS = tuple(host for host, profile in HOSTS.items() if profile.installer is not None)

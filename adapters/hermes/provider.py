@@ -33,6 +33,8 @@ from .worker import AdapterWorker
 
 _log = logging.getLogger(__name__)
 
+#: Hard ceiling for an input observation hook when the caller supplies no host callback deadline.
+_INPUT_OBSERVATION_CEILING_S = 20.0
 #: What a shutdown waits for captures whose store I/O runs without the adapter lock.  A tool result's write took
 #: 1.4-4.4 s on a busy shared store, past its own ``CAPTURE_TIMEOUT_S`` budget; 10 s covers that.
 _CAPTURE_DRAIN_WAIT_S = 10.0
@@ -128,6 +130,8 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         #: ``post_llm_call`` runs before Hermes sends the reply and must not wait behind a capture.
         self._said_lock = threading.RLock()
         self._identity: HermesIdentity | None = None
+        self._injected_core = core is not None or host_runtime is not None or clock is not None
+        self._explicit_runtime_config = False
         self._host_runtime = host_runtime
         self._core = host_runtime.core if host_runtime is not None else core
         self._clock = clock
@@ -302,17 +306,21 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         """Observe the request's UUID and typed user messages through the shared input pipeline."""
         self._observe_input("pre_api_request", kwargs)
 
-    def _observe_input(self, event: str, kwargs: dict, *, wait=None, selected=None) -> None:
-        """Process current input under one lock hold, then write typed history without that hold.
+    def _observe_input(
+        self, event: str, kwargs: dict, *, wait=None, deadline: float | None = None, selected=None
+    ) -> None:
+        """Process current input under one bounded lock hold, then write typed steers within ``deadline``.
 
-        Dispatcher admission has a timeout; direct callers block for the lock. The opener's store call has
-        its own capture budget and history writing gets a separate soft budget. Parsing and subsequent lock
-        acquisitions are outside admission's timeout, so the complete observation has no hard time bound.
+        Every lock acquisition and store write inside the hook shares a finite wall-clock ceiling inside Hermes'
+        callback timeout. Unfinished opener writes degrade to the durable retry buffer, and skipped steers remain in
+        conversation history for ``post_llm_call``, ``on_pre_compress``, ``sync_turn`` and ``on_session_end``.
         """
         if self._unbound_session:
             return
-        acquired = self._lock.acquire() if wait is None else self._lock.acquire(timeout=wait)
-        if not acquired:
+        effective_deadline = time.monotonic() + _INPUT_OBSERVATION_CEILING_S if deadline is None else deadline
+        remaining_wait = max(0.0, effective_deadline - time.monotonic())
+        lock_wait = remaining_wait if wait is None else min(wait, remaining_wait)
+        if not self._lock.acquire(timeout=lock_wait):
             self._calls.busy(event, kwargs)
             return
         try:
@@ -321,18 +329,22 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             holder = "observe_pre_llm" if event == "pre_llm_call" else "observe_pre_api_request"
             with self._calls.holding(holder):
                 observer = self._turns.pre_llm if event == "pre_llm_call" else self._turns.pre_api
-                current = observer(**kwargs)
+                current = observer(deadline=effective_deadline, **kwargs)
                 identity = self._require_identity()
         finally:
             self._lock.release()
-        if current:
+        if current and time.monotonic() < effective_deadline:
             self._turns.steers(
                 kwargs.get("conversation_history"),
                 session_id=str(kwargs.get("session_id") or ""),
                 hook=event,
+                deadline=min(steer_deadline(), effective_deadline),
+                lock_deadline=effective_deadline,
                 bound=identity,
                 typed_only=True,
             )
+        elif current:
+            self._merge_gaps(("capture_gap:input_hook_deadline",))
 
     @_serialized_host_event
     def observe_post_tool_call(self, **kwargs) -> None:
