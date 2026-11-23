@@ -68,3 +68,19 @@ def test_a_reply_that_spells_the_name_out_is_recalled(app):
     )
     refs = [item["ref"] for item in _packet(core, ctx, "DLSS5到底是什么")["items"]]
     assert question.ref in refs and answer.ref in refs
+
+
+def test_opaque_session_and_hash_slugs_do_not_block_topic_memories():
+    assert identifiers_compatible(
+        "session pick mwi23qkzrwwilg inspect the cache and indexing discussion",
+        "Architecture notes for cache invalidation and indexing",
+    )
+    assert identifiers_compatible(
+        "Check commit a1b2c3d4e5f67890 for the cache key change",
+        "Notes about the cache key change",
+    )
+    assert not identifiers_compatible(
+        "Check commit a1b2c3d4e5f67890 on SR4127",
+        "Notes about SR9999",
+    )
+
