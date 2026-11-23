@@ -19,12 +19,15 @@ from typing import Any
 
 import scope_recall
 from scope_recall._version import __version__
-from scope_recall.adapters.clients.config import load_codex_config, load_shared_client
-from scope_recall.adapters.hermes.audiences import LOCAL_USER_ID
+from scope_recall.adapters.clients.config import CodexConfigError, load_codex_config, load_shared_client
+from scope_recall.adapters.hermes.audiences import LOCAL_PLATFORMS, LOCAL_USER_ID
 from scope_recall.adapters.hermes.identity import unbound_session_hint
-from scope_recall.adapters.hermes.shared_entries import read_attachment
+from scope_recall.adapters.hermes.shared_entries import read_attachment, read_shared_payload, shared_entry_manifest
 from scope_recall.adapters.hermes.unbound_sessions import owner_sessions_unbound
+from scope_recall.adapters.host_identity import HermesRuntimeScope, resolve_granted_audience
 from scope_recall.adapters.host_memory import inspect_host_memory
+from scope_recall.contracts import CLIENT_HOSTS, HOOK_CLIENT_HOSTS, ContractError
+from scope_recall.core.entry_control import account_pin, current_account_pin, local_account_matches
 from scope_recall.core.recall_policy import RecallPolicy, embedding_space_id
 from scope_recall.host_registry import ENTRY_HOSTS, HOSTS
 from scope_recall.runtime.budget_reservations import reservation_headroom
@@ -233,7 +236,12 @@ def probe_python_package(python: Path) -> dict[str, Any]:
 
 
 def load_binding(host: HostChoice, instance_root: Path):
-    """Load a binding through the same adapter and account checks the host runs."""
+    """Load a binding through the same adapter and account checks the host runs.
+
+    When a shared client entry is structurally valid and granted scopes, yet fails ``load_shared_client`` solely
+    because ``local_account_id`` is unapproved or belongs to another OS account, return the read-only diagnostic
+    binding so ``run_doctor`` can report the store's entry table alongside the account approval gap.
+    """
     profile = HOSTS[host]
     if profile.integration == "provider":
         from scope_recall.adapters.hermes.shared_entries import load_binding_for_home
@@ -242,12 +250,36 @@ def load_binding(host: HostChoice, instance_root: Path):
         return manifest.to_binding(), manifest.data_directory
 
     path = _config_path(host, instance_root)
-    config = (
-        load_codex_config(path)
-        if profile.workspace_mapping and path.name == profile.local_manifest
-        else load_shared_client(instance_root, host)
-    )
-    return config.to_binding(), config.data_directory
+    if profile.workspace_mapping and path.name == profile.local_manifest:
+        config = load_codex_config(path)
+        return config.to_binding(), config.data_directory
+    try:
+        config = load_shared_client(instance_root, host)
+        return config.to_binding(), config.data_directory
+    except CodexConfigError:
+        attachment = read_attachment(instance_root)
+        if attachment is None or attachment.host != host:
+            raise
+        manifest = shared_entry_manifest(attachment.root, attachment.entry_id, hermes_home=instance_root)
+        if manifest.entry_host != host or local_account_matches(manifest.local_account_id):
+            raise
+        scope = HermesRuntimeScope(
+            platform=host,
+            user_id=LOCAL_USER_ID,
+            chat_type="private",
+            chat_id=LOCAL_USER_ID,
+            thread_id="main",
+            agent_identity=manifest.agent_id,
+            agent_workspace="default",
+            agent_context="primary",
+            entry_id=str(manifest.entry_id),
+        )
+        audience = resolve_granted_audience(manifest, scope)
+        if not audience.allowed_scope_ids or (host in HOOK_CLIENT_HOSTS and audience.capture_scope_id is None):
+            raise
+        if not (manifest.data_directory / "memory.sqlite3").is_file():
+            raise
+        return manifest.to_binding(), manifest.data_directory
 
 
 def _ledger_headroom(ledger_path: Path | None, policy: Any, *, auxiliary=None) -> dict[str, Any]:
@@ -542,7 +574,101 @@ def _check_audiences(report: DoctorReport, instance: Path) -> None:
         )
 
 
-def _check_local_sessions(report: DoctorReport, data_directory: Path) -> None:
+_LOCAL_ROUTE_PLATFORMS = frozenset({"cli", *LOCAL_PLATFORMS, *CLIENT_HOSTS})
+
+
+def _local_account_state(pin: object) -> str:
+    """Compare a stored local_account_id against the current OS process without exposing either pin."""
+    checked = account_pin(pin)
+    if checked is None:
+        return "unapproved"
+    try:
+        current = current_account_pin()
+    except ContractError:
+        return "unavailable"
+    return "approved" if checked == current else "mismatched"
+
+
+def _entry_account_state(pin: object, audiences: object) -> str:
+    uses_local = isinstance(audiences, (list, tuple)) and any(
+        isinstance(row, dict) and row.get("platform") in _LOCAL_ROUTE_PLATFORMS for row in audiences
+    )
+    if not uses_local and account_pin(pin) is None:
+        return "not_applicable"
+    return _local_account_state(pin)
+
+
+def _check_local_account(
+    report: DoctorReport, instance: Path, binding, data_directory: Path
+) -> tuple[dict[str, str], str | None]:
+    """Read per-entry local OS account states and grade only the inspected local installation or entry."""
+    entry_accounts: dict[str, str] = {}
+    active_state: str | None = None
+    remote_forwarded = (_hermes_data_dir(instance) / "remote-server.json").is_file()
+    try:
+        if binding.installation_kind == "shared":
+            payload = read_shared_payload(data_directory)
+            for record in payload["entries"]:
+                entry_accounts[record["entry_id"]] = _entry_account_state(
+                    record.get("local_account_id"), record.get("audiences")
+                )
+            active_id = report.shared_store.get("entry_id")
+            if active_id in entry_accounts and not remote_forwarded:
+                active_state = entry_accounts[active_id]
+        elif HOSTS[report.host].integration == "provider":
+            from scope_recall.adapters.hermes.shared_entries import load_binding_for_home
+
+            manifest = load_binding_for_home(instance)
+            state = _entry_account_state(manifest.local_account_id, manifest.audiences)
+            entry_accounts = {"local": state}
+            if not remote_forwarded:
+                active_state = state
+        elif HOSTS[report.host].workspace_mapping:
+            config = load_codex_config(_config_path(report.host, instance))
+            state = _local_account_state(config.local_account_id)
+            entry_accounts = {"local": state}
+            active_state = state
+    except Exception:  # noqa: BLE001 - synthetic or broken manifests do not mask store diagnostics.
+        return {}, None
+
+    if active_state == "unapproved":
+        report.capability_gaps.append("local_account_unapproved")
+        record_check(
+            report,
+            "local_account",
+            "unapproved",
+            f"approve this OS account with scope-recall approve-local-account --host {report.host} "
+            "--instance-root <home> --yes, then start a new backend session",
+        )
+    elif active_state in {"mismatched", "unavailable"}:
+        report.capability_gaps.append("local_account_mismatch")
+        record_check(
+            report,
+            "local_account",
+            active_state,
+            "local routes are approved for another OS account; start host sessions from that account",
+        )
+    elif active_state == "approved":
+        record_check(report, "local_account", "approved")
+    return entry_accounts, active_state
+
+
+def _local_session_detail(item: dict[str, Any], *, entry: str, account_state: str | None) -> str:
+    gaps = item["gaps"]
+    if "capability_gap:local_account_binding" in gaps and account_state == "approved":
+        hint = (
+            "the local account is approved on disk; start a new backend session so the running process loads "
+            "the updated approval"
+        )
+    else:
+        hint = unbound_session_hint(item["platform"], LOCAL_USER_ID, shared_entry=bool(entry), gaps=gaps)
+    return (
+        f"{item['platform']}: the owner's sessions there bind no memory scope since {item['since']} "
+        f"({', '.join(gaps)}): {hint}"
+    )
+
+
+def _check_local_sessions(report: DoctorReport, data_directory: Path, *, account_state: str | None = None) -> None:
     """The owner's local sessions a live Hermes process bound to no scope (``adapters/hermes/unbound_sessions``).
 
     Such a session captures and recalls nothing, and the host shows no one the line the adapter writes in its log.
@@ -559,12 +685,7 @@ def _check_local_sessions(report: DoctorReport, data_directory: Path) -> None:
         report,
         "local_sessions",
         "unbound",
-        "; ".join(
-            f"{item['platform']}: the owner's sessions there bind no memory scope since {item['since']} "
-            f"({', '.join(item['gaps'])}): "
-            + unbound_session_hint(item["platform"], LOCAL_USER_ID, shared_entry=bool(entry))
-            for item in unbound
-        ),
+        "; ".join(_local_session_detail(item, entry=entry, account_state=account_state) for item in unbound),
     )
 
 
@@ -754,11 +875,39 @@ def _check_autostart(report: DoctorReport, binding, data_directory: Path) -> flo
             report.capability_gaps.extend(provider_refusals(ledger))
             report.capability_gaps.extend(pre_request_refusals(aux))
         control = read_control(runtime_config)
+        if control is None:
+            return wake_seconds
         if not control["enabled"]:
             report.autostart_status = "paused"
         elif control.get("registration") == "operator_timer":
-            # The operator's own timer runs the wake; nothing here can see it.
-            report.autostart_status = "operator_timer"
+            timer_python = control.get("python_executable")
+            timer_probe = (
+                probe_python_package(Path(timer_python))
+                if isinstance(timer_python, str) and Path(timer_python).is_absolute() and Path(timer_python).is_file()
+                else {}
+            )
+            expected_version = report.package_version or __version__
+            if not timer_probe:
+                report.autostart_status = "operator_timer_python_invalid"
+                report.capability_gaps.append("autostart_python_invalid")
+                record_check(
+                    report,
+                    "autostart",
+                    "python_invalid",
+                    "the operator timer's registered python_executable cannot import scope_recall; "
+                    "re-run scope-recall autostart plan or enable with the active environment's --python",
+                )
+            elif timer_probe["version"] != expected_version:
+                report.autostart_status = "operator_timer_version_mismatch"
+                report.capability_gaps.append("autostart_package_version_mismatch")
+                record_check(
+                    report,
+                    "autostart",
+                    "version_mismatch",
+                    f"operator timer imports {timer_probe['version']}, expected {expected_version}",
+                )
+            else:
+                report.autostart_status = "operator_timer"
         elif os.name != "nt":
             report.autostart_status = "unsupported_platform"
         else:
@@ -900,14 +1049,19 @@ def run_doctor(
         return report
     binding, data_directory = bound
     _check_audiences(report, instance)
+    entry_accounts, active_account_state = _check_local_account(report, instance, binding, data_directory)
     report.memory_import = read_progress(data_directory)
-    _check_local_sessions(report, data_directory)
+    _check_local_sessions(report, data_directory, account_state=active_account_state)
     _check_running_code(report, data_directory)
     package_health.apply_package_health(report, instance, probe)
     check_runtime_config_present(report, data_directory)
     _check_vector_threshold(report, binding, data_directory)
 
     readable = check_storage(report, binding, data_directory)
+    if entry_accounts:
+        for entry in report.entries:
+            if entry["id"] in entry_accounts:
+                entry["local_account"] = entry_accounts[entry["id"]]
     check_recall_log(report, binding, request_id=recall_request_id)
     config = _runtime_config(data_directory)
     entry_config = _entry_runtime_config(instance, data_directory)

@@ -824,3 +824,27 @@ def test_the_doctor_reports_an_operator_timer(app, monkeypatch):
     monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert result.autostart_status == "operator_timer"
+    assert "autostart_python_invalid" not in result.capability_gaps
+
+
+def test_the_doctor_flags_an_operator_timer_whose_interpreter_cannot_import_package(app, monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from scope_recall.maintenance import autostart
+
+    _core, ctx = app
+    _config_, path = _config(ctx)
+    missing_python = tmp_path / "TEST-replaced-venv" / "bin" / "python"
+    missing_python.parent.mkdir(parents=True)
+    missing_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(autostart, "_windows", lambda: False)
+    autostart.apply(autostart.plan(path, Path(missing_python), user_id=None))
+    missing_python.unlink()
+    (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
+    result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    assert result.autostart_status == "operator_timer_python_invalid"
+    assert "autostart_python_invalid" in result.capability_gaps
+    [check] = [item for item in result.checks if item["name"] == "autostart"]
+    assert check["result"] == "python_invalid"

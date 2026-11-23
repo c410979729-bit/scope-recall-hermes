@@ -284,3 +284,99 @@ def test_top_level_account_approval_command_binds_only_explicit_home(tmp_path, c
     assert maintenance_main(["approve-local-account", "--host", "hermes", "--instance-root", str(home), "--yes"]) == 0
     assert json.loads(capsys.readouterr().out)["account_bound"]
     assert resolve_runtime_audience(load_installation_manifest(home), route()).includes_owner_private
+
+
+def test_doctor_reports_entry_local_account_approval_and_running_session_hint(tmp_path, monkeypatch):
+    """Doctor surfaces unapproved/mismatched/approved entry state without exposing raw OS account pins."""
+    from scope_recall.adapters.hermes import ScopeRecallHermesAdapter
+    from scope_recall.adapters.installation import install_hermes_scope_recall
+    from scope_recall.maintenance.doctor import run_doctor
+
+    home = tmp_path / "hermes-home"
+    install_hermes_scope_recall(home, agent_id="TEST-agent")
+    manifest = load_installation_manifest(home)
+    pin = entry_control.current_account_pin()
+    write_installation_manifest(replace(manifest, local_account_id=None))
+
+    before = run_doctor(host="hermes", instance_root=home)
+    assert before.status == "degraded"
+    assert "local_account_unapproved" in before.capability_gaps
+    assert before.entries == [{"id": "local", "state": "normal", "version": 0, "local_account": "unapproved"}]
+    [account_check] = [check for check in before.checks if check["name"] == "local_account"]
+    assert account_check["result"] == "unapproved"
+    assert "approve-local-account" in account_check["detail"]
+    assert "new backend session" in account_check["detail"]
+    assert pin not in json.dumps(before.to_dict())
+
+    provider = ScopeRecallHermesAdapter()
+    provider.initialize(
+        "TEST-running-session",
+        hermes_home=str(home),
+        agent_identity="TEST-agent",
+        agent_workspace="default",
+        platform="cli",
+    )
+    try:
+        during_unbound = run_doctor(host="hermes", instance_root=home)
+        [session_check] = [check for check in during_unbound.checks if check["name"] == "local_sessions"]
+        assert "approve-local-account" in session_check["detail"]
+        assert "new backend session" in session_check["detail"]
+
+        approve("hermes", home)
+        after_approval = run_doctor(host="hermes", instance_root=home)
+        assert "local_account_unapproved" not in after_approval.capability_gaps
+        assert after_approval.entries == [{"id": "local", "state": "normal", "version": 0, "local_account": "approved"}]
+        [approved_check] = [check for check in after_approval.checks if check["name"] == "local_account"]
+        assert approved_check["result"] == "approved"
+        [stale_session_check] = [check for check in after_approval.checks if check["name"] == "local_sessions"]
+        assert "approved on disk" in stale_session_check["detail"]
+        assert "new backend session" in stale_session_check["detail"]
+        assert pin not in json.dumps(after_approval.to_dict())
+    finally:
+        provider.shutdown()
+
+    monkeypatch.setattr(entry_control, "process_account_id", other_account)
+    mismatched = run_doctor(host="hermes", instance_root=home)
+    assert mismatched.status == "degraded"
+    assert "local_account_mismatch" in mismatched.capability_gaps
+    assert mismatched.entries == [{"id": "local", "state": "normal", "version": 0, "local_account": "mismatched"}]
+
+
+def test_doctor_reports_shared_entry_local_account_without_degrading_peer_account(tmp_path):
+    """A shared store lists each entry's local_account state while grading only the inspected entry."""
+    from scope_recall.adapters.shared_entries import shared_entry_for_home
+    from scope_recall.core.storage import TrustedContext
+    from scope_recall.maintenance.doctor import run_doctor
+
+    root, payload = shared_world(tmp_path)
+    other_pin = "sid:S-1-5-21-999" if entry_control.os.name == "nt" else "uid:999999"
+    payload["entries"][0].pop("local_account_id")
+    payload["entries"][1]["local_account_id"] = other_pin
+    write_shared_payload(root, payload)
+    manifest = shared_entry_manifest(root, "first")
+    storage = SQLiteStorage(replace(manifest.to_binding(), scope_ids=frozenset(payload["scope_ids"])))
+    context = TrustedContext(storage.binding, "TEST-register", storage.binding.scope_ids, "host_generated")
+    with storage.write(context) as tx:
+        tx.registry.register_scopes(storage.binding.scope_ids)
+        for item in payload["entries"]:
+            record = shared_entry_for_home(payload, item["entry_id"], hermes_home=None)
+            tx.registry.register_entry(
+                record["entry_id"],
+                record["display_name"],
+                record["host"],
+                now=record["attached_at"],
+            )
+
+    first_before = run_doctor(host="codex", instance_root=tmp_path / "first")
+    assert first_before.status == "degraded"
+    assert "local_account_unapproved" in first_before.capability_gaps
+    by_id = {row["id"]: row["local_account"] for row in first_before.entries}
+    assert by_id == {"first": "unapproved", "second": "mismatched"}
+    assert other_pin not in json.dumps(first_before.to_dict())
+
+    approve("codex", tmp_path / "first")
+    first_after = run_doctor(host="codex", instance_root=tmp_path / "first")
+    assert "local_account_unapproved" not in first_after.capability_gaps
+    assert "local_account_mismatch" not in first_after.capability_gaps
+    by_id_after = {row["id"]: row["local_account"] for row in first_after.entries}
+    assert by_id_after == {"first": "approved", "second": "mismatched"}

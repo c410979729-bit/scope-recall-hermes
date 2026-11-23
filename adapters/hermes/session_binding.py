@@ -266,7 +266,12 @@ class SessionBinding:
             scope.platform,
             scope.user_id[:120],
             ", ".join(identity.runtime_audience.capability_gaps),
-            unbound_session_hint(scope.platform, scope.user_id, shared_entry=bool(scope.entry_id)),
+            unbound_session_hint(
+                scope.platform,
+                scope.user_id,
+                shared_entry=bool(scope.entry_id),
+                gaps=identity.runtime_audience.capability_gaps,
+            ),
         )
         _log.warning("%s", "".join(character for character in said if character.isprintable()))
 

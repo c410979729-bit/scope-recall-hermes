@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
@@ -318,14 +319,20 @@ class HermesIdentity:
         return TrustedSourcePrincipal(cast(PrincipalKind, kinds.get(origin, "unknown")), "unresolved")
 
 
-def unbound_session_hint(platform: str, user_id: str, *, shared_entry: bool) -> str:
+def unbound_session_hint(platform: str, user_id: str, *, shared_entry: bool, gaps: Sequence[str] = ()) -> str:
     """What the operator can do about a session on ``platform`` for ``user_id`` that binds no scope.
 
     ``apply-install`` approves the owner's local surface, and a login on one as the owner's own.  An entry of a shared
     store keeps its grants in the store's manifest, which ``apply-install`` refuses to write: there the owner principal
-    and its row are added with ``scope-recall grants``.  Any other route is granted by an exact audience row.  It names
-    the route, never what was said.
+    and its row are added with ``scope-recall grants``.  An unapproved local OS account requires explicit account
+    approval and a new backend session so the running provider reloads the manifest.  It names the route, never what
+    was said.
     """
+    if "capability_gap:local_account_binding" in gaps:
+        return (
+            "approve this OS account with scope-recall approve-local-account --host hermes "
+            "--instance-root <home> --yes, then start a new backend session"
+        )
     if platform in LOCAL_PLATFORMS:
         owner = user_id == LOCAL_USER_ID
         login = user_id[:240]

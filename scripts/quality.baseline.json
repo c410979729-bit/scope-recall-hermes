@@ -135,9 +135,7 @@
    "reportArgumentType": 1
   },
   "maintenance/doctor.py": {
-   "reportArgumentType": 1,
-   "reportOptionalMemberAccess": 1,
-   "reportOptionalSubscript": 2
+   "reportArgumentType": 1
   },
   "maintenance/install_codex.py": {
    "reportArgumentType": 1
