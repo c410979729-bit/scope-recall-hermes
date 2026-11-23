@@ -21,7 +21,7 @@ from .recall_channels import CLAIM_CANDIDATES as CLAIM_CANDIDATES
 from .recall_channels import DATED_CANDIDATES as DATED_CANDIDATES
 from .recall_channels import SCOPED_CANDIDATES as SCOPED_CANDIDATES
 from .recall_channels import SCOPED_WEIGHT as SCOPED_WEIGHT
-from .recall_channels import ChannelBudget, RecallChannels
+from .recall_channels import ChannelBudget, RecallChannels, _corpus_term_stats
 from .recall_channels import RetrievalClock as RetrievalClock
 from .recall_diagnostics import RecallTimings
 from .recall_needs import (
@@ -36,10 +36,13 @@ from .recall_needs import (
 )
 from .recall_overflow import visible_query_pairs
 from .recall_policy import (
+    BUILTIN_VECTOR_THRESHOLD,
+    VECTOR_SCORE_TOLERANCE,
     RecallPolicy,
     asks_without_answering,
     identifiers_compatible,
     meaningful_query_terms,
+    query_has_specific_anchor,
     rrf_score,
     same_message,
 )
@@ -191,6 +194,53 @@ class _Aside:
     held: list[CandidateRef] = field(default_factory=list)
 
 
+def _query_is_anchored(tx, query: str, *, remaining: float | None = None) -> bool:
+    """Whether ``query`` carries enough store-specific self-information to anchor cross-session raw events."""
+    freqs, corpus_size = _corpus_term_stats(tx, query, remaining=remaining)
+    return query_has_specific_anchor(query, freqs, corpus_size)
+
+
+def _ephemeral_auto_event(
+    storage_reader,
+    tx,
+    candidate: CandidateRef,
+    context: SearchContext,
+    obj: RetrievedObject,
+    question: str,
+    *,
+    policy: RecallPolicy,
+    remaining: float,
+) -> bool:
+    """Whether ``obj`` is a consolidated raw event ineligible for ambient unscoped injection."""
+    if not (
+        context.automatic_injection
+        and candidate.source != "exact_ref"
+        and obj.kind == "event"
+        and context.scope is None
+        and context.time is None
+        and remaining > 0
+    ):
+        return False
+    base = policy.vector_threshold if policy.vector_threshold is not None else BUILTIN_VECTOR_THRESHOLD
+    vscore = candidate.vector_score if isinstance(candidate.vector_score, (int, float)) else None
+    if (
+        candidate.source == "vector"
+        and vscore is not None
+        and vscore + VECTOR_SCORE_TOLERANCE >= base + 0.10
+        and obj.origin == "assistant_visible"
+        and len(obj.content) >= 60
+    ):
+        return False
+    checker = getattr(storage_reader, "consolidated_ungrounded_event", None)
+    if not callable(checker):
+        return False
+    freqs, corpus_size = _corpus_term_stats(tx, question, remaining=remaining)
+    if freqs is None:
+        return False
+    anchored = query_has_specific_anchor(question, freqs, corpus_size)
+    return bool(checker(tx, candidate, context, query_anchored=anchored, corpus_size=corpus_size))
+
+
 class RetrievalPipeline(RecallChannels):
     """Collect, hydrate, admit, and rank candidates in one read-only pass."""
 
@@ -235,16 +285,28 @@ class RetrievalPipeline(RecallChannels):
                     aside.echoes.append(candidate)
                 note_candidate(candidate, "current_prompt")
                 return None
-        if candidate.source != "exact_ref" and not _identifiers_match(tx, candidate, context, obj, question):
-            note_candidate(candidate, "identifier_mismatch")
-            return None
-        # An episode whose resume was never consolidated carries nothing but its
-        # own state: `{"state": "unknown"}` fills a packet slot and answers
-        # nothing.  Every plain chat turn opens one.  Named directly it is still
-        # delivered, because then the caller asked for that object.
-        if candidate.source != "exact_ref" and obj.kind == "episode" and _says_only_its_state(obj.content):
-            note_candidate(candidate, "empty_resume")
-            return None
+        if candidate.source != "exact_ref":
+            rejection = (
+                "identifier_mismatch"
+                if not _identifiers_match(tx, candidate, context, obj, question)
+                else "threshold"
+                if _ephemeral_auto_event(
+                    self.storage_reader,
+                    tx,
+                    candidate,
+                    context,
+                    obj,
+                    question,
+                    policy=self.policy,
+                    remaining=self._remaining(context),
+                )
+                else "empty_resume"
+                if obj.kind == "episode" and _says_only_its_state(obj.content)
+                else None
+            )
+            if rejection is not None:
+                note_candidate(candidate, rejection)
+                return None
         if context.mode == "auto" and context.in_context_since is not None and _in_context(tx, obj, context):
             # The asking model still holds everything it stands on, word for word: delivered, it would be a second copy
             # in that model's context, and take a slot from what the model does not have.  Set aside in ``aside``, it
@@ -639,7 +701,9 @@ class RetrievalPipeline(RecallChannels):
                     timings=timings,
                     release_deadline=release_deadline,
                 )
-                if len(meaningful_query_terms(working.query)) < ECHO_TURN_MIN_TERMS:
+                if len(meaningful_query_terms(working.query)) < ECHO_TURN_MIN_TERMS or not _query_is_anchored(
+                    tx, working.query, remaining=self._remaining(working)
+                ):
                     aside.echoes.clear()
                 with (
                     timings.measure("relation"),

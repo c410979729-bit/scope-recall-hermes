@@ -25,9 +25,12 @@ from ..contracts import (
 from . import lexical_index, lineage
 from .claims import canonical_time, select_effective, select_proposal
 from .delete_storage import canonical, retraction_after
+from .episodes import source_origin
 from .events import lexical_terms
 from .injection_guard import held_roots_sql
 from .recall_policy import (
+    MATURE_CORPUS_SIZE,
+    asks_without_answering,
     claim_embedding_text,
     hard_identifiers,
     meaningful_query_terms,
@@ -512,11 +515,10 @@ class RetrievalStorage(RetrievalHydration):
         return context.deadline - self.clock.monotonic()
 
     def embedded_replies(self, tx, candidates, *, searched_scopes: set[str]) -> frozenset[tuple[str, str, int]]:
-        """The keys of the event ``candidates`` the assistant wrote whose embedding is done, so the vector search
-        could have ranked them, restricted to fully searched logical scopes.
+        """The keys of embedded non-owner event ``candidates`` the completed vector search passed over.
 
-        One look-up per candidate on the queue's unique key; the state is compared outside the index so the planner
-        does not walk every finished item instead.
+        Owner messages stay exempt so multi-turn aggregation and preference statements remain reachable via lexical
+        search; expired vectors are never treated as live embeddings.
         """
         wanted = [[candidate.ref, candidate.revision] for candidate in candidates if candidate.kind == "event"]
         if not wanted or not searched_scopes:
@@ -526,10 +528,82 @@ class RetrievalStorage(RetrievalHydration):
             "ON i.work_type='embed' AND i.subject_ref=json_extract(w.value,'$[0]') "
             "AND i.subject_revision=json_extract(w.value,'$[1]') "
             "JOIN source_events e ON e.event_id=i.subject_ref AND e.source_revision=i.subject_revision "
-            f"WHERE +i.state='done' AND e.role='assistant' AND e.scope_id IN ({_marks(searched_scopes)})",
+            f"WHERE +i.state='done' AND e.role!='user' AND e.scope_id IN ({_marks(searched_scopes)}) "
+            "AND NOT EXISTS (SELECT 1 FROM expired_vectors x "
+            "WHERE x.source_ref=i.subject_ref AND x.source_revision=i.subject_revision)",
             (json.dumps(wanted), *sorted(searched_scopes)),
         )
         return frozenset(("event", ref, revision) for ref, revision in rows)
+
+    def consolidated_ungrounded_event(
+        self,
+        tx,
+        candidate: CandidateRef,
+        context: SearchContext,
+        *,
+        query_anchored: bool = True,
+        corpus_size: int = 0,
+    ) -> bool:
+        """Whether a raw event has already completed consolidation without warranting ambient re-injection.
+
+        Fresh, deferred, or failed-consolidation conversational events stay eligible so unprocessed turns remain
+        reachable. Once settled, machine/host telemetry that produced no durable object (or any cross-session
+        settled machine telemetry on a mature store), ungrounded cross-session assistant chatter under an unanchored
+        prompt, and bare cross-session user questions that grounded no durable object are excluded from automatic
+        injection; owner declarative statements stay eligible.
+        """
+        if candidate.kind != "event" or (src := tx.source(candidate.ref, candidate.revision)) is None:
+            return False
+        conn = tx._check()
+        origin = str(src.event.get("origin") or "")
+        role = str(src.event.get("role") or "")
+        same_session = src.session_id == context.trusted_context.session_id
+        machine_row = source_origin(src) in {
+            "tool_observation",
+            "host_generated",
+            "origin_unknown",
+            "memory_reinjection",
+        } or role in {"tool", "system", "unknown"}
+        adm_row = conn.execute(
+            "SELECT json_extract(extra_json,'$._scope_recall_admission.disposition') "
+            "FROM source_events WHERE event_id=? AND source_revision=?",
+            (candidate.ref, candidate.revision),
+        ).fetchone()
+        deferred = adm_row is not None and adm_row[0] == "deferred"
+        work = dict(
+            conn.execute(
+                "SELECT work_type, state FROM work_items WHERE work_type IN ('consolidate','embed') "
+                "AND subject_ref=? AND subject_revision=?",
+                (candidate.ref, candidate.revision),
+            ).fetchall()
+        )
+        states = set(work.values())
+        in_flight = deferred or bool(states.intersection({"pending", "leased"}))
+        same_session_source_only = same_session and not states and origin != "imported"
+        failed_unanchored = not machine_row and work.get("consolidate") == "failed" and query_anchored
+        if in_flight or same_session_source_only or failed_unanchored:
+            return False
+        if machine_row and corpus_size >= MATURE_CORPUS_SIZE:
+            return True
+        grounded = (
+            conn.execute(
+                "SELECT 1 FROM evidence_links WHERE source_ref=? AND source_revision=? "
+                "AND object_kind IN ('claim','reference','artifact') LIMIT 1",
+                (candidate.ref, candidate.revision),
+            ).fetchone()
+            is not None
+        )
+        if machine_row:
+            return not grounded
+        return (
+            corpus_size >= MATURE_CORPUS_SIZE
+            and not same_session
+            and not grounded
+            and (
+                (role != "user" and not query_anchored)
+                or (role == "user" and asks_without_answering(str(src.event.get("content") or "")))
+            )
+        )
 
     def epoch(self, tx) -> int:
         return tx.memory_epoch()

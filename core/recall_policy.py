@@ -54,6 +54,20 @@ BUILTIN_VECTOR_THRESHOLD = 0.66
 #: because an earlier copy of the question itself scores near 1 and would push every other hit out of a margin.
 BUILTIN_VECTOR_NEAR_RANK = 6
 BUILTIN_VECTOR_MARGIN = 0.10
+#: Minimum source count before mature-corpus statistical rules engage; smaller stores keep young-instance floors.
+MATURE_CORPUS_SIZE = 512
+#: Corpus size at which ``BUILTIN_VECTOR_THRESHOLD`` was calibrated before extreme-value cosine drift sets in.
+VECTOR_CALIBRATION_CORPUS_SIZE = 2048
+#: Minimum self-information ratio relative to a query's rarest specific term for primary anchor membership.
+AUTO_ANCHOR_INFO_RATIO = 0.88
+#: Self-information (nats) above which a specific term (~<0.055% corpus prevalence) is intrinsically a primary anchor.
+AUTO_INTRINSIC_ANCHOR_INFO = 7.5
+#: Maximum cosine margin above the vector threshold required on large stores without a lexical primary anchor.
+AUTO_STRONG_VECTOR_MARGIN = 0.06
+#: Minimum specific or total self-information (nats) to anchor cross-session raw event recall on a mature store.
+AUTO_ONGOING_SPECIFIC_INFO_FLOOR = 11.5
+AUTO_ONGOING_PEAK_INFO_FLOOR = 8.2
+AUTO_ONGOING_TOTAL_INFO_FLOOR = 45.0
 
 _WEAK_QUERY = frozenset({"那次", "那件", "那个", "这个", "怎样", "如何", "what", "that", "it"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,239}")
@@ -322,6 +336,58 @@ class RecallPolicy:
         ):
             raise ContractError("INPUT_INVALID", "owner_names")
 
+    def _vector_automatic_admission(
+        self,
+        candidate: CandidateRef,
+        query: str,
+        *,
+        term_frequencies: dict[str, int] | None,
+        corpus_size: int,
+    ) -> bool:
+        """Admit strong vector hits directly; require primary-anchor coherence in the large-corpus marginal band."""
+        score = _finite_score(candidate.vector_score)
+        if score is None or score + VECTOR_SCORE_TOLERANCE < self.auto_vector_threshold:
+            return False
+        margin = extreme_value_vector_margin(corpus_size)
+        if term_frequencies is None or margin <= 0.0:
+            return True
+        base = self.vector_threshold if self.vector_threshold is not None else BUILTIN_VECTOR_THRESHOLD
+        if score + VECTOR_SCORE_TOLERANCE >= base + margin:
+            return True
+        present, specific, anchors = query_term_information(
+            meaningful_query_terms(query), query, term_frequencies, corpus_size
+        )
+        if not specific:
+            asked = set(asked_terms(query))
+            return candidate.kind in {"claim", "procedure"} and bool(asked - set(present))
+        return bool(anchors.intersection(candidate.matched_query_terms or ()))
+
+    def _idf_lexical_admission(
+        self,
+        scope_terms: set[str] | tuple[str, ...],
+        matched: set[str],
+        query: str,
+        term_frequencies: dict[str, int],
+        corpus_size: int,
+        *,
+        dated: bool = False,
+    ) -> bool:
+        """Evaluate self-information coverage and primary-anchor presence for one query or substantive clause."""
+        present, specific, anchors = query_term_information(scope_terms, query, term_frequencies, corpus_size)
+        if not present:
+            return dated or corpus_size < MATURE_CORPUS_SIZE
+        if corpus_size >= MATURE_CORPUS_SIZE and not dated:
+            if not specific or not matched.intersection(anchors):
+                return False
+            floor = self.auto_lexical_min_coverage
+        else:
+            if specific and not matched.intersection(specific):
+                return False
+            floor = self.auto_lexical_min_coverage if specific else max(0.60, self.auto_lexical_min_coverage)
+        present_info = sum(present.values())
+        matched_info = sum(present[term] for term in matched.intersection(present))
+        return present_info > 0 and matched_info / present_info >= floor
+
     def automatic_admission(
         self,
         candidate: CandidateRef,
@@ -335,16 +401,17 @@ class RecallPolicy:
         Named references and a named day's scoped conversation are already
         narrowed by the request. Relations inherit admission from their seed.
         One-term questions may match one term; longer ones need several. When
-        corpus document frequencies are supplied, unseen terms (such as CJK
-        cross-word boundary bigrams) are excluded from the specificity bar, a
-        query with store-specific terms must match at least one of them, and
-        queries composed solely of high-frequency terms require tighter overlap.
+        corpus document frequencies are supplied, CJK boundary bigrams are
+        de-artifacted by character-cover monotonicity, mature stores require
+        primary-anchor coherence for lexical and marginal vector hits, and
+        queries composed solely of high-frequency terms cannot admit noise.
         """
         if candidate.source in {"exact_ref", "scoped", "relation"}:
             return True
         if candidate.source == "vector":
-            score = _finite_score(candidate.vector_score)
-            return score is not None and score + VECTOR_SCORE_TOLERANCE >= self.auto_vector_threshold
+            return self._vector_automatic_admission(
+                candidate, query, term_frequencies=term_frequencies, corpus_size=corpus_size
+            )
         terms = set(meaningful_query_terms(query))
         matched = terms.intersection(candidate.matched_query_terms or ())
         if not terms or len(matched) < min(len(terms), self.auto_lexical_min_terms):
@@ -359,24 +426,14 @@ class RecallPolicy:
         if not substantive_clauses and len(matched) / len(terms) < self.auto_lexical_min_coverage:
             return False
         if term_frequencies is not None and corpus_size >= 64:
-            ceiling = max(64, int(corpus_size * 0.10))
-
-            def _idf_admits(scope_terms: set[str] | tuple[str, ...]) -> bool:
-                present = {term for term in scope_terms if term_frequencies.get(term, 0) > 0}
-                if not present:
-                    return True
-                specific = {term for term in present if term_frequencies[term] < ceiling}
-                if specific and not matched.intersection(specific):
-                    return False
-                floor = self.auto_lexical_min_coverage if specific else max(0.60, self.auto_lexical_min_coverage)
-                present_info = sum(math.log((corpus_size + 1) / (term_frequencies[t] + 1)) + 1.0 for t in present)
-                matched_info = sum(
-                    math.log((corpus_size + 1) / (term_frequencies[t] + 1)) + 1.0 for t in matched.intersection(present)
-                )
-                return present_info > 0 and matched_info / present_info >= floor
-
-            whole_ok = len(matched) / len(terms) >= self.auto_lexical_min_coverage and _idf_admits(terms)
-            return whole_ok or any(_idf_admits(clause) for clause in substantive_clauses)
+            is_dated = candidate.source == "dated"
+            whole_ok = len(matched) / len(terms) >= self.auto_lexical_min_coverage and self._idf_lexical_admission(
+                terms, matched, query, term_frequencies, corpus_size, dated=is_dated
+            )
+            return whole_ok or any(
+                self._idf_lexical_admission(clause, matched, query, term_frequencies, corpus_size, dated=is_dated)
+                for clause in substantive_clauses
+            )
         return True
 
     def vector_best(self, candidates) -> float | None:
@@ -760,6 +817,143 @@ def meaningful_query_terms(query: str) -> tuple[str, ...]:
 
     return tuple(
         term for term in query_terms(query) if term not in _WEAK_QUERY and len(term) > 1 and not _asks_only(term)
+    )
+
+
+def cjk_run_bigrams(text: str, *, limit: int = 256) -> tuple[str, ...]:
+    """Bounded overlapping 2-character bigrams across contiguous CJK runs in NFKC-normalized ``text``."""
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    seen: dict[str, None] = {}
+    for run in CJK_RUN.findall(normalized):
+        for index in range(len(run) - 1):
+            seen.setdefault(run[index : index + 2], None)
+            if len(seen) >= limit:
+                return tuple(seen)
+    return tuple(seen)
+
+
+def word_document_frequencies(query: str, raw_frequencies: dict[str, int]) -> dict[str, int]:
+    """Bound length-1 and length-2 interior CJK cross-word bridge valleys without segmentation dictionaries.
+
+    Two adjacent words separated by zero characters form one bridge bigram ``b_i`` bounded by
+    ``min(df(b_{i-1}), df(b_{i+1}))``; separated by a single particle or conjunction character they form a
+    two-bigram valley ``(b_i, b_{i+1})`` bounded by ``min(df(b_{i-1}), df(b_{i+2}))``. A genuine two-character
+    rare word spans three low-frequency bigrams, so its core bigram retains its rarity, as do three-character
+    proper names and prefix/suffix compounds.
+    """
+    adjusted = dict(raw_frequencies)
+    normalized = unicodedata.normalize("NFKC", query).casefold()
+    for run in CJK_RUN.findall(normalized):
+        if len(run) < 3:
+            continue
+        if len(run) == 3:
+            b0, b1 = run[:2], run[1:3]
+            v0, v1 = raw_frequencies.get(b0, 0), raw_frequencies.get(b1, 0)
+            if v0 > 0 and v1 > 0:
+                geo = math.isqrt(v0 * v1)
+                adjusted[b0] = max(v0, v1 if v1 >= 16 * v0 else geo)
+                adjusted[b1] = max(v1, geo)
+            continue
+        count = len(run) - 1
+        vals = [raw_frequencies.get(run[index : index + 2], 0) for index in range(count)]
+        bound = list(vals)
+        if vals[1] >= 4 * max(vals[0], vals[2], 1):
+            bound[0] = max(bound[0], vals[1])
+        if vals[-2] >= 4 * max(vals[-1], vals[-3], 1):
+            bound[-1] = max(bound[-1], vals[-2])
+        for index in range(1, count - 1):
+            bound[index] = max(bound[index], min(vals[index - 1], vals[index + 1]))
+        for index in range(1, count - 2):
+            pair_cap = min(vals[index - 1], vals[index + 2])
+            bound[index] = max(bound[index], pair_cap)
+            bound[index + 1] = max(bound[index + 1], pair_cap)
+        for index in range(count):
+            if vals[index] > 0:
+                adjusted[run[index : index + 2]] = bound[index]
+    return adjusted
+
+
+def ubiquity_ceiling(corpus_size: int) -> int:
+    """Sublinear Heaps'-law document-frequency ceiling separating ubiquitous vocabulary from store-specific terms."""
+    if corpus_size <= 0:
+        return 64
+    return max(64, int(min(corpus_size * 0.10, 5.0 * math.sqrt(corpus_size))))
+
+
+def _is_cjk_bigram(term: str) -> bool:
+    return len(term) == 2 and CJK_RUN.fullmatch(term) is not None
+
+
+def _independent_specific_sum(query: str, present: dict[str, float], specific: set[str]) -> float:
+    """Sum specific self-information without double-counting adjacent overlapping bigrams in the same CJK run."""
+    cjk_specific = {term for term in specific if _is_cjk_bigram(term)}
+    total = sum(present[term] for term in specific - cjk_specific)
+    if not cjk_specific:
+        return total
+    normalized = unicodedata.normalize("NFKC", query).casefold()
+    accounted: set[str] = set()
+    for run in CJK_RUN.findall(normalized):
+        prev2, prev1 = 0.0, 0.0
+        for index in range(len(run) - 1):
+            bigram = run[index : index + 2]
+            weight = present[bigram] if bigram in cjk_specific and bigram not in accounted else 0.0
+            if weight > 0.0:
+                accounted.add(bigram)
+            prev2, prev1 = prev1, max(prev1, prev2 + weight)
+        total += prev1
+    total += sum(present[term] for term in cjk_specific - accounted)
+    return total
+
+
+def extreme_value_vector_margin(corpus_size: int) -> float:
+    """Scale-aware cosine margin above the calibration threshold as corpus size grows beyond ``2048``."""
+    if corpus_size <= VECTOR_CALIBRATION_CORPUS_SIZE:
+        return 0.0
+    return min(AUTO_STRONG_VECTOR_MARGIN, 0.012 * math.log(corpus_size / VECTOR_CALIBRATION_CORPUS_SIZE))
+
+
+def query_term_information(
+    scope_terms: Iterable[str],
+    query: str,
+    term_frequencies: dict[str, int],
+    corpus_size: int,
+) -> tuple[dict[str, float], set[str], set[str]]:
+    """Return ``(present_weights, specific_terms, primary_anchors)`` over observed store terms."""
+    adjusted = word_document_frequencies(query, term_frequencies)
+    ceiling = ubiquity_ceiling(corpus_size)
+    mature = corpus_size >= MATURE_CORPUS_SIZE
+    smoothing = 1e-6 if mature else 1.0
+    present: dict[str, float] = {}
+    for term in set(scope_terms):
+        df = adjusted.get(term, 0)
+        if df > 0:
+            present[term] = math.log((corpus_size + 1) / (df + 1)) + smoothing
+    specific = {term for term in present if adjusted.get(term, 0) < ceiling}
+    peak = max((present[term] for term in specific), default=0.0)
+    intrinsic = min(AUTO_INTRINSIC_ANCHOR_INFO, 0.58 * math.log(max(2, corpus_size + 1)))
+    anchor_floor = min(intrinsic, AUTO_ANCHOR_INFO_RATIO * peak)
+    anchors = {term for term in specific if present[term] >= anchor_floor} if peak > 0.0 else set()
+    return present, specific, anchors
+
+
+def query_has_specific_anchor(query: str, term_frequencies: dict[str, int] | None, corpus_size: int) -> bool:
+    """Whether ``query`` carries sufficient scale-normalized self-information to anchor cross-session raw events."""
+    if term_frequencies is None or corpus_size < MATURE_CORPUS_SIZE:
+        return True
+    all_terms = meaningful_query_terms(query)
+    if not all_terms:
+        return any(char.isalpha() and not char.isascii() and CJK_RUN.fullmatch(char) is None for char in query)
+    content_terms = asked_terms(query) or all_terms
+    present, specific, _anchors = query_term_information(content_terms, query, term_frequencies, corpus_size)
+    spec_sum = _independent_specific_sum(query, present, specific)
+    spec_peak = max((present[term] for term in specific), default=0.0)
+    all_present, _all_spec, _all_anc = query_term_information(all_terms, query, term_frequencies, corpus_size)
+    total_info = sum(all_present.values())
+    scale = math.log(corpus_size + 1)
+    return (
+        spec_sum >= min(AUTO_ONGOING_SPECIFIC_INFO_FLOOR, 0.89 * scale)
+        or spec_peak >= min(AUTO_ONGOING_PEAK_INFO_FLOOR, 0.63 * scale)
+        or total_info >= min(AUTO_ONGOING_TOTAL_INFO_FLOOR, 3.5 * scale)
     )
 
 

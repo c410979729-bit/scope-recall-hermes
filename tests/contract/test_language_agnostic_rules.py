@@ -15,8 +15,16 @@ from scope_recall.core.entity_resolution import (
     publish_entity_merge,
 )
 from scope_recall.core.evidence_support import SupportVerdict, using_support
-from scope_recall.core.recall_policy import RecallPolicy, meaningful_query_terms
-from scope_recall.core.retrieval import CandidateRef
+from scope_recall.core.recall_channels import _matched_statement_terms
+from scope_recall.core.recall_policy import (
+    RecallPolicy,
+    meaningful_query_terms,
+    query_has_specific_anchor,
+    query_term_information,
+    ubiquity_ceiling,
+    word_document_frequencies,
+)
+from scope_recall.core.retrieval import CandidateRef, RetrievedObject
 from scope_recall.core.review_policy import set_policy
 from scope_recall.core.semantic_proposals import prepare_publication, prepare_support, validate_judgement
 from v11_support import recall_request
@@ -510,3 +518,261 @@ def test_retire_invalid_aliases_previews_read_only_and_preserves_owner_approved_
     assert _latest_version(core, ctx, bad_saved.ref).state == "retracted"
     assert core.current_claim(ctx, approved.ref) is not None
     assert core.current_claim(ctx, mgmt_merged) is not None
+
+
+def test_cjk_boundary_monotonicity_and_sublinear_ubiquity_separate_noise_without_wordlists():
+    corpus_size = 400_000
+    ceiling = ubiquity_ceiling(corpus_size)
+    assert 3_000 <= ceiling <= 3_500
+
+    steering = "目前什么进度了，下一步应该做什么？"
+    raw = {
+        "目前": 5600,
+        "前什": 420,
+        "什么": 12000,
+        "么进": 95,
+        "进度": 4200,
+        "度了": 310,
+        "下一": 6000,
+        "一步": 5500,
+        "步应": 170,
+        "应该": 3800,
+        "该做": 490,
+        "做什": 1080,
+    }
+    adjusted = word_document_frequencies(steering, raw)
+    assert adjusted["步应"] >= 3800
+    assert query_has_specific_anchor(steering, raw, corpus_size) is False
+
+    compound = "项目甲的偏好是什么？"
+    compound_raw = {
+        "项目": 20000,
+        "目甲": 3,
+        "甲的": 2,
+        "的偏": 50,
+        "偏好": 4000,
+        "好是": 100,
+        "是什": 2000,
+        "什么": 12000,
+    }
+    _cpresent, cspecific, canchors = query_term_information(
+        meaningful_query_terms(compound), compound, compound_raw, corpus_size
+    )
+    assert "目甲" in cspecific
+    assert "目甲" in canchors
+    assert query_has_specific_anchor(compound, compound_raw, corpus_size) is True
+    policy = RecallPolicy(vector_threshold=0.70)
+    compound_claim = CandidateRef(
+        "claim", "claim-TEST-cmp", 1, "claim_lexical", matched_query_terms=("项目", "目甲", "偏好")
+    )
+    assert policy.automatic_admission(compound_claim, compound, term_frequencies=compound_raw, corpus_size=corpus_size)
+
+    assert query_has_specific_anchor("What is Quasar991?", {"quasar991": 1}, 600) is True
+    assert query_has_specific_anchor("デプロイ先はどこですか？", {}, 400_000) is True
+
+    dated_cand = CandidateRef("event", "event-TEST-dated", 1, "dated", matched_query_terms=("测试", "结果"))
+    assert (
+        policy.automatic_admission(
+            dated_cand, "测试结果是什么？", term_frequencies={"测试": 20000, "结果": 15000}, corpus_size=corpus_size
+        )
+        is True
+    )
+
+    proc_obj = RetrievedObject(
+        kind="procedure",
+        ref="claim-TEST-proc",
+        revision=1,
+        content=json.dumps(
+            {
+                "kind": "procedure",
+                "subject": "ScopeRecall",
+                "predicate": "部署步骤",
+                "value_text": "先备份再平滑重启",
+                "conditions": [],
+                "entity_names": ["天璇网关"],
+                "procedure": {"steps": ["backup"], "verification_basis": "doctor"},
+            },
+            ensure_ascii=False,
+        ),
+        origin="human_direct",
+        temporal_status="current",
+        applicability="trusted scope",
+        evidence_refs=("event-TEST-1@1",),
+        basis="direct_report",
+        expandable=True,
+    )
+    assert "天璇" in _matched_statement_terms("天璇网关的部署步骤 verification_basis", proc_obj)
+    assert "verification_basis" not in _matched_statement_terms("天璇网关的部署步骤 verification_basis", proc_obj)
+
+    obs_payload = {
+        "kind": "observation",
+        "subject": "天枢实例",
+        "predicate": "端口规律",
+        "value_text": "监听 8652",
+        "conditions": [],
+        "entity_names": ["Port8652"],
+    }
+    obs_obj = RetrievedObject(
+        kind="claim",
+        ref="claim-TEST-obs",
+        revision=1,
+        content="Inductive observation (not the owner's words): 监听 8652",
+        origin="inductive_observation",
+        temporal_status="current",
+        applicability="trusted scope",
+        evidence_refs=("event-TEST-2@1",),
+        basis="observed",
+        expandable=False,
+        metadata=(("payload_json", json.dumps(obs_payload, ensure_ascii=False)),),
+    )
+    assert "天枢" in _matched_statement_terms("天枢实例 Port8652 监听什么", obs_obj)
+    assert "port8652" in _matched_statement_terms("天枢实例 Port8652 监听什么", obs_obj)
+
+    target = "所有私钥和凭据应该存放在哪里"
+    target_raw = {
+        "所有": 7800,
+        "有私": 80,
+        "私钥": 850,
+        "钥和": 9,
+        "和凭": 140,
+        "凭据": 5800,
+        "据应": 35,
+        "应该": 3800,
+        "该存": 28,
+        "存放": 2400,
+        "放在": 2400,
+        "在哪": 2100,
+        "哪里": 1280,
+    }
+    _tpresent, tspecific, tanchors = query_term_information(
+        meaningful_query_terms(target), target, target_raw, corpus_size
+    )
+    assert "私钥" in tspecific
+    assert "私钥" in tanchors
+    assert query_has_specific_anchor(target, target_raw, corpus_size) is True
+
+
+@pytest.mark.parametrize(
+    "prompt,freqs",
+    [
+        ("开始吧", {"开始": 6400}),
+        ("善，依汝所言", {"依汝": 0, "汝所": 0, "所言": 4100}),
+        ("Proceed as you see fit", {"proceed": 3800, "as": 25000, "you": 11000, "see": 8400, "fit": 4200}),
+        ("今の進捗はどう？", {"進捗": 0}),
+    ],
+)
+def test_multilingual_unanchored_prompts_fail_mature_anchor_and_lexical_admission(prompt, freqs):
+    policy = RecallPolicy(vector_threshold=0.70)
+    corpus_size = 400_000
+    assert query_has_specific_anchor(prompt, freqs, corpus_size) is False
+    terms = meaningful_query_terms(prompt)
+    candidate = CandidateRef("event", "event-TEST-steer", 1, "lexical", matched_query_terms=terms)
+    assert policy.automatic_admission(candidate, prompt, term_frequencies=freqs, corpus_size=corpus_size) is False
+
+
+def test_mature_marginal_vector_requires_primary_anchor_while_strong_paraphrase_passes():
+    policy = RecallPolicy(vector_threshold=0.70)
+    corpus_size = 400_000
+    query = "帮我写一个二分查找的边界测试用例"
+    freqs = {
+        "帮我": 2480,
+        "我写": 389,
+        "写一": 1218,
+        "一个": 19400,
+        "个二": 110,
+        "二分": 32,
+        "分查": 19,
+        "查找": 417,
+        "找的": 104,
+        "的边": 698,
+        "边界": 8800,
+        "界测": 108,
+        "测试": 22500,
+        "试用": 681,
+        "用例": 1200,
+    }
+    marginal_noise = CandidateRef(
+        "event",
+        "event-TEST-boundary",
+        1,
+        "vector",
+        vector_id="vec-1",
+        embedding_space=policy.embedding_space_id,
+        vector_score=0.747,
+        matched_query_terms=("边界", "测试", "用例"),
+    )
+    assert policy.automatic_admission(marginal_noise, query, term_frequencies=freqs, corpus_size=corpus_size) is False
+
+    marginal_anchored = replace(marginal_noise, matched_query_terms=("二分", "查找", "边界"))
+    assert policy.automatic_admission(marginal_anchored, query, term_frequencies=freqs, corpus_size=corpus_size) is True
+
+    strong_paraphrase = replace(marginal_noise, vector_score=0.78, matched_query_terms=())
+    assert policy.automatic_admission(strong_paraphrase, query, term_frequencies=freqs, corpus_size=corpus_size) is True
+
+
+def test_consolidated_ungrounded_tool_event_stays_out_of_auto_recall_while_fresh_and_explicit_pass(app):
+    core, ctx = app
+    tool_ctx = replace(ctx, actor_origin="tool_observation")
+    fresh_tool = capture(
+        core,
+        tool_ctx,
+        "TEST-Quasar991 diagnostic output confirmed gateway port 19442 active.",
+        origin="tool_observation",
+    )
+    probe = capture(core, ctx, "What port did TEST-Quasar991 report?")
+    before = core.recall(
+        ctx,
+        recall_request(query="TEST-Quasar991 gateway port", mode="auto"),
+        current_source_refs=(f"{probe.ref}@{probe.revision}",),
+    )
+    assert any(item.ref == fresh_tool.ref for item in before.items)
+
+    with core.storage.write(ctx) as tx:
+        conn = tx._check()
+        conn.execute(
+            "UPDATE work_items SET state='done' WHERE work_type IN ('consolidate','embed') "
+            "AND subject_ref=? AND subject_revision=?",
+            (fresh_tool.ref, fresh_tool.revision),
+        )
+
+    after_auto = core.recall(
+        ctx,
+        recall_request(query="TEST-Quasar991 gateway port", mode="auto"),
+        current_source_refs=(f"{probe.ref}@{probe.revision}",),
+    )
+    assert all(item.ref != fresh_tool.ref for item in after_auto.items)
+
+    after_explicit = core.recall(
+        ctx,
+        recall_request(query="TEST-Quasar991 gateway port", mode="current"),
+        current_source_refs=(f"{probe.ref}@{probe.revision}",),
+    )
+    assert any(item.ref == fresh_tool.ref for item in after_explicit.items)
+
+
+def test_unseen_paraphrase_terms_and_edge_clitics_do_not_starve_real_anchors():
+    policy = RecallPolicy(vector_threshold=0.70)
+    corpus_size = 400_000
+    english = "Where should you book me when I need to concentrate?"
+    en_freqs = {"book": 12, "me": 15000, "when": 9000, "need": 6500, "concentrate": 0}
+    present, _spec, anchors = query_term_information(meaningful_query_terms(english), english, en_freqs, corpus_size)
+    assert "concentrate" not in present
+    assert "book" in anchors
+    hit = CandidateRef("claim", "claim-TEST-book", 1, "lexical", matched_query_terms=("book", "me"))
+    assert policy.automatic_admission(hit, english, term_frequencies=en_freqs, corpus_size=corpus_size) is True
+
+    edge = "Hermes 升级 wheel 时怎么平滑切换"
+    edge_freqs = {
+        "hermes": 850,
+        "升级": 1400,
+        "wheel": 620,
+        "时怎": 18,
+        "怎么": 9200,
+        "么平": 2,
+        "平滑": 340,
+        "滑切": 190,
+        "切换": 980,
+    }
+    _ep, _espec, edge_anchors = query_term_information(meaningful_query_terms(edge), edge, edge_freqs, corpus_size)
+    assert "时怎" not in edge_anchors
+    assert "滑切" in edge_anchors

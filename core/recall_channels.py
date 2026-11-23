@@ -11,13 +11,24 @@ from typing import Any, Protocol, cast
 
 from ..contracts import ContractError
 from . import lexical_index
-from .deadline import RequestDeadline, using_request_deadline
+from .deadline import RequestDeadline, current_request_deadline, using_request_deadline
 from .events import lexical_terms
 from .owner_view import OwnerView, owner_names, owner_view
 from .recall_needs import statement_text
-from .recall_policy import RecallPolicy, hard_identifiers, meaningful_query_terms, rrf_score
+from .recall_policy import (
+    BUILTIN_VECTOR_THRESHOLD,
+    VECTOR_SCORE_TOLERANCE,
+    RecallPolicy,
+    cjk_run_bigrams,
+    claim_embedding_text,
+    extreme_value_vector_margin,
+    hard_identifiers,
+    meaningful_query_terms,
+    rrf_score,
+    synonym_expansions,
+)
 from .recall_trace import note_candidate
-from .retrieval import CandidateRef, SearchContext, SearchLimits
+from .retrieval import CandidateRef, SearchContext, SearchLimits, optional_json
 from .retrieval_storage import RetrievalStorage
 from .vector_failure import note_embedding_failure, vector_failure_label
 
@@ -65,29 +76,108 @@ _VECTOR_REJECTION_GAPS = {
 _VECTOR_SILENT_REJECTIONS = frozenset({"vector_below_threshold", "vector_id_missing", "vector_score_invalid"})
 
 
-def _corpus_term_stats(tx: Any, question: str) -> tuple[dict[str, int] | None, int]:
-    """Read and cache per-term document frequency and exact source count once per recall snapshot."""
+_STAT_TERM_CAP = 256
+_STAT_POSTING_CAP = 20_000
+
+
+def _deadline_expired(remaining: float | None = None) -> bool:
+    if remaining is not None and remaining <= 0:
+        return True
+    active = current_request_deadline()
+    return active is not None and active.remaining() <= 0
+
+
+def _corpus_term_stats(tx: Any, question: str, *, remaining: float | None = None) -> tuple[dict[str, int] | None, int]:
+    """Read and cache bounded per-term document frequency and source count within the request deadline."""
     if not hasattr(tx, "_check") or not hasattr(tx, "remembered"):
         return None, 0
+    cache = getattr(tx, "_cache", None)
+    if _deadline_expired(remaining) and (not isinstance(cache, dict) or ("lexical_corpus_size",) not in cache):
+        return None, 0
+    conn = tx._check()
+    total = int(
+        tx.remembered(
+            ("lexical_corpus_size",),
+            lambda: int(conn.execute("SELECT COUNT(*) FROM source_events").fetchone()[0] or 0),
+        )
+    )
+    if total < 64:
+        return {}, total
     terms = meaningful_query_terms(question)
     if not terms:
-        return {}, 0
+        return {}, total
+    all_terms = tuple(dict.fromkeys((*terms, *cjk_run_bigrams(question, limit=_STAT_TERM_CAP))))[:_STAT_TERM_CAP]
+    key = ("auto_term_stats", all_terms)
+    if _deadline_expired(remaining) and (not isinstance(cache, dict) or key not in cache):
+        return None, 0
+    cap = min(max(64, total + 1), _STAT_POSTING_CAP)
+    freqs: dict[str, int] = tx.remembered(key, lambda: lexical_index.document_frequency(conn, all_terms, limit=cap))
+    return freqs, total
 
-    def load() -> tuple[dict[str, int], int]:
-        conn = tx._check()
-        total = int(
-            tx.remembered(
-                ("lexical_corpus_size",),
-                lambda: int(conn.execute("SELECT COUNT(*) FROM source_events").fetchone()[0] or 0),
-            )
+
+def _has_rare_identifier(tx: Any, question: str, *, remaining: float | None = None) -> bool:
+    """Whether ``question`` names a store-specific identifier rather than a ubiquitous technical token."""
+    identifiers = tuple(sorted(hard_identifiers(question)))[:_STAT_TERM_CAP]
+    if not identifiers:
+        return False
+    if not hasattr(tx, "_check") or not hasattr(tx, "remembered") or _deadline_expired(remaining):
+        return True
+    conn = tx._check()
+    total = int(
+        tx.remembered(
+            ("lexical_corpus_size",),
+            lambda: int(conn.execute("SELECT COUNT(*) FROM source_events").fetchone()[0] or 0),
         )
-        if total < 64:
-            return {}, total
-        freqs = lexical_index.document_frequency(conn, terms, limit=max(64, total + 1))
-        return freqs, total
+    )
+    if total < 64:
+        return True
+    cap = max(16, int(total * 0.002))
+    freqs: dict[str, int] = tx.remembered(
+        ("identifier_term_freqs", identifiers),
+        lambda: lexical_index.document_frequency(conn, identifiers, limit=cap + 1),
+    )
+    return any(freqs.get(identifier, 0) < cap for identifier in identifiers)
 
-    stats: tuple[dict[str, int], int] = tx.remembered(("auto_term_stats", terms), load)
-    return stats
+
+def _claim_statement_for_matching(obj: Any) -> str:
+    """Render claim or procedure payload text and entity names without exposing raw JSON field keys."""
+    kind = getattr(obj, "kind", "")
+    raw_meta = dict(getattr(obj, "metadata", ())).get("payload_json")
+    payload = optional_json(raw_meta) if raw_meta else None
+    if not isinstance(payload, dict) and kind in {"claim", "procedure"}:
+        payload = optional_json(getattr(obj, "content", ""))
+    if not isinstance(payload, dict):
+        return statement_text(obj)
+    try:
+        base = claim_embedding_text(payload)
+    except ContractError:
+        base = " ".join(str(payload.get(field, "")) for field in ("subject", "predicate", "value_text", "conditions"))
+    entities = payload.get("entity_names")
+    if isinstance(entities, list):
+        extra = " ".join(str(item) for item in entities if item)
+        if extra:
+            return f"{base} {extra}"
+    return base
+
+
+def _matched_statement_terms(question: str, obj: Any) -> tuple[str, ...]:
+    """Query terms (including credited synonyms) matched by ``obj``'s statement text and entity labels."""
+    if obj is None:
+        return ()
+    hits = set(meaningful_query_terms(question))
+    if not hits:
+        return ()
+    text = (
+        _claim_statement_for_matching(obj)
+        if getattr(obj, "kind", "") in {"claim", "procedure"}
+        else statement_text(obj)
+    )
+    present = set(lexical_terms(text))
+    matched = hits.intersection(present)
+    for syn_term, original in synonym_expansions(question).items():
+        if syn_term in present and original in hits:
+            matched.add(original)
+    return tuple(sorted(matched))
 
 
 def _note_below_floor(gaps: list[str], channel: str) -> None:
@@ -374,23 +464,40 @@ class RecallChannels:
         """Apply the channel floor before fusion and relation expansion.
 
         Storage reports lexical matches, including credited synonyms. Ports
-        without those matches are checked against their hydrated statement.
-        Rejections count channel candidates, once per collection round.
+        without those matches, and marginal vector hits on mature stores, are
+        checked against their hydrated statement. Rejections count channel
+        candidates, once per collection round.
         """
         question = self._admission_query(context)
         if candidate.source == "dated" and context.time is not None:
             question = context.time.rest
         freqs: dict[str, int] | None = None
         corpus_size = 0
-        if candidate.source not in {"vector", "exact_ref", "scoped", "relation"}:
+        if candidate.source == "vector":
+            freqs, corpus_size = _corpus_term_stats(tx, question, remaining=self._remaining(context))
+            base = (
+                self.policy.vector_threshold if self.policy.vector_threshold is not None else BUILTIN_VECTOR_THRESHOLD
+            )
+            score = candidate.vector_score if isinstance(candidate.vector_score, (int, float)) else None
+            margin = extreme_value_vector_margin(corpus_size)
+            if (
+                freqs is not None
+                and margin > 0.0
+                and score is not None
+                and score + VECTOR_SCORE_TOLERANCE < base + margin
+                and candidate.matched_query_terms is None
+            ):
+                if self._remaining(context) <= 0:
+                    return False
+                obj = self.storage_reader.hydrate(tx, candidate, context)
+                candidate = replace(candidate, matched_query_terms=_matched_statement_terms(question, obj))
+        elif candidate.source not in {"exact_ref", "scoped", "relation"}:
             if candidate.matched_query_terms is None:
                 if self._remaining(context) <= 0:
                     return False
                 obj = self.storage_reader.hydrate(tx, candidate, context)
-                hits = meaningful_query_terms(question)
-                matched = set(hits).intersection(lexical_terms(statement_text(obj))) if obj is not None else set()
-                candidate = replace(candidate, matched_query_terms=tuple(sorted(matched)))
-            freqs, corpus_size = _corpus_term_stats(tx, question)
+                candidate = replace(candidate, matched_query_terms=_matched_statement_terms(question, obj))
+            freqs, corpus_size = _corpus_term_stats(tx, question, remaining=self._remaining(context))
         if self.policy.automatic_admission(candidate, question, term_frequencies=freqs, corpus_size=corpus_size):
             return True
         note_candidate(candidate, "threshold")
@@ -435,23 +542,24 @@ class RecallChannels:
     def _outside_vector_pool(
         self, tx, candidates: list[CandidateRef], context: SearchContext, pool: _VectorPool | None
     ) -> frozenset[tuple[str, str, int]]:
-        """Embedded assistant lexical hits absent from the finite vector pool in fully searched scopes.
+        """Embedded non-owner lexical hits absent from the finite vector pool in fully searched scopes.
 
-        Absence is a ranking signal, not proof of irrelevance: a question about an earlier assistant reply can lose
-        its answer here. Explicit lookup retains it. Unchecked scopes cannot supply this negative signal.
-
-        The owner's own messages stay: an aggregate question ("how many times did I ...") is answered by many of
-        them that its words find and its meaning ranks too low.  So does a reply not embedded yet (a message said a
-        moment ago is found by its words), and every hit when the vector search did not run or the question names an
-        identifier, which words find and meaning does not.
+        Non-owner events (assistant replies, tool outputs, system events) with live embeddings are dropped when the
+        completed vector search passed them over, unless a store-specific identifier is named. Owner messages stay
+        exempt because aggregate and preference questions are answered across many owner statements that lexical
+        search finds outside the finite vector pool.
         """
         reader = getattr(self.storage_reader, "embedded_replies", None)
-        if pool is None or not pool.searched_scopes or not callable(reader):
+        remaining = self._remaining(context)
+        if pool is None or not pool.searched_scopes or not callable(reader) or remaining <= 0:
             return frozenset()
         loose = [
             candidate for candidate in candidates if candidate.source == "lexical" and candidate.key not in pool.keys
         ]
-        if not loose or hard_identifiers(self._admission_query(context)):
+        question = self._admission_query(context)
+        if not loose or _has_rare_identifier(tx, question, remaining=remaining):
+            return frozenset()
+        if self._remaining(context) <= 0:
             return frozenset()
         outside = cast(frozenset[tuple[str, str, int]], reader(tx, loose, searched_scopes=pool.searched_scopes))
         for candidate in loose:
@@ -512,13 +620,15 @@ class RecallChannels:
         interruptible = callable(getattr(conn, "set_progress_handler", None))
         if interruptible:
             conn.set_progress_handler(lambda: 1 if self._remaining(context) <= 0 else 0, _INTERRUPT_STEPS)
+        stopped_early = False
         try:
             for channel, loader, limit in channels:
                 if loader is None:
                     continue
                 if self._remaining(context) <= 0:
                     gaps.append("deadline_exceeded_collect")
-                    return admitted()
+                    stopped_early = True
+                    break
                 allowance = budget.allowance(channel, limit)
                 if allowance <= 0:
                     continue
@@ -531,13 +641,16 @@ class RecallChannels:
             # Only the interrupt is the deadline; a locked store past it is still reported as the error it is.
             if interruptible and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
                 gaps.append("deadline_exceeded_collect")
-                return admitted()
-            gaps.append(f"sqlite_candidate_error:{type(exc).__name__}")
+                stopped_early = True
+            else:
+                gaps.append(f"sqlite_candidate_error:{type(exc).__name__}")
         except Exception as exc:
             gaps.append(f"sqlite_candidate_error:{type(exc).__name__}")
         finally:
             if interruptible:
                 conn.set_progress_handler(None, 0)
+        if stopped_early:
+            return admitted()
         if self._remaining(context) <= 0:
             gaps.append("deadline_exceeded_collect")
             return admitted()
