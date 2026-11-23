@@ -143,11 +143,15 @@ def _read_offline_store(source: Path):
         raise BackupError("store lock files must not be symlinks or reparse points")
     with exclusive_store(source.parent, busy=lambda _reason: BackupError("store is busy: stop all store processes")):
         before = _offline_file(source)
-        # Compute the source digest before acquiring the Windows 1 GiB mandatory byte lock so multi-gigabyte
-        # files hash cleanly, then bind the exclusive pager lock to the exact stat revision read above.
-        source_digest = sha256(source)
-        _unchanged(source, before)
+        # On Windows, hash before the 1 GiB mandatory byte lock so multi-gigabyte files read cleanly.
+        # On POSIX, never open/close a descriptor for ``source`` in this process before the child acquires
+        # ``LOCK_EX``, because closing any descriptor to the inode would release an in-process SQLite fcntl lock.
+        source_digest = sha256(source) if os.name == "nt" else None
+        if source_digest is not None:
+            _unchanged(source, before)
         with _exclusive_pager(source, before) as owner:
+            if source_digest is None:
+                source_digest = sha256(source)
 
             def check_source() -> None:
                 if owner.poll() is not None:
