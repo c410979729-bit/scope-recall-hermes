@@ -1039,3 +1039,50 @@ def test_mcp_illegal_protocol_values_rejected_and_legal_strict_path_kept(tmp_pat
                 assert extra.is_error
 
     asyncio.run(run())
+
+
+def test_mcp_recall_description_and_no_match_fallback_hint(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from scope_recall.adapters.clients.config import install_codex_scope_recall
+    from scope_recall.adapters.clients.mcp_server import CodexMCPServer
+    from scope_recall.adapters.tool_common import NO_MATCH_FALLBACK_HINT
+    from scope_recall.contracts import validate_payload
+
+    project = tmp_path / "project"
+    project.mkdir()
+    config, core = install_codex_scope_recall(tmp_path / "install", project_root=project)
+    server = CodexMCPServer(config, workspace=project, core=core)
+    tool = server.server._tool_manager.get_tool("recall")
+    assert tool is not None
+    assert tool.description.startswith("Use before answering any question that involves the past:")
+    assert "transcript search" in tool.description
+
+    fake_ctx = SimpleNamespace(request_context=SimpleNamespace(meta={}))
+    reply = tool.fn(
+        fake_ctx,
+        protocol_version="1.1",
+        query="TEST-unmatched-mcp-recall-nebula",
+        mode="current",
+        max_items=6,
+        budget_tokens=1200,
+    )
+    packet = reply["result"]
+    assert packet["status"] == "no_match"
+    assert NO_MATCH_FALLBACK_HINT in packet["unmet_needs"]
+    validate_payload("recall_packet", packet)
+
+    from scope_recall.core.recall_budget import canonical_render_json, estimate_tokens
+
+    bare_budget = estimate_tokens(canonical_render_json({**packet, "unmet_needs": []}))
+    tiny = tool.fn(
+        fake_ctx,
+        protocol_version="1.1",
+        query="TEST-unmatched-mcp-recall-nebula",
+        mode="current",
+        max_items=6,
+        budget_tokens=bare_budget,
+        request_id=packet["request_id"],
+    )
+    validate_payload("recall_packet", tiny["result"])
+    assert NO_MATCH_FALLBACK_HINT not in tiny["result"]["unmet_needs"]

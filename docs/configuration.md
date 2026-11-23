@@ -45,7 +45,7 @@ Credentials are environment variable references. Never put their values in a rou
 | <a id="session_brief_enabled"></a>`session_brief_enabled` | `bool` | `true` |
 | <a id="session_brief_tokens"></a>`session_brief_tokens` | `int` | `1024` |
 | <a id="injection_format"></a>`injection_format` | `str` | `"json"` |
-| <a id="injection_token_cap"></a>`injection_token_cap` | `int` | `12654` |
+| <a id="injection_token_cap"></a>`injection_token_cap` | `int` | `12687` |
 | <a id="session_token_cap"></a>`session_token_cap` | `int &#124; None` | `null` |
 | <a id="max_items"></a>`max_items` | `int` | `32` |
 | <a id="lease_seconds"></a>`lease_seconds` | `float` | `60.0` |

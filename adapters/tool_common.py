@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import Any, Callable, cast
 
 from scope_recall.contracts import ContractError
+from scope_recall.core.recall_budget import canonical_render_json, estimate_tokens
 
 PROTOCOL_VERSION = "1.1"
 MAX_CONTENT = 8192
 MAX_REFS = 32
+NO_MATCH_FALLBACK_HINT = "fallback_to_transcript_search_for_verbatim_history"
 _MAX_JSON_BYTES = 2 * 1024 * 1024
 _MAX_JSON_DEPTH = 32
 #: Every rendered/body surface a raced stale packet must not carry.
@@ -223,13 +225,38 @@ def fence_epoch(
     fenced = cast(dict[str, Any], scrub_no_content(view))
     if "candidate_groups" in fenced:
         fenced["candidate_groups"] = []
+    prior_gaps = list(fenced.get("gaps", []))
+    if "memory_epoch_changed_before_delivery" not in prior_gaps:
+        prior_gaps.append("memory_epoch_changed_before_delivery")
+    prior_needs = list(fenced.get("unmet_needs", []))
+    if "retry_against_current_epoch" not in prior_needs and len(prior_needs) < 8:
+        prior_needs.append("retry_against_current_epoch")
     fenced.update(
         status="unavailable",
         memory_epoch=current_epoch,
         **copy.deepcopy(empty),
-        gaps=[*fenced.get("gaps", []), "memory_epoch_changed_before_delivery"],
+        gaps=prior_gaps,
         answerability="unknown",
         coverage="unknown",
-        unmet_needs=[*fenced.get("unmet_needs", []), "retry_against_current_epoch"],
+        unmet_needs=prior_needs,
     )
     return fenced
+
+
+def note_explicit_recall_fallback(packet: object, *, budget_tokens: int | None = None) -> None:
+    """Tell explicit tool callers to fall back to verbatim transcript search when memory holds no match."""
+    if type(packet) is not dict or packet.get("status") != "no_match":
+        return
+    gaps = packet.get("gaps") or ()
+    if any(type(gap) is str and gap.startswith(("entry_state:", "private_mode:", "deadline_exceeded")) for gap in gaps):
+        return
+    needs = packet.get("unmet_needs")
+    if type(needs) is not list or len(needs) >= 8 or NO_MATCH_FALLBACK_HINT in needs:
+        return
+    updated = [*needs, NO_MATCH_FALLBACK_HINT]
+    if (
+        type(budget_tokens) is int
+        and estimate_tokens(canonical_render_json({**packet, "unmet_needs": updated})) > budget_tokens
+    ):
+        return
+    needs.append(NO_MATCH_FALLBACK_HINT)

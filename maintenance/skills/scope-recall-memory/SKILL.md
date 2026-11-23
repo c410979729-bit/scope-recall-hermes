@@ -23,8 +23,11 @@ explicit corrections, withdrawal, suppression and deletion.
 2. `recall` with `mode: "current"` and a query in their words, for what `profile`
    does not list. An item whose `claim_state` is `proposed` is not confirmed yet;
    say so rather than presenting it as known.
-3. Answer in sentences, grouped by topic. `no_match` means nothing is remembered:
-   say that, and do not fill the gap from the chat history.
+3. Answer in sentences, grouped by topic. `no_match` means nothing is remembered
+   in Scope Recall (`fallback_to_transcript_search_for_verbatim_history` in
+   `unmet_needs` marks when verbatim transcript search is the next fallback for
+   past conversation wording; for "what do you remember about me?", report that
+   nothing is stored rather than inventing memories from chat fragments).
 
 ## Did I say this, or did you work it out?
 

@@ -29,6 +29,14 @@ null withdraws the fact. Required `valid_from` accepts null and preserves it in 
 arguments remain strict integers; booleans and numeric strings cannot substitute for them. Extra identity, scope,
 path and session arguments remain forbidden.
 
+The `recall` tool description names its usage contexts directly so every host's tool list carries the routing rule
+without relying on an already-loaded skill: questions about earlier user decisions, preferences, standing conventions,
+how something was done (`mode="method"`), whether a fact still holds (`mode="current"` or `"history"`), or where a
+statement came from go to `recall` first, leaving raw transcript search for verbatim wording or when `recall` returns
+`status="no_match"` (`fallback_to_transcript_search_for_verbatim_history` in `unmet_needs`). Host integrations should
+rely on automatic turn recall and semantic tool selection rather than maintaining keyword lists, which break under
+paraphrasing.
+
 ## Native Hermes request binding
 
 Hermes model mutations require an executor-owned request identity and the latest complete user's durable message

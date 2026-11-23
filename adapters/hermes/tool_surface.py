@@ -17,7 +17,7 @@ from scope_recall.core.handoff import tool_schemas as handoff_schemas
 from scope_recall.core.read_views import DEFAULT_BUDGET_TOKENS, DEFAULT_MAX_ITEMS
 from scope_recall.core.trace import fence_trace_epoch, trace_tool_schema
 
-from ..runtime_wiring import FORGET_GUIDANCE, READ_VIEW_BUDGET_GUIDANCE, REVISE_GUIDANCE
+from ..runtime_wiring import FORGET_GUIDANCE, READ_VIEW_BUDGET_GUIDANCE, RECALL_TOOL_GUIDANCE, REVISE_GUIDANCE
 from ..tool_common import (
     FENCED_ENTITY,
     FENCED_PROFILE,
@@ -28,6 +28,7 @@ from ..tool_common import (
     check_protocol,
     envelope,
     fence_epoch,
+    note_explicit_recall_fallback,
     revision_ref,
     strict_object,
 )
@@ -57,7 +58,7 @@ def _parameters(properties: dict[str, Any], required: list[str], *, version_defa
 _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "name": "recall",
-        "description": "Run the shared bounded read-only recall pipeline.",
+        "description": RECALL_TOOL_GUIDANCE + " Runs the shared bounded read-only recall pipeline.",
         "parameters": _parameters(
             {
                 "query": {"type": "string", "minLength": 1, "maxLength": MAX_CONTENT},
@@ -346,6 +347,7 @@ class HermesToolSurface:
         release = getattr(core, "release_recall_packet", None)
         if callable(release):
             packet = release(context, packet, original=original_packet)
+        note_explicit_recall_fallback(packet, budget_tokens=body.get("budget_tokens"))
         return self._reply(body["request_id"], packet)
 
     def _handle_inspect(self, args: object) -> str:

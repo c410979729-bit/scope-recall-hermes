@@ -39,7 +39,13 @@ from scope_recall.core.read_views import DEFAULT_BUDGET_TOKENS, DEFAULT_MAX_ITEM
 from scope_recall.core.trace import TRACE_GUIDANCE, fence_trace_epoch
 
 from ...host_registry import HOSTS
-from ..runtime_wiring import FORGET_GUIDANCE, READ_VIEW_BUDGET_GUIDANCE, RECALL_CONTEXT_GUIDANCE, REVISE_GUIDANCE
+from ..runtime_wiring import (
+    FORGET_GUIDANCE,
+    READ_VIEW_BUDGET_GUIDANCE,
+    RECALL_CONTEXT_GUIDANCE,
+    RECALL_TOOL_GUIDANCE,
+    REVISE_GUIDANCE,
+)
 from ..tool_common import (
     FENCED_ENTITY,
     FENCED_PROFILE,
@@ -50,6 +56,7 @@ from ..tool_common import (
     check_protocol,
     envelope,
     fence_epoch,
+    note_explicit_recall_fallback,
     revision_ref,
     strict_object,
 )
@@ -84,7 +91,8 @@ _READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempo
 _TOOLS: tuple[tuple[str, str, ToolAnnotations], ...] = (
     (
         "recall",
-        "Run the shared bounded read-only recall pipeline. Protocol version 1.1. "
+        RECALL_TOOL_GUIDANCE
+        + " Runs the shared bounded read-only recall pipeline. Protocol version 1.1. "
         + _RECALL_BUDGET_GUIDANCE
         + " "
         + RECALL_CONTEXT_GUIDANCE,
@@ -473,6 +481,7 @@ class CodexMCPServer:
         )
         packet = self.core.release_recall_packet(context, packet, original=original_packet)
         _budget_retry_hint(packet, budget_tokens)
+        note_explicit_recall_fallback(packet, budget_tokens=budget_tokens)
         return self._reply(ctx, call_id, packet)
 
     def inspect(

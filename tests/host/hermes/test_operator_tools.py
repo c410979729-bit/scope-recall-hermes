@@ -588,3 +588,42 @@ def test_handoff_provider_records_the_bound_host_session(adapter, tmp_path, monk
         )
     )
     assert result["result"]["sender_session"] == context.session_id
+
+
+def test_recall_tool_description_names_routing_situations_and_no_match_fallback(adapter):
+    from scope_recall.adapters.runtime_wiring import RECALL_CONTEXT_GUIDANCE
+    from scope_recall.adapters.tool_common import NO_MATCH_FALLBACK_HINT, note_explicit_recall_fallback
+    from scope_recall.contracts import validate_payload
+
+    provider, _clock = adapter
+    schemas = {schema["name"]: schema for schema in provider.get_tool_schemas()}
+    description = schemas["recall"]["description"]
+    assert description.startswith("Use before answering any question that involves the past:")
+    assert "earlier user decisions" in description
+    assert "transcript search" in description
+    assert "no_match" in description
+    assert (
+        "authoritative" in RECALL_CONTEXT_GUIDANCE or "precedence over raw transcript search" in RECALL_CONTEXT_GUIDANCE
+    )
+
+    empty = json.loads(
+        provider.handle_tool_call(
+            "recall",
+            {
+                "protocol_version": "1.1",
+                "query": "TEST-never-recorded-decision-quasar",
+                "mode": "current",
+                "max_items": 6,
+                "budget_tokens": 1200,
+            },
+        )
+    )
+    packet = empty["result"]
+    assert packet["status"] == "no_match"
+    assert NO_MATCH_FALLBACK_HINT in packet["unmet_needs"]
+    validate_payload("recall_packet", packet)
+
+    for blocked_gap in ("entry_state:paused", "private_mode:full", "deadline_exceeded_release_fence"):
+        blocked_packet = {**packet, "gaps": [blocked_gap], "unmet_needs": []}
+        note_explicit_recall_fallback(blocked_packet, budget_tokens=1200)
+        assert blocked_packet["unmet_needs"] == []

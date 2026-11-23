@@ -171,7 +171,7 @@ def question_cases(s, host, prompts):
     """Measure question retrieval before briefing or prior delivery can hide distractors."""
     core = s.hooks[host].core
     original = core.config
-    values = dict(session_brief_enabled=False, session_token_cap=None, injection_token_cap=12654)
+    values = dict(session_brief_enabled=False, session_token_cap=None, injection_token_cap=12687)
     core.config = replace(original, **{key: value for key, value in values.items() if hasattr(original, key)})
     session, rows = str(__import__("uuid").uuid4()), []
     try:
@@ -243,12 +243,12 @@ def unrelated(s, r, args):
     r.record(
         "S6.turn",
         all(
-            row["diagnostics"].get("injection_tokens", 0) <= row["diagnostics"].get("injection_token_cap", 12654)
+            row["diagnostics"].get("injection_tokens", 0) <= row["diagnostics"].get("injection_token_cap", 12687)
             for row in deliveries
         )
         and all(
             (estimate_tokens(host_text(row["output"])) if host_text(row["output"]) else 0)
-            <= (row["diagnostics"].get("injection_token_cap") or 12654)
+            <= (row["diagnostics"].get("injection_token_cap") or 12687)
             for row in deliveries
         ),
         deliveries,
