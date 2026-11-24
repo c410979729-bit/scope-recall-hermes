@@ -1,8 +1,8 @@
-"""Inspect or stop the worker-owned recall service shared by local entries of a library.
+"""Inspect or stop the worker-owned recall service for a shared library or standalone local Hermes store.
 
-The existing --home and --host arguments resolve an attached entry to its library. Status includes the service lock
-and stable process identity; stop never signals an unproven process. The worker may restart the service while client
-activity remains recent. Setting residence to zero disables that restart.
+The --home and --host arguments resolve an entry or local Hermes home to its resident endpoint. Status includes the
+service lock and stable process identity; stop never signals an unproven process. The worker may restart the service
+while client activity remains recent. Setting residence to zero disables that restart.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ STOP_WAIT_SECONDS = 5.0
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="scope-recall resident")
     parser.add_argument("action", choices=("status", "stop"))
-    parser.add_argument("--home", required=True, help="absolute home of a client attached to a shared store")
+    parser.add_argument("--home", required=True, help="absolute home of a local or shared-store entry")
     parser.add_argument("--host", required=True, choices=RESIDENT_HOSTS)
     args = parser.parse_args(argv)
     try:

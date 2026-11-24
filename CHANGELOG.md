@@ -2,6 +2,17 @@
 
 ## [4.0.7.dev0]
 
+### Added
+
+- `EmbeddingRouteConfig` accepts optional paired `query_prefix` and `document_prefix` strings (entered into the `embedding_space` digest) and allows omitting `credential_env` when `endpoint` addresses a loopback host (#16).
+- MCP and Hermes tool schemas publish parameter-level descriptions for `recall` and `inspect` alongside shared `inspect` and `status` tool guidance (#17).
+
+### Fixed
+
+- Standalone `local` Hermes installations (`installation_kind == "local"`) with a configured `runtime-config.json` delegate `prefetch` and `recall` reads to the worker-managed resident recall server outside the gateway's GIL without requiring shared-store attachment (#8).
+- Automatic recall treats leading-slash prompts containing path segments or a leading dot (such as `/srv/workspace/...` or `/.config/...`) as normal prompts rather than skipping them as slash commands (#15).
+- `DistinctContent` strips outer whitespace before hashing `content_key` so dual-captured copies differing only by a leading or trailing newline collapse cleanly (#14).
+
 ## [4.0.6]
 
 ### Added

@@ -32,7 +32,7 @@ from ..installation import MANIFEST_FILENAME
 from ..shared_entries import attachment_path, read_attachment
 from .config import CodexConfigError, load_shared_client
 from .handler import CodexHookHandler
-from .hermes_resident import HermesResidentHandler, load_hermes_resident_target, shared_resident_entries
+from .hermes_resident import HermesResidentHandler, load_hermes_resident_target, resident_entries
 
 #: What a hook may send: its payload (a hook's own stdin is at most 64 KiB, and written as ASCII JSON a character
 #: of it takes up to six bytes) and the refs and gaps of its capture.
@@ -416,11 +416,12 @@ def file_stamp(*paths: Path | None) -> tuple:
 
 
 def entry_files(home: Path | str) -> tuple[Path, ...]:
-    """What a shared entry's handler is made from besides its credentials and runtime config: its pointer to the
-    store, and the store's record of the entry's grants and binding."""
-    files = [attachment_path(Path(home))]
+    """What an entry's handler is made from besides its credentials and runtime config: its pointer to a shared
+    store, its local installation manifest path, and the shared store's record of the entry's grants and binding."""
+    root = Path(home)
+    files = [attachment_path(root), root / "scope-recall" / MANIFEST_FILENAME]
     try:
-        attachment = read_attachment(Path(home))
+        attachment = read_attachment(root)
     except Exception:  # noqa: BLE001 - an unreadable pointer is one more reason the stamp changed
         attachment = None
     if attachment is not None:
@@ -433,7 +434,7 @@ def _nothing() -> None:
 
 
 def load_resident_target(home: Path | str, host: str):
-    """Resolve any local resident-capable entry (Hermes or a hook client) attached to a shared store."""
+    """Resolve any local resident-capable installation (Hermes or an attached hook client)."""
     if host == "hermes":
         return load_hermes_resident_target(home)
     return load_shared_client(home, host)
@@ -769,7 +770,7 @@ class HookEndpoint:
         if self.binding is None:
             self.kept.warm()
         else:
-            for config, _attached in shared_resident_entries(self.binding):
+            for config, _attached in resident_entries(self.binding):
                 if resident_minutes(config.home, config.host) > 0:
                     self._route(config).warm()
 

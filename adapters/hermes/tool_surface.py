@@ -18,8 +18,8 @@ from scope_recall.core.handoff import tool_schemas as handoff_schemas
 from scope_recall.core.read_views import DEFAULT_BUDGET_TOKENS, DEFAULT_MAX_ITEMS
 from scope_recall.core.trace import fence_trace_epoch, trace_tool_schema
 
+from ..clients import local_endpoint
 from ..clients.hook_answer import server_own_vector_fault
-from ..clients.local_endpoint import Recaller, request_recall, resident_minutes
 from ..runtime_wiring import (
     FORGET_GUIDANCE,
     INSPECT_GUIDANCE,
@@ -254,16 +254,12 @@ def resident_hermes_recall(
     session_id: str | None = None,
     host_memory_entries: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
-    """Ask the shared library's resident process for a read-only Hermes recall, or return None to recall locally."""
-    if (
-        identity.entry_id is None
-        or getattr(adapter, "_injected_core", False)
-        or getattr(adapter, "_explicit_runtime_config", False)
-    ):
+    """Ask the resident process for a read-only Hermes recall, or return None to recall locally."""
+    if getattr(adapter, "_injected_core", False) or getattr(adapter, "_explicit_runtime_config", False):
         return None
-    if resident_minutes(identity.hermes_home, "hermes") <= 0:
+    if local_endpoint.resident_minutes(identity.hermes_home, "hermes") <= 0:
         return None
-    request_recall(identity.hermes_home, "hermes")
+    local_endpoint.request_recall(identity.hermes_home, "hermes")
     prepare_render = host_memory_entries is not None
     zone = display_zone()
     scope = identity.scope
@@ -293,7 +289,7 @@ def resident_hermes_recall(
         "background_without_evidence": prepare_render,
     }
     try:
-        answered = Recaller(identity.hermes_home, "hermes")(payload, current_refs, (), budget_seconds)
+        answered = local_endpoint.Recaller(identity.hermes_home, "hermes")(payload, current_refs, (), budget_seconds)
     except Exception:  # noqa: BLE001 - fall back to direct in-process recall
         return None
     if answered is None:

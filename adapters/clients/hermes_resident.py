@@ -1,12 +1,13 @@
-"""Resident recall target and handler for Hermes shared-store entries.
+"""Resident recall target and handler for local and shared-store Hermes installations.
 
 Runs inside the worker-owned loopback resident process so automatic prefetch and explicit tool recalls
-execute outside the Hermes gateway's Python GIL while re-verifying the entry's manifest and exact session
+execute outside the Hermes gateway's Python GIL while re-verifying the installation manifest and exact session
 audience on every request. Imports stay strictly within shared and client layers.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, replace
@@ -44,7 +45,13 @@ from ..host_identity import (
     principal_ref,
     resolve_runtime_audience,
 )
-from ..installation import HermesIdentityError, InstallationManifest, bounded_text
+from ..installation import (
+    MANIFEST_FILENAME,
+    HermesIdentityError,
+    InstallationManifest,
+    bounded_text,
+    load_installation_manifest,
+)
 from ..runtime_wiring import GAP_UNCONFIGURED, TrustedHostRuntime, attach_trusted_host_runtime
 from ..shared_entries import attachment_path, read_attachment, read_shared_payload, shared_entry_manifest
 from ..tool_common import FENCED_RECALL, fence_epoch
@@ -70,7 +77,7 @@ _SCOPE_FIELDS = (
 
 @dataclass(frozen=True)
 class HermesResidentTarget:
-    """Verified local Hermes entry attached to a shared store."""
+    """Verified local or shared-store Hermes installation."""
 
     home: Path
     manifest: InstallationManifest
@@ -114,27 +121,40 @@ class HermesResidentTarget:
 
 
 def load_hermes_resident_target(home: Path | str, *, expected_store: Path | None = None) -> HermesResidentTarget:
-    """Bind a local Hermes shared-store entry; remote-forwarded and cross-account entries are refused."""
+    """Bind a local or shared-store Hermes installation; remote-forwarded and cross-account entries are refused."""
     path = Path(home).expanduser()
     if not path.is_absolute():
         raise CodexConfigError("home must be absolute")
     if expected_store is None:
         path = path.resolve()
     try:
-        attachment = read_attachment(path, local_only=expected_store is not None)
-        if attachment is None:
-            raise CodexConfigError("home is not attached to a shared store")
-        if expected_store is not None and not same_local_path(attachment.root, expected_store):
-            raise CodexConfigError("home points to another shared store")
-        if attachment.host != "hermes":
-            raise CodexConfigError(f"home is attached as a {attachment.host} entry, not hermes")
         remote_cfg = attachment_path(path).with_name(REMOTE_SERVER_CONFIG_FILENAME)
         has_remote = (
             local_attachment_stat(remote_cfg) is not None if expected_store is not None else remote_cfg.is_file()
         )
         if has_remote:
             raise CodexConfigError("remote server entries do not use local resident recall")
-        manifest = shared_entry_manifest(expected_store or attachment.root, attachment.entry_id, hermes_home=path)
+        attachment = read_attachment(path, local_only=expected_store is not None)
+        if attachment is None:
+            if expected_store is not None:
+                raise CodexConfigError("home is not attached to a shared store")
+            manifest = load_installation_manifest(path)
+            if manifest.installation_kind != "local":
+                raise CodexConfigError("home is not a standalone local Hermes installation")
+        else:
+            local_manifest = path / "scope-recall" / MANIFEST_FILENAME
+            has_local = (
+                local_attachment_stat(local_manifest) is not None
+                if expected_store is not None
+                else os.path.lexists(local_manifest)
+            )
+            if has_local:
+                raise CodexConfigError("home holds both its own installation and a shared store attachment")
+            if expected_store is not None and not same_local_path(attachment.root, expected_store):
+                raise CodexConfigError("home points to another shared store")
+            if attachment.host != "hermes":
+                raise CodexConfigError(f"home is attached as a {attachment.host} entry, not hermes")
+            manifest = shared_entry_manifest(expected_store or attachment.root, attachment.entry_id, hermes_home=path)
     except (HermesIdentityError, UnverifiedAttachmentPath) as exc:
         raise CodexConfigError(str(exc)) from exc
     if manifest.entry_host != "hermes" or not manifest.scope_ids:
@@ -144,6 +164,17 @@ def load_hermes_resident_target(home: Path | str, *, expected_store: Path | None
     if not (manifest.data_directory / "memory.sqlite3").is_file():
         raise CodexConfigError("verified core database is required")
     return HermesResidentTarget(home=path, manifest=manifest)
+
+
+def local_hermes_resident_entry(binding: InstanceBinding) -> HermesResidentTarget | None:
+    """Resolve a standalone local Hermes installation from its store binding, or None for other local hosts."""
+    if binding.installation_kind != "local" or binding.data_directory.name != "scope-recall":
+        return None
+    try:
+        target = load_hermes_resident_target(binding.data_directory.parent)
+    except (ContractError, OSError, RuntimeError, ValueError):
+        return None
+    return target if target.to_binding() == binding else None
 
 
 def shared_resident_entries(binding: InstanceBinding):
@@ -164,6 +195,16 @@ def shared_resident_entries(binding: InstanceBinding):
                 yield target, entry["attached_at"]
         except (ContractError, OSError, RuntimeError, ValueError):
             continue
+
+
+def resident_entries(binding: InstanceBinding):
+    """Yield resident-capable entries for either a shared library or a standalone local Hermes store."""
+    if binding.installation_kind == "shared":
+        yield from shared_resident_entries(binding)
+        return
+    target = local_hermes_resident_entry(binding)
+    if target is not None:
+        yield target, ""
 
 
 def _parse_zone(raw: object) -> tzinfo | None:
@@ -366,7 +407,7 @@ class HermesResidentHandler:
             host_runtime = attach_trusted_host_runtime(
                 config_path=self.target.runtime_config_path,
                 expected_binding=self.target.to_binding(),
-                session_id=f"hermes-resident:{self.target.installation_id}:{self.target.entry_id}",
+                session_id=f"hermes-resident:{self.target.installation_id}:{self.target.entry_id or 'local'}",
                 allowed_scope_ids=self.target.scope_ids,
                 host_adapter="hermes",
                 core=self.core,
@@ -387,7 +428,7 @@ class HermesResidentHandler:
             "warm-embedding",
             self.target.scope_ids,
             "host_generated",
-            entry_id=self.target.entry_id,
+            entry_id=self.target.manifest.entry_id,
         )
         if outbound_blocked(self.core.storage, self.core.clock, context):
             return
