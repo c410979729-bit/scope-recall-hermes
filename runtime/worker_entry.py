@@ -68,9 +68,9 @@ def load_config(path: str | Path) -> RuntimeInstanceConfig:
 def credential_environment(config, env_file):
     """Read only the configured credential keys; never execute/interpolate dotenv."""
     names = {
-        route.credential_env
+        name
         for route in (getattr(config.auxiliary, "embedding", None), getattr(config.auxiliary, "consolidation", None))
-        if route is not None and hasattr(route, "credential_env")
+        if route is not None and (name := getattr(route, "credential_env", None))
     }
     if not env_file or not names:
         return {}
