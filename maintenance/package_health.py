@@ -18,6 +18,8 @@ from pathlib import Path
 DISTRIBUTION = "hermes-scope-recall"
 #: Raw float32 scans need NumPy; extension loading is optional.
 VECTOR_DISTRIBUTIONS = ("numpy",)
+#: Legacy LanceDB companion import needs LanceDB and PyArrow until ``vector_imports`` marks the copy complete.
+LEGACY_LANCEDB_DISTRIBUTIONS = ("lancedb", "pyarrow")
 
 
 def installed_version(name: str) -> str | None:
@@ -126,6 +128,7 @@ def package_probe() -> dict:
         "dependency_drift": {"status": "unavailable"},
         # Optional, so never drift; the doctor reads it against the runtime config's vector store.
         "vector_dependencies": {name: installed_version(name) for name in VECTOR_DISTRIBUTIONS},
+        "legacy_lancedb_dependencies": {name: installed_version(name) for name in LEGACY_LANCEDB_DISTRIBUTIONS},
     }
     try:
         dist = metadata.distribution(DISTRIBUTION)

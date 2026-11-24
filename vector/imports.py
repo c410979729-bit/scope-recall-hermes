@@ -8,7 +8,9 @@ or unreadable input leaves recall explicitly degraded and preserves the input.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import time
 from collections.abc import Callable
 from contextlib import closing
@@ -28,6 +30,102 @@ def legacy_sources(directory: Path, table: str) -> list[tuple[str, Path]]:
     if (directory / "lancedb").is_dir():
         sources.append(("lance", directory / "lancedb"))
     return sources
+
+
+def _is_nonreparse(path: Path, *, want_dir: bool) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or (int(getattr(info, "st_file_attributes", 0)) & 0x400):
+        return False
+    return stat.S_ISDIR(info.st_mode) if want_dir else stat.S_ISREG(info.st_mode)
+
+
+def _lance_source_key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def _configured_vector_storage_dir(data_root: Path) -> Path | None:
+    config_file = data_root / "runtime-config.json"
+    try:
+        if _is_nonreparse(config_file, want_dir=False) and config_file.stat().st_size <= 1_048_576:
+            raw = json.loads(config_file.read_text(encoding="utf-8"))
+            vector = raw.get("vector") if isinstance(raw, dict) else None
+            configured = vector.get("storage_dir") if isinstance(vector, dict) else None
+            if isinstance(configured, str) and configured.strip():
+                candidate = Path(configured).expanduser()
+                if candidate.is_absolute():
+                    return candidate
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _space_has_pending_lance_import(space_dir: Path) -> bool:
+    lance_dir = space_dir / "lancedb"
+    try:
+        if not _is_nonreparse(space_dir, want_dir=True) or not _is_nonreparse(lance_dir, want_dir=True):
+            return False
+    except OSError:
+        return False
+    db_path = space_dir / "vectors.sqlite3"
+    try:
+        if not _is_nonreparse(db_path, want_dir=False):
+            return True
+        expected = _lance_source_key(lance_dir)
+        with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0)) as conn:
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vector_imports'"
+            ).fetchone()
+            if not has_table:
+                return True
+            rows = conn.execute("SELECT source, state FROM vector_imports WHERE source LIKE 'lance:%'").fetchall()
+        if any(state != "complete" for _source, state in rows):
+            return True
+        for source, _state in rows:
+            if isinstance(source, str) and _lance_source_key(Path(source.removeprefix("lance:"))) == expected:
+                return False
+        return True
+    except (sqlite3.Error, OSError, RuntimeError, ValueError):
+        return True
+
+
+def legacy_lancedb_import_pending(data_directory: Path | None, *, storage_dir: Path | None = None) -> bool:
+    """Whether ``data_directory`` or ``storage_dir`` has a legacy LanceDB companion not yet imported to ``complete``."""
+    roots: list[Path] = []
+    if storage_dir is not None:
+        roots.append(Path(storage_dir))
+    if data_directory is not None:
+        data_root = Path(data_directory)
+        roots.append(data_root / "vectors")
+        if storage_dir is None and (configured := _configured_vector_storage_dir(data_root)) is not None:
+            roots.append(configured)
+    spaces: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            if not _is_nonreparse(root, want_dir=True):
+                continue
+            candidates = [
+                root,
+                *(
+                    child
+                    for child in sorted(root.iterdir())
+                    if child.name != "lancedb" and _is_nonreparse(child, want_dir=True)
+                ),
+            ]
+        except OSError:
+            continue
+        for space in candidates:
+            try:
+                key = _lance_source_key(space)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if key not in seen:
+                seen.add(key)
+                spaces.append(space)
+    return any(_space_has_pending_lance_import(space) for space in spaces)
 
 
 def _read_timeout() -> float:

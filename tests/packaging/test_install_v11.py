@@ -2267,3 +2267,65 @@ def test_remote_release_candidate_manifest_is_converted_once(tmp_path, monkeypat
     )
     metadata = json.loads(files[plugin / ".codex-plugin" / "plugin.json"])
     assert metadata["version"] == "4.0.0-rc.1"
+
+
+def test_hermes_upgrade_retains_lancedb_extra_until_legacy_import_completes(tmp_path, monkeypatch):
+    """While a legacy LanceDB companion has not finished importing to SQLite, wrapper declarations retain [lancedb]."""
+    import sqlite3
+    import tomllib
+
+    import yaml
+    from scope_recall.maintenance import doctor, install_hermes
+
+    instance, _outside, project = _install_paths(tmp_path, host="hermes")
+    plugin = instance / "plugins" / "scope-recall"
+    _hand_made_wrapper(plugin)
+    monkeypatch.setattr(install_hermes, "__version__", "3.15.1")
+    apply_install(_hermes_plan(instance, plugin, project))
+
+    custom_vectors = tmp_path / "TEST-legacy-vectors"
+    lance_dir = custom_vectors / "lancedb"
+    (lance_dir / "memories.lance").mkdir(parents=True)
+    store_dir = instance / "scope-recall"
+    (store_dir / "runtime-config.json").write_text(
+        json.dumps({"vector": {"backend": "lancedb", "storage_dir": str(custom_vectors), "dimensions": 768}}),
+        encoding="utf-8",
+    )
+
+    version = "4.0.7"
+    monkeypatch.setattr(install_hermes, "__version__", version)
+    apply_install(_hermes_plan(instance, plugin, project))
+    dependencies = tomllib.loads((plugin / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
+    assert dependencies == [f"hermes-scope-recall[lancedb]=={version}"]
+    manifest_deps = yaml.safe_load((plugin / "plugin.yaml").read_text(encoding="utf-8"))["pip_dependencies"]
+    assert manifest_deps == [f"hermes-scope-recall[lancedb]=={version}"]
+
+    report = doctor.DoctorReport(host="hermes", status="ok")
+    vector_cfg = type("Vec", (), {"storage_dir": custom_vectors})()
+    runtime_cfg = type("Cfg", (), {"vector": vector_cfg})()
+    doctor._check_vector_dependencies(
+        report,
+        {
+            "vector_dependencies": {"numpy": "2.1.0"},
+            "legacy_lancedb_dependencies": {"lancedb": None, "pyarrow": None},
+        },
+        runtime_cfg,
+        store_dir,
+    )
+    assert "vector_dependencies_missing" in report.capability_gaps
+    assert {"name": "vector_dependencies", "result": "missing", "detail": "lancedb,pyarrow"} in report.checks
+
+    resolved_lance = str(lance_dir.resolve())
+    if os.name == "nt" and len(resolved_lance) >= 2 and resolved_lance[1] == ":":
+        resolved_lance = resolved_lance[0].swapcase() + resolved_lance[1:]
+    with sqlite3.connect(custom_vectors / "vectors.sqlite3") as conn:
+        conn.execute("CREATE TABLE vector_imports(source TEXT PRIMARY KEY, watermark INTEGER, state TEXT, detail TEXT)")
+        conn.execute(
+            "INSERT INTO vector_imports(source, watermark, state, detail) VALUES (?, 128, 'complete', '1')",
+            (f"lance:{resolved_lance}",),
+        )
+    apply_install(_hermes_plan(instance, plugin, project))
+    after_deps = tomllib.loads((plugin / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
+    assert after_deps == [f"hermes-scope-recall[vectors]=={version}"]
+    after_manifest = yaml.safe_load((plugin / "plugin.yaml").read_text(encoding="utf-8"))["pip_dependencies"]
+    assert after_manifest == [f"hermes-scope-recall[vectors]=={version}"]

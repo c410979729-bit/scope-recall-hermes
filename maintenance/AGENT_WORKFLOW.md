@@ -86,7 +86,8 @@ it under `hermes_runtime`.
    `--target-plugin-dir <home>\plugins\scope-recall`. A receipt that names another
    plugin directory is moved (`move` in the plan); a wrapper someone put there by
    hand is backed up and replaced (`replace`). The wrapper's `pyproject.toml`
-   declares `hermes-scope-recall[vectors]==<version>`.
+   declares `hermes-scope-recall[vectors]==<version>` (or `hermes-scope-recall[lancedb]==<version>`
+   while a legacy LanceDB companion import is still pending).
 2. Rebuild the environment with Hermes's own sync, `HERMES_HOME` set to the home:
    `<hermes-python> -m hermes_cli.venv_sync --project-root <hermes-checkout> --json`.
    Use the actual Hermes source directory, which can be outside the home.
