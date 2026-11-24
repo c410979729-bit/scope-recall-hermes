@@ -5,11 +5,11 @@ The retrieval pipeline de-duplicates on ``(kind, ref, revision)``, which is
 under fresh identities would let one document hold most of a packet's slots
 and push the answer out entirely.  Collapsing copies prevents that.
 
-Collapsing is not truncation.  The surviving copy is byte-identical to the
-ones removed, so no content is lost and coverage is not reduced; that is why
-this gap has its own prefix rather than reusing ``coverage_truncated``.  It is
-still recorded, because "six items from six sources" and "six items from
-three" are different facts about the evidence.
+Collapsing is not truncation.  The surviving copy carries the same body apart
+from leading or trailing whitespace, so no content is lost and coverage is not
+reduced; that is why this gap has its own prefix rather than reusing
+``coverage_truncated``.  It is still recorded, because "six items from six
+sources" and "six items from three" are different facts about the evidence.
 
 A duplicate is *two different objects carrying the same body*.  Two revisions
 of one object are not duplicates however identical their text: ``history`` and
@@ -36,12 +36,14 @@ def content_key(obj: Any) -> tuple[str, str]:
 
     Kind is part of the key so a claim is never folded into an event that
     happens to quote it verbatim -- they carry different authority.
+    Leading/trailing whitespace is stripped so dual-captured copies differing
+    only by a leading or trailing newline still fold together.
     """
     kind = getattr(obj, "kind", "") or ""
     content = getattr(obj, "content", "") or ""
     if type(content) is not str:
         content = str(content)
-    body = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+    body = hashlib.sha256(content.strip().encode("utf-8", "replace")).hexdigest()
     return str(kind), body
 
 
