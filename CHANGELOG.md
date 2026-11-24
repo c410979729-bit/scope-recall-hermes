@@ -1,5 +1,20 @@
 # Changelog
 
+## [4.0.7]
+
+### Added
+
+- `EmbeddingRouteConfig` accepts optional paired `query_prefix` and `document_prefix` strings (entered into the `embedding_space` digest) and allows omitting `credential_env` when `endpoint` addresses a loopback host, including in `scope-recall setup` route updates and guided configuration (#16).
+- MCP and Hermes tool schemas publish parameter-level descriptions for `recall` (including `budget_tokens`) and `inspect` alongside shared `inspect` and `status` tool guidance (#17).
+
+### Fixed
+
+- Upgrading a Hermes installation whose store still has an incomplete legacy LanceDB companion import retains `hermes-scope-recall[lancedb]` in wrapper declarations and checks `lancedb`/`pyarrow` availability in `doctor` until `vector_imports` marks the copy complete (#19).
+- Standalone `local` Hermes installations (`installation_kind == "local"`) with a configured `runtime-config.json` delegate `prefetch` and `recall` reads to the worker-managed resident recall server outside the gateway's GIL, resolve resident route credentials from each entry's `.env` or install receipt without binding the host's in-process secret scope, reconcile resident service wakeups across backup/waiting cycles, and bound `post_tool_call` and `post_llm_call` inside the host callback timeout (#8).
+- Automatic recall treats leading-slash prompts containing path segments or a leading dot (such as `/srv/workspace/...` or `/.config/...`) as normal prompts rather than skipping them as slash commands (#15), explicit `recall` strips numbered record URLs before hard-identifier matching, and `identifiers_compatible` matches short and full hexadecimal digests by prefix.
+- `DistinctContent` strips outer whitespace before hashing `content_key` so dual-captured copies differing only by a leading or trailing newline collapse cleanly (#14).
+- Packaged `scope-recall-memory` skill and operator documentation reflect `request_message_binding` availability for `revise` and `forget` on Hermes and local Codex shared entries, and PyPI provenance verification waits for the triggering release run to complete before checking its conclusion.
+
 ## [4.0.6]
 
 ### Added

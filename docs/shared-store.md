@@ -110,7 +110,7 @@ that stopped, or after `adopt`) keeps the entry's grants as they are and needs n
 ## Bringing an agent's memories along
 
 `attach` starts an agent on the shared store without what its own store held. To bring that in,
-stop every attached host (and a WorkBuddy or dsh entry's resident recall server: `scope-recall resident stop`) and
+stop every attached host (and any running resident recall server: `scope-recall resident stop`) and
 pause the shared worker, then run for each agent:
 
 ```text
@@ -200,7 +200,7 @@ and run `apply-install --host codex` without `--project-root`. Its hooks and MCP
 the home and serve every workspace. Refresh Codex's plugin cache and approve the changed hooks in
 Codex. The moved store's memories are not imported.
 
-`doctor --host codex|claude-code|workbuddy|dsh --instance-root "<home>"` and `detach` work for these
+`doctor --host codex|claude-code|workbuddy|dsh|antigravity|cherry-studio --instance-root "<home>"` and `detach` work for these
 entries as for a Hermes home.
 
 ## Attach WorkBuddy
@@ -400,9 +400,10 @@ retains its existing peer-account checks. Owner approvals are rechecked only thr
 they are not an atomic snapshot with the database and do not cover later manifest changes.
 
 These corrections are stated in conversation and take effect through background consolidation.
-The Hermes and MCP `revise` and `forget` tools are closed because their dispatch contracts lack a verified
-binding to the exact latest user message seen by each model request. Local memory management provides explicit
-correction and deletion. See [Claim mutation](claim-mutation-contract.md) for host requirements and errors.
+Hermes and local Codex shared entries expose `revise` and `forget` when the host attests a verified binding
+to the exact latest complete user message in that model request (`request_message_binding`); other MCP and remote
+entries omit or refuse model mutations, and local memory management provides explicit correction and deletion
+everywhere. See [Claim mutation](claim-mutation-contract.md) for host requirements and errors.
 
 ## Repeated evidence in recall
 
@@ -427,7 +428,7 @@ references retain their existing semantics.
 
 ## Moving the store
 
-1. Pause the shared worker (`autostart pause`), stop every attached host and a WorkBuddy or dsh entry's resident
+1. Pause the shared worker (`autostart pause`), stop every attached host and any running resident
    recall server (`scope-recall resident stop`), and take a `backup`. The server reads the store, and on Windows its open
    files keep the old root from being removed.
 2. Copy the whole root directory to the new place.

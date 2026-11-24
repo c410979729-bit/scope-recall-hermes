@@ -41,10 +41,12 @@ from scope_recall.core.trace import TRACE_GUIDANCE, fence_trace_epoch
 from ...host_registry import HOSTS
 from ..runtime_wiring import (
     FORGET_GUIDANCE,
+    INSPECT_GUIDANCE,
     READ_VIEW_BUDGET_GUIDANCE,
     RECALL_CONTEXT_GUIDANCE,
     RECALL_TOOL_GUIDANCE,
     REVISE_GUIDANCE,
+    STATUS_GUIDANCE,
 )
 from ..tool_common import (
     FENCED_ENTITY,
@@ -100,7 +102,7 @@ _TOOLS: tuple[tuple[str, str, ToolAnnotations], ...] = (
     ),
     (
         "inspect",
-        "Inspect one visible, versioned object or source, or a recall packet's diagnostic_ref from this session. Protocol version 1.1.",
+        INSPECT_GUIDANCE + " Protocol version 1.1.",
         _READ_ONLY,
     ),
     (
@@ -135,7 +137,7 @@ _TOOLS: tuple[tuple[str, str, ToolAnnotations], ...] = (
         FORGET_GUIDANCE + " Protocol version 1.1.",
         ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False),
     ),
-    ("status", "Read bounded Core status and adapter capability gaps. Protocol version 1.1.", _READ_ONLY),
+    ("status", STATUS_GUIDANCE + " Protocol version 1.1.", _READ_ONLY),
     *(
         (
             schema["name"],
@@ -444,14 +446,36 @@ class CodexMCPServer:
         self,
         ctx: Context,
         protocol_version: Literal["1.1"],
-        query: StrictStr,
-        mode: Literal["auto", "current", "history", "as_of", "method"],
-        max_items: StrictInt,
+        query: Annotated[
+            StrictStr,
+            Field(description="Search query; include specific identifiers, repo/symbol names, or topic terms."),
+        ],
+        mode: Annotated[
+            Literal["auto", "current", "history", "as_of", "method"],
+            Field(
+                description="current: what holds now. history: what was believed before, with what replaced it. "
+                "as_of: what held at one instant, which requires as_of. method: how something is done. "
+                "auto: background context."
+            ),
+        ],
+        max_items: Annotated[
+            StrictInt,
+            Field(description="Maximum items to return (higher values spend budget_tokens faster)."),
+        ],
         budget_tokens: Annotated[
             StrictInt, Field(description=_RECALL_BUDGET_GUIDANCE)
         ] = RECOMMENDED_EXPLICIT_BUDGET_TOKENS,
-        as_of: StrictStr | None = None,
-        focus_refs: list[StrictStr] | None = None,
+        as_of: Annotated[
+            StrictStr | None,
+            Field(
+                description="Required by mode='as_of', and ignored otherwise. One ISO-8601 instant with an explicit "
+                "timezone offset or 'Z' (e.g. '2026-09-17T12:00:00Z')."
+            ),
+        ] = None,
+        focus_refs: Annotated[
+            list[StrictStr] | None,
+            Field(description="Optional prior ref strings to bias relation/claim expansion around."),
+        ] = None,
         request_id: StrictStr | None = None,
     ) -> dict[str, Any]:
         body, call_id = self._request(
@@ -488,8 +512,17 @@ class CodexMCPServer:
         self,
         ctx: Context,
         protocol_version: Literal["1.1"],
-        ref: StrictStr,
-        limit: Annotated[StrictInt, Field(ge=1, le=24)] = 24,
+        ref: Annotated[
+            StrictStr,
+            Field(
+                description="Object ref (e.g. 'event-...@1', 'claim-...') from auto-injected memory or recall(), "
+                "or a diagnostic_ref from this session."
+            ),
+        ],
+        limit: Annotated[
+            StrictInt,
+            Field(ge=1, le=24, description="Maximum linked evidence/claim items to include (1-24, default 24)."),
+        ] = 24,
         request_id: StrictStr | None = None,
     ) -> dict[str, Any]:
         body, call_id = self._request(protocol_version=protocol_version, request_id=request_id, ref=ref, limit=limit)

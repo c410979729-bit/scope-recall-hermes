@@ -137,13 +137,15 @@ Credentials are environment variable references. Never put their values in a rou
 
 | Field | JSON input type | Default when omitted |
 |---|---|---|
-| <a id="credential_env"></a>`credential_env` | `str` | `required` |
+| <a id="credential_env"></a>`credential_env` | `str &#124; None` | `required` |
 | <a id="model"></a>`model` | `str &#124; None` | `null` |
 | <a id="endpoint"></a>`endpoint` | `str &#124; None` | `null` |
 | `dimensions` | `int &#124; None` | `null` |
 | <a id="dialect"></a>`dialect` | `str &#124; None` | `null` |
 | <a id="dimensions_field"></a>`dimensions_field` | `str` | `"dimensions"` |
 | <a id="allow_insecure_endpoint"></a>`allow_insecure_endpoint` | `bool` | `false` |
+| <a id="query_prefix"></a>`query_prefix` | `str &#124; None` | `null` |
+| <a id="document_prefix"></a>`document_prefix` | `str &#124; None` | `null` |
 
 ## ConsolidationRouteConfig
 
@@ -205,3 +207,4 @@ Nested objects use the definitions above: binding → InstanceBinding; auxiliary
 budget → BudgetPolicy; pricing values → ModelPricing; subscription_budget → SubscriptionBudgetPolicy.
 In model_token_caps each model maps to an object with input and output integers or null; both keys are stated.
 Embedding descriptor fields may be omitted together to select the built-in space.
+On EmbeddingRouteConfig, credential_env may be omitted or null only when endpoint addresses a loopback host; query_prefix and document_prefix move together into the space digest and require an explicit vector_threshold.

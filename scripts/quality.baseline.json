@@ -267,7 +267,7 @@
    }
   },
   "adapters/clients/mcp_server.py": {
-   "E501": 3,
+   "E501": 2,
    "PLR0913": {
     "CodexMCPServer.entity": 9,
     "CodexMCPServer.recall": 9,
@@ -329,7 +329,6 @@
    "UP031": 1
   },
   "adapters/hermes/tool_surface.py": {
-   "E501": 1,
    "UP006": 3,
    "UP035": 2
   },
@@ -481,8 +480,7 @@
    }
   },
   "core/recall_policy.py": {
-   "UP017": 1,
-   "UP035": 1
+   "UP017": 1
   },
   "core/recall_scope.py": {
    "B905": 1,

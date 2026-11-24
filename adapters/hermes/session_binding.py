@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
 
+from ..clients import local_endpoint
 from .audiences import LOCAL_PLATFORMS, LOCAL_USER_ID
 from .capture import CAPTURE_TIMEOUT_S
 from .identity import (
@@ -131,6 +132,12 @@ class SessionBinding:
             )
             self._adapter._worker_launch_gaps = ()
             self._adapter._initialized = True
+            if (
+                not self._adapter._injected_core
+                and not self._adapter._explicit_runtime_config
+                and local_endpoint.resident_minutes(fresh.hermes_home, "hermes") > 0
+            ):
+                local_endpoint.request_recall(fresh.hermes_home, "hermes")
             # What an earlier process kept on disk, its shutdown or a pass that could not store it, is this start's
             # to write (``CaptureRetry.load_kept``).
             self._adapter._retry.load_kept()

@@ -8,7 +8,7 @@ installation can use it. It does not call a model or a network service. Agent to
 conversation-authorization checks; they do not expose this installation capability.
 
 Select a shared store with `--root /path/to/store`. For an installation with its own store, use
-`--host hermes|codex|claude-code|workbuddy|dsh --instance-root /path/to/home`. An attached entry directs you to the shared
+`--host hermes|codex|claude-code|workbuddy|dsh|antigravity --instance-root /path/to/home`. An attached entry directs you to the shared
 store root so management sees the whole installation. Examples below use a shared root.
 
 ## Local account approval
@@ -382,8 +382,8 @@ The Review page lists unconfirmed cross-session observations. The held-content p
 Use **Confirm observation** to record review, or open the fact detail to edit the body or delete it. Confirmation
 keeps the `derived_summary` basis and the original multi-session evidence. A source withdrawal still invalidates
 an observation after confirmation. Existing `memory show`, `memory revise` and deletion commands handle these
-claim references. The agent `revise` tool is closed because the hosts lack a verified latest-message binding
-for each model request. Use local memory management for explicit edits and retractions.
+claim references. Model-driven `revise` requires a host-verified latest-message binding (`request_message_binding`);
+when unavailable, use local memory management for explicit edits and retractions.
 
 ## Correct source provenance
 

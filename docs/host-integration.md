@@ -1,6 +1,6 @@
 # Host capture and identity
 
-Hermes, Codex, Claude Code, WorkBuddy and dsh share immutable installation bindings and exact audience grants.
+Hermes, Codex, Claude Code, WorkBuddy, dsh, Antigravity and Cherry Studio share immutable installation bindings and exact audience grants.
 Session ids distinguish conversations; they do not attest a person's identity. Local Hermes surfaces require the
 owner's approved grant. A shared coding-client entry uses the route approved when it was attached. An unknown route
 never borrows another route's scopes.
@@ -67,16 +67,17 @@ for service cleanup. Hermes uses the host's native memory-provider lifecycle rat
 
 ## Resident recall
 
-The background worker starts one recall process for the shared library, discovered through a directory private to
-this OS user. Every entry uses the same library lock and signed loopback transport. Requests name their entry and
-host; the service reloads the attachment before choosing its audience-specific handler. Entries cannot borrow one
-another's grants, including after a grant or attachment changes. Capture remains synchronous in the invoking hook.
+The background worker starts one recall process for a shared library or a standalone local Hermes store, discovered
+through a directory private to this OS user. Every entry of that store uses the same store lock and signed loopback
+transport. Requests name their entry and host; the service reloads the attachment or local manifest before choosing its
+audience-specific handler. Entries cannot borrow one another's grants, including after a grant or attachment changes.
+Capture remains synchronous in the invoking hook.
 
-Hooks, MCP services, and Hermes shared-store entries publish activity but never launch or keep a separate recall
+Hooks, MCP services, and Hermes adapters publish activity but never launch or keep a separate recall
 process. Worker passes do not extend idle time. The process exits after the longest enabled entry idle allowance,
 when all entries disable it, when its installed package is replaced, or when recall remains stuck. A missing runtime
 config starts no service; a transient unreadable config receives a second check before shutdown. The default
-allowance is 120 minutes for local Hermes and coding-client entries. An explicit `resident_recall_minutes: 0`
+allowance is 120 minutes for local Hermes installations and coding-client entries. An explicit `resident_recall_minutes: 0`
 remains a way to disable residence when no other entry has it enabled. The worker's explicit zero stops the library
 service.
 
@@ -115,7 +116,7 @@ recording keeps a session's input out of the store ([Private mode](private-mode.
 ## Task handoffs
 
 `handoff_write`, `handoff_list`, `handoff_accept` and `handoff_cancel` are available
-on the Codex, Claude Code, WorkBuddy and dsh MCP servers and the Hermes provider.
+on the Codex, Claude Code, WorkBuddy, dsh and Antigravity MCP servers and the Hermes provider.
 They use the authenticated entry's read and write scopes. Handoffs are agent
 reports attached to task episodes; they do not become facts or consolidation input.
 

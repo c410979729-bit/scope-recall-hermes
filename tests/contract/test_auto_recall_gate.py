@@ -437,6 +437,11 @@ def test_status_links_bind_the_post_across_handles_hosts_and_media_views(tmp_pat
     packet = core.recall_packet(replace(ctx, session_id="reader"), recall_request(query=query))
     assert right.ref in {item["ref"] for item in packet["items"]}
     assert all("42018" not in item["content"] for item in packet["items"])
+    explicit_req = {**recall_request(query=query), "mode": "current"}
+    explicit_packet = core.recall_packet(
+        replace(ctx, session_id="reader"), explicit_req, background_without_evidence=False
+    )
+    assert right.ref in {item["ref"] for item in explicit_packet["items"]}
 
 
 @pytest.mark.parametrize(
@@ -622,3 +627,12 @@ def test_a_passed_over_lexical_hit_stays_when_meaning_could_not_judge_it(tmp_pat
     automatic = core.recall_packet(ctx, recall_request(query=query))
 
     assert said.ref in {item["ref"] for item in automatic["items"]}, automatic["gaps"]
+
+
+def test_unix_path_prefix_is_not_skipped_as_slash_command():
+    assert automatic_recall_skip_reason("/srv/workspace/project\n\nInspect the tools in this repository") is None
+    assert automatic_recall_skip_reason("/tmp/check.py inspect this file") is None
+    assert automatic_recall_skip_reason("/.config/app.toml check this config") is None
+    assert automatic_recall_skip_reason("/code-review /tmp/check.py") == "slash_command"
+    assert automatic_recall_skip_reason("/status") == "slash_command"
+    assert automatic_recall_skip_reason("/") == "slash_command"

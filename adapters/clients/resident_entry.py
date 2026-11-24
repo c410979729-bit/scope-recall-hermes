@@ -61,7 +61,7 @@ FUTURE_MARK_SECONDS = 60.0
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scope Recall resident prompt recall server")
-    parser.add_argument("--home", type=Path, required=True, help="Absolute home of a client attached to a shared store")
+    parser.add_argument("--home", type=Path, required=True, help="Absolute home of a local or shared-store entry")
     parser.add_argument("--host", choices=RESIDENT_HOSTS, required=True)
     parser.add_argument(
         "--env-file",

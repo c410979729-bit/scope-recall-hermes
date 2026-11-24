@@ -1,6 +1,6 @@
 # Scope Recall
 
-Scope Recall `4.0.6` lets your assistants find earlier conversations and show where an answer came from.
+Scope Recall `4.0.7` lets your assistants find earlier conversations and show where an answer came from.
 You can keep memory on one computer or share a store across your own agents. Capture and text search work without a model budget.
 
 ## Quick start

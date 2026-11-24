@@ -151,6 +151,9 @@ def render() -> str:
             "In model_token_caps each model maps to an object with input and output integers or null; "
             "both keys are stated.",
             "Embedding descriptor fields may be omitted together to select the built-in space.",
+            "On EmbeddingRouteConfig, credential_env may be omitted or null only when endpoint addresses a loopback "
+            "host; query_prefix and document_prefix move together into the space digest and require an explicit "
+            "vector_threshold.",
         ]
     )
     return "\n".join(lines) + "\n"

@@ -49,7 +49,7 @@ scope-recall private off --all --root /path/to/store
 ```
 
 The same store selection flags as the management commands apply: `--root` for a
-shared store, or `--host hermes|codex|claude-code|workbuddy|dsh` with
+shared store, or `--host hermes|codex|claude-code|workbuddy|dsh|antigravity` with
 `--instance-root` for a host's own store. `--json` emits
 `scope-recall-private/1`, defined by
 [`private_mode.schema.json`](../contracts/private_mode.schema.json). A refused
@@ -93,8 +93,9 @@ with the local memory command or [management page](ui.md) while private mode
 applies under either mode. Owner inspection makes no model or embedding request
 and preserves scope and deletion checks. Agents cannot use owner inspection;
 full mode blocks their recall and outbound work, while read-only permits both
-for existing memory. The agent `forget` and `revise` tools are closed because
-the hosts lack a verified latest-message binding for each model request.
+for existing memory. Agent `forget` and `revise` tools remain blocked while
+private mode applies and require verified latest-message binding
+(`request_message_binding`) when private mode is off.
 
 Overlapping rules take the stricter mode: `full` beats `read-only`. Closing one
 rule never closes another, so `off --all` does not release a session or project

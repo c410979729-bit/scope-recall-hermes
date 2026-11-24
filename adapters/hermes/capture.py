@@ -175,8 +175,10 @@ class CaptureWriter:
         reader = getattr(self._adapter._require_core(), "private_capture_guard", None)
         if reader is None:
             return None
+        if remaining_seconds <= 0:
+            return ContractError("DEADLINE_EXCEEDED", "capture_guard")
         try:
-            return reader(context, observations=observations, remaining_seconds=max(0.001, remaining_seconds))
+            return reader(context, observations=observations, remaining_seconds=remaining_seconds)
         except (ContractError, OSError, RuntimeError, sqlite3.Error) as exc:
             return exc
 

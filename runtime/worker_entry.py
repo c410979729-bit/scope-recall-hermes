@@ -68,9 +68,9 @@ def load_config(path: str | Path) -> RuntimeInstanceConfig:
 def credential_environment(config, env_file):
     """Read only the configured credential keys; never execute/interpolate dotenv."""
     names = {
-        route.credential_env
+        name
         for route in (getattr(config.auxiliary, "embedding", None), getattr(config.auxiliary, "consolidation", None))
-        if route is not None and hasattr(route, "credential_env")
+        if route is not None and (name := getattr(route, "credential_env", None))
     }
     if not env_file or not names:
         return {}
@@ -616,9 +616,12 @@ def run_backup_worker(
             backup_deadline(deadline, cancelled=backup_pause_check(config, paused)),
         ):
             receipt = backup_if_due(SQLiteStorage(config.binding), config, available_seconds=budget)
+        from ..adapters.clients.store_service import manage
+
+        resident = resident_recall_result(manage(config.binding, minutes=config.resident_recall_minutes))
         outcome = (receipt or {}).get("outcome", "skipped_not_due")
         payload = _minimal_payload(config, "degraded" if outcome == "failed" else "ok", "backup_failed")
-        payload.update(job_kind="backup", backup_outcome=outcome)
+        payload.update(job_kind="backup", backup_outcome=outcome, resident_recall=resident)
         if outcome != "failed":
             payload["capability_gaps"] = []
         _write(sink, payload)

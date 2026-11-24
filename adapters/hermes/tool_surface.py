@@ -18,9 +18,16 @@ from scope_recall.core.handoff import tool_schemas as handoff_schemas
 from scope_recall.core.read_views import DEFAULT_BUDGET_TOKENS, DEFAULT_MAX_ITEMS
 from scope_recall.core.trace import fence_trace_epoch, trace_tool_schema
 
+from ..clients import local_endpoint
 from ..clients.hook_answer import server_own_vector_fault
-from ..clients.local_endpoint import Recaller, request_recall, resident_minutes
-from ..runtime_wiring import FORGET_GUIDANCE, READ_VIEW_BUDGET_GUIDANCE, RECALL_TOOL_GUIDANCE, REVISE_GUIDANCE
+from ..runtime_wiring import (
+    FORGET_GUIDANCE,
+    INSPECT_GUIDANCE,
+    READ_VIEW_BUDGET_GUIDANCE,
+    RECALL_TOOL_GUIDANCE,
+    REVISE_GUIDANCE,
+    STATUS_GUIDANCE,
+)
 from ..tool_common import (
     FENCED_ENTITY,
     FENCED_PROFILE,
@@ -58,13 +65,26 @@ def _parameters(properties: dict[str, Any], required: list[str], *, version_defa
     }
 
 
+_HERMES_RECALL_BUDGET_GUIDANCE = (
+    "budget_tokens caps the character-calibrated token estimate of the complete canonical "
+    "packet, including packet and source metadata (64..8000; recommended 4096 for explicit retrieval). "
+    "If a smaller budget hits budget_token_cap or budget_packet_cap, retry once with budget_tokens=4096."
+)
+
 _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "name": "recall",
-        "description": RECALL_TOOL_GUIDANCE + " Runs the shared bounded read-only recall pipeline.",
+        "description": RECALL_TOOL_GUIDANCE
+        + " Runs the shared bounded read-only recall pipeline. "
+        + _HERMES_RECALL_BUDGET_GUIDANCE,
         "parameters": _parameters(
             {
-                "query": {"type": "string", "minLength": 1, "maxLength": MAX_CONTENT},
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_CONTENT,
+                    "description": "Search query; include specific identifiers, repo/symbol names, or topic terms.",
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "current", "history", "as_of", "method"],
@@ -81,20 +101,42 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                     "2026-09-17T12:00:00Z. A date alone, a space instead of the T, or a time "
                     "without an offset is refused.",
                 },
-                "max_items": {"type": "integer"},
-                "budget_tokens": {"type": "integer"},
-                "focus_refs": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 240}},
+                "max_items": {
+                    "type": "integer",
+                    "description": "Maximum items to return (higher values spend budget_tokens faster).",
+                },
+                "budget_tokens": {
+                    "type": "integer",
+                    "description": _HERMES_RECALL_BUDGET_GUIDANCE,
+                },
+                "focus_refs": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "description": "Optional prior ref strings to bias relation/claim expansion around.",
+                },
             },
             ["protocol_version", "query", "mode", "max_items", "budget_tokens"],
         ),
     },
     {
         "name": "inspect",
-        "description": "Inspect one visible, versioned object or source, or a recall packet's diagnostic_ref from this session.",
+        "description": INSPECT_GUIDANCE,
         "parameters": _parameters(
             {
-                "ref": {"type": "string", "minLength": 1, "maxLength": 240},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 24, "default": 24},
+                "ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240,
+                    "description": "Object ref (e.g. 'event-...@1', 'claim-...') from auto-injected memory "
+                    "or recall(), or a diagnostic_ref from this session.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 24,
+                    "default": 24,
+                    "description": "Maximum linked evidence/claim items to include (1-24, default 24).",
+                },
             },
             ["protocol_version", "ref"],
         ),
@@ -184,7 +226,7 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "status",
-        "description": "Read bounded Core status and adapter capability gaps.",
+        "description": STATUS_GUIDANCE,
         "parameters": _parameters({}, [], version_default=True),
     },
 )
@@ -223,16 +265,12 @@ def resident_hermes_recall(
     session_id: str | None = None,
     host_memory_entries: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
-    """Ask the shared library's resident process for a read-only Hermes recall, or return None to recall locally."""
-    if (
-        identity.entry_id is None
-        or getattr(adapter, "_injected_core", False)
-        or getattr(adapter, "_explicit_runtime_config", False)
-    ):
+    """Ask the resident process for a read-only Hermes recall, or return None to recall locally."""
+    if getattr(adapter, "_injected_core", False) or getattr(adapter, "_explicit_runtime_config", False):
         return None
-    if resident_minutes(identity.hermes_home, "hermes") <= 0:
+    if local_endpoint.resident_minutes(identity.hermes_home, "hermes") <= 0:
         return None
-    request_recall(identity.hermes_home, "hermes")
+    local_endpoint.request_recall(identity.hermes_home, "hermes")
     prepare_render = host_memory_entries is not None
     zone = display_zone()
     scope = identity.scope
@@ -262,7 +300,7 @@ def resident_hermes_recall(
         "background_without_evidence": prepare_render,
     }
     try:
-        answered = Recaller(identity.hermes_home, "hermes")(payload, current_refs, (), budget_seconds)
+        answered = local_endpoint.Recaller(identity.hermes_home, "hermes")(payload, current_refs, (), budget_seconds)
     except Exception:  # noqa: BLE001 - fall back to direct in-process recall
         return None
     if answered is None:

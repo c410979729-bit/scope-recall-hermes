@@ -9,11 +9,19 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
+from contextvars import ContextVar
 from typing import Any
 
 from ..host_profiles import HOSTS
 
 _log = logging.getLogger(__name__)
+_CURRENT_HOOK_DEADLINE: ContextVar[float | None] = ContextVar("_CURRENT_HOOK_DEADLINE", default=None)
+
+
+def current_hook_deadline() -> float | None:
+    """Return the active Hermes callback deadline for the executing thread, if any."""
+    return _CURRENT_HOOK_DEADLINE.get()
+
 
 _OBSERVERS = dict(HOSTS["hermes"].hook_observers)
 _SUPPORTED_HOOKS = tuple(_OBSERVERS)
@@ -193,15 +201,20 @@ def _dispatch(event: str, kwargs: dict[str, Any], *, wait: float, deadline: floa
 def _global_callback(event: str) -> Callable[..., None]:
     def callback(**kwargs: Any) -> None:
         started, timeout = time.monotonic(), host_hook_timeout()
+        hook_deadline = _input_hook_deadline(started, timeout)
         selected = _active_adapter(kwargs) if event == "pre_api_request" else None
         native = getattr(selected, "_native_requests", None)
         candidate = native.observe(selected, kwargs) if native is not None else None
-        adapter = _dispatch(
-            event,
-            kwargs,
-            wait=_SESSION_WAIT_CAP_S if timeout is None else min(_SESSION_WAIT_CAP_S, timeout / 3),
-            deadline=_input_hook_deadline(started, timeout) if event in {"pre_llm_call", "pre_api_request"} else None,
-        )
+        token = _CURRENT_HOOK_DEADLINE.set(hook_deadline)
+        try:
+            adapter = _dispatch(
+                event,
+                kwargs,
+                wait=_SESSION_WAIT_CAP_S if timeout is None else min(_SESSION_WAIT_CAP_S, timeout / 3),
+                deadline=hook_deadline if event in {"pre_llm_call", "pre_api_request"} else None,
+            )
+        finally:
+            _CURRENT_HOOK_DEADLINE.reset(token)
         if native is not None and adapter is selected:
             native.finish(candidate)
         elapsed = time.monotonic() - started

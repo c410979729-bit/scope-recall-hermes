@@ -35,6 +35,7 @@ from scope_recall.adapters.hermes.installation import (
     unapproved_owner_logins as _unapproved_owner_logins,
 )
 from scope_recall.adapters.hermes.shared_entries import attachment_path, load_binding_for_home
+from scope_recall.vector.imports import legacy_lancedb_import_pending
 
 from .install_common import (
     REPO_ROOT,
@@ -50,7 +51,7 @@ from .install_common import (
 # The public installer must bind that exact host value; identifiers are not aliased.
 DEFAULT_AGENT_WORKSPACE = "hermes"
 DIST_HERMES = REPO_ROOT / "distribution" / "hermes"
-_CORE_PIN = re.compile(r'"hermes-scope-recall\[vectors\]==[^"]*"')
+_CORE_PIN = re.compile(r'"hermes-scope-recall\[(?:vectors|lancedb)\]==[^"]*"')
 
 
 def registration(instance: Path, python_executable: Path | None) -> str:
@@ -219,17 +220,30 @@ def environment_notes(plan: InstallPlan, home_plugin: Path | None) -> tuple[str,
     )
 
 
-def wrapper_pyproject(version: str = __version__) -> str:
+def _required_wrapper_extra(instance_root: Path | None) -> str:
+    """Keep ``[lancedb]`` until a bound store's legacy LanceDB companion has finished importing to SQLite."""
+    if instance_root is None:
+        return "vectors"
+    store_dir = data_dir(instance_root)
+    try:
+        store_dir = load_binding_for_home(instance_root).data_directory
+    except Exception:  # noqa: BLE001 - uninitialized or partial homes fall back to the local store path.
+        pass
+    return "lancedb" if legacy_lancedb_import_pending(store_dir) else "vectors"
+
+
+def wrapper_pyproject(version: str = __version__, *, extra: str = "vectors") -> str:
     """The ``pyproject.toml`` beside the wrapper in ``home_plugin_dir``: the same core, vector extra included.
 
     Hermes's package manager builds the environment it runs plugins in from each plugin's declaration, and a
     ``pyproject.toml`` there wins over ``plugin.yaml``. The vector extra stays in the declaration for installation
-    compatibility; NumPy retrieval is part of the base dependency set. Development, pre-release and local versions
-    are pinned too; Hermes must be given a wheel source when rebuilding their environment.
+    compatibility (or ``lancedb`` while a legacy LanceDB companion import is still pending); NumPy retrieval is part
+    of the base dependency set. Development, pre-release and local versions are pinned too; Hermes must be given a
+    wheel source when rebuilding their environment.
     """
     return (
         '[project]\nname = "hermes-scope-recall-plugin"\nversion = "0.0.0"\nrequires-python = ">=3.11"\n'
-        f'dependencies = ["hermes-scope-recall[vectors]=={version}"]\n\n[tool.uv]\npackage = false\n'
+        f'dependencies = ["hermes-scope-recall[{extra}]=={version}"]\n\n[tool.uv]\npackage = false\n'
     )
 
 
@@ -246,7 +260,7 @@ def adoptable_wrapper_files(target: Path) -> set[Path]:
     return {target / name for name in ("plugin.yaml", "__init__.py", "pyproject.toml") if (target / name).is_file()}
 
 
-def wrapper_manifest(template: str, version: str = __version__) -> str:
+def wrapper_manifest(template: str, version: str = __version__, *, extra: str = "vectors") -> str:
     """Stamp the wrapper's own version and declare its core when that is a release on PyPI.
 
     Hermes Desktop rebuilds the Python environment it runs plugins in on updates, dropping a core installed
@@ -259,25 +273,30 @@ def wrapper_manifest(template: str, version: str = __version__) -> str:
     template = stamp_manifest_version(template, version)
     if _non_pypi_version(version):
         return re.sub(r"(?m)^pip_dependencies:\r?\n(?:[ \t]+[^\n]*\n?)*", "", template)
+    template, _ = _CORE_PIN.subn(f'"hermes-scope-recall[{extra}]=={version}"', template)
     return template
 
 
-def _pinned_manifest(template: str, version: str) -> str:
+def _pinned_manifest(template: str, version: str, *, extra: str = "vectors") -> str:
     """Stamp the catalog manifest and pin its core exactly, including development builds."""
     stamped = stamp_manifest_version(template, version)
-    pinned, count = _CORE_PIN.subn(f'"hermes-scope-recall[vectors]=={version}"', stamped)
+    pinned, count = _CORE_PIN.subn(f'"hermes-scope-recall[{extra}]=={version}"', stamped)
     if count != 1:
         raise InstallError("the catalog manifest does not pin exactly one core package")
     return pinned
 
 
-def wrapper_files(target: Path) -> dict[Path, str]:
+def wrapper_files(target: Path, *, instance_root: Path | None = None) -> dict[Path, str]:
     """Render a wrapper without writes, preserving its dependency declaration form.
 
     Hermes locks the plugin member by declaration source; changing that source can disable the plugin during a
     rebuild. Existing authored projects keep their form. Fresh and manifest-only directories pin every build in
     ``plugin.yaml``, with the same wheel-source requirement as an authored project for builds absent from PyPI.
     """
+    inferred_home = instance_root
+    if inferred_home is None and target.parent.name == "plugins":
+        inferred_home = target.parent.parent
+    extra = _required_wrapper_extra(inferred_home)
     files: dict[Path, str] = {}
     for name in ("__init__.py", "plugin.yaml"):
         source = DIST_HERMES / name
@@ -286,10 +305,16 @@ def wrapper_files(target: Path) -> dict[Path, str]:
         files[target / name] = source.read_text(encoding="utf-8")
     manifest = target / "plugin.yaml"
     if (target / "pyproject.toml").is_file():
-        files[manifest] = wrapper_manifest(files[manifest], __version__)
-        files[target / "pyproject.toml"] = wrapper_pyproject(__version__)
+        files[manifest] = (
+            wrapper_manifest(files[manifest], __version__)
+            if extra == "vectors"
+            else wrapper_manifest(files[manifest], __version__, extra=extra)
+        )
+        files[target / "pyproject.toml"] = (
+            wrapper_pyproject(__version__) if extra == "vectors" else wrapper_pyproject(__version__, extra=extra)
+        )
     else:
-        files[manifest] = _pinned_manifest(files[manifest], __version__)
+        files[manifest] = _pinned_manifest(files[manifest], __version__, extra=extra)
     return files
 
 
@@ -297,7 +322,7 @@ def planned_files(plan: InstallPlan) -> dict[Path, str | bytes]:
     """Render installer-owned wrappers and skills, leaving catalog-managed plugin files to Hermes."""
     files: dict[Path, str | bytes] = {}
     if not host_owned_plugin(plan.instance_root, plan.target_plugin_dir):
-        files.update(wrapper_files(plan.target_plugin_dir))
+        files.update(wrapper_files(plan.target_plugin_dir, instance_root=plan.instance_root))
     for name, source in SKILLS.items():
         files[plan.instance_root / "skills" / name / "SKILL.md"] = source.read_text(encoding="utf-8")
     return files

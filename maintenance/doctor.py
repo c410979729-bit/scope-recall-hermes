@@ -27,6 +27,7 @@ from scope_recall.adapters.hermes.shared_entries import read_attachment, read_sh
 from scope_recall.adapters.hermes.unbound_sessions import owner_sessions_unbound
 from scope_recall.adapters.host_identity import HermesRuntimeScope, resolve_granted_audience
 from scope_recall.adapters.host_memory import inspect_host_memory
+from scope_recall.adapters.runtime_wiring import bindings_match
 from scope_recall.contracts import CLIENT_HOSTS, HOOK_CLIENT_HOSTS, ContractError
 from scope_recall.core.entry_control import account_pin, current_account_pin, local_account_matches
 from scope_recall.core.recall_policy import RecallPolicy, embedding_space_id
@@ -41,6 +42,7 @@ from scope_recall.runtime.model_budget import (
     provider_refusals,
 )
 from scope_recall.runtime.running_code import live_records, stale_records
+from scope_recall.vector.imports import legacy_lancedb_import_pending
 
 from . import package_health
 from .doctor_report import DoctorReport, HostChoice, record_check
@@ -133,7 +135,12 @@ def _installed_version(names: list[str], distribution: str) -> str | None:
     return None
 
 
-def _check_hermes_runtime(report: DoctorReport, instance: Path, config: RuntimeInstanceConfig | None) -> None:
+def _check_hermes_runtime(
+    report: DoctorReport,
+    instance: Path,
+    config: RuntimeInstanceConfig | None,
+    data_directory: Path | None = None,
+) -> None:
     """Check the package version and vector dependencies in the environment Hermes manages.
 
     The inspecting interpreter can differ from that environment. An unreadable environment is reported without
@@ -151,9 +158,16 @@ def _check_hermes_runtime(report: DoctorReport, instance: Path, config: RuntimeI
         record_check(report, "hermes_runtime", "unreadable")
         return
     version = _installed_version(names, "hermes-scope-recall")
-    vectors = all(_installed_version(names, name) is not None for name in ("numpy",))
     vector = config.vector if config is not None else None
     needs_vectors = vector is not None
+    required = ("numpy",)
+    if (
+        vector is not None
+        and data_directory is not None
+        and legacy_lancedb_import_pending(data_directory, storage_dir=vector.storage_dir)
+    ):
+        required = ("numpy", "lancedb", "pyarrow")
+    vectors = all(_installed_version(names, name) is not None for name in required)
     report.hermes_runtime = {
         "environment": str(environment),
         "package_version": version,
@@ -170,7 +184,10 @@ def _check_hermes_runtime(report: DoctorReport, instance: Path, config: RuntimeI
 
 
 def _check_vector_dependencies(
-    report: DoctorReport, probe: dict[str, Any], config: RuntimeInstanceConfig | None
+    report: DoctorReport,
+    probe: dict[str, Any],
+    config: RuntimeInstanceConfig | None,
+    data_directory: Path | None = None,
 ) -> None:
     """Report missing vector packages for a configured vector companion.
 
@@ -181,7 +198,12 @@ def _check_vector_dependencies(
     found = probe.get("vector_dependencies")
     if not isinstance(found, dict):
         return
-    missing = sorted(name for name, version in found.items() if not version)
+    checked = dict(found)
+    if data_directory is not None and legacy_lancedb_import_pending(data_directory, storage_dir=vector.storage_dir):
+        legacy = probe.get("legacy_lancedb_dependencies")
+        if isinstance(legacy, dict):
+            checked.update(legacy)
+    missing = sorted(name for name, version in checked.items() if not version)
     record_check(report, "vector_dependencies", "missing" if missing else "ok", ",".join(missing))
     if missing:
         report.capability_gaps.append("vector_dependencies_missing")
@@ -401,6 +423,7 @@ _WORKER_STATUS_KEYS = frozenset(
         "worker_error",
         "ingress_deferred",
         "ingress_given_up",
+        "resident_recall",
     }
 )
 
@@ -949,18 +972,34 @@ def _entry_runtime_config(instance: Path, data_directory: Path):
     return _runtime_config(pointer.parent if pointer.is_file() else data_directory)
 
 
-def _check_vector_threshold(report: DoctorReport, binding, data_directory: Path) -> None:
+def _check_vector_threshold(
+    report: DoctorReport, binding, data_directory: Path, *, instance: Path | None = None
+) -> None:
     """Report recall's built-in default or configured floor without changing configuration."""
+    attached = instance is not None and (_hermes_data_dir(instance) / "attachment.json").is_file()
+    entry_file = _hermes_data_dir(instance) / "runtime-config.json" if attached and instance is not None else None
+    config_file = (
+        entry_file if entry_file is not None and entry_file.exists() else data_directory / "runtime-config.json"
+    )
     try:
-        raw = _read_control_file(data_directory / "runtime-config.json")
+        raw = _read_control_file(config_file)
         config = None if raw is None else RuntimeInstanceConfig.from_mapping(raw)
     except Exception as exc:  # noqa: BLE001 - an unusable config is a finding, not a crash.
         record_check(report, "vector_threshold", "invalid", type(exc).__name__)
         return
+    shared_store_config = (
+        attached
+        and config is not None
+        and config_file != entry_file
+        and config.binding.installation_kind == "shared"
+        and config.binding.installation_id == binding.installation_id
+        and config.binding.data_directory.resolve() == data_directory.resolve()
+        and config.binding.test_mode == binding.test_mode
+    )
     auxiliary = getattr(config, "auxiliary", None)
     if (
         config is None
-        or config.binding != binding
+        or (not bindings_match(binding, config.binding) and not shared_store_config)
         or config.vector is None
         or auxiliary is None
         or auxiliary.external_embedding is not True
@@ -1061,7 +1100,7 @@ def run_doctor(
     _check_running_code(report, data_directory)
     package_health.apply_package_health(report, instance, probe)
     check_runtime_config_present(report, data_directory)
-    _check_vector_threshold(report, binding, data_directory)
+    _check_vector_threshold(report, binding, data_directory, instance=instance)
 
     readable = check_storage(report, binding, data_directory)
     if entry_accounts:
@@ -1071,8 +1110,11 @@ def run_doctor(
     check_recall_log(report, binding, request_id=recall_request_id)
     config = _runtime_config(data_directory)
     entry_config = _entry_runtime_config(instance, data_directory)
-    _check_hermes_runtime(report, instance, entry_config)
-    _check_vector_dependencies(report, probe, entry_config)
+    bound_entry_dir = (
+        data_directory if entry_config is not None and bindings_match(binding, entry_config.binding) else None
+    )
+    _check_hermes_runtime(report, instance, entry_config, bound_entry_dir)
+    _check_vector_dependencies(report, probe, entry_config, bound_entry_dir)
     check_vector_store(report, entry_config, binding)
     check_footprint(report, data_directory, config)
     if readable:

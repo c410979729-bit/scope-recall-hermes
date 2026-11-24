@@ -38,7 +38,8 @@ from .boundary import (
     tool_call_source_event,
     unanswered_messages,
 )
-from .capture import CAPTURE_TIMEOUT_S, GAP_CURRENT_SOURCE_REFS_LIMIT
+from .capture import CAPTURE_TIMEOUT_S, GAP_CURRENT_SOURCE_REFS_LIMIT, RETRY_CAPACITY
+from .hooks import current_hook_deadline
 from .tool_surface import TOOL_NAMES
 
 if TYPE_CHECKING:
@@ -589,15 +590,32 @@ class TurnCapture:
             outcome=outcome,
             origin=captured_origin,
         )
-        self._adapter._writer.write(
-            context,
-            event,
-            identity=ledger_identity,
-            gaps=gaps,
-            scope_id=identity.local_scope_id,
-            bound=identity,
-            release=True,
+        hook_deadline = current_hook_deadline()
+        remaining = (
+            CAPTURE_TIMEOUT_S
+            if hook_deadline is None
+            else min(CAPTURE_TIMEOUT_S, max(0.0, hook_deadline - time.monotonic()))
         )
+        if hook_deadline is not None and remaining <= 0.02:
+            self._adapter._writer.defer(
+                context,
+                event,
+                identity=ledger_identity,
+                gaps=gaps,
+                scope_id=identity.local_scope_id,
+                bound=identity,
+            )
+        else:
+            self._adapter._writer.write(
+                context,
+                event,
+                identity=ledger_identity,
+                gaps=gaps,
+                scope_id=identity.local_scope_id,
+                remaining_seconds=remaining,
+                bound=identity,
+                release=True,
+            )
         self._adapter._diagnostics.pending_outcome_gaps = self._adapter._outcomes.pending_gaps()
 
     def request_error(self, **kwargs) -> None:
@@ -646,7 +664,8 @@ class TurnCapture:
                 )[1],
             )
             for ordinal, (text, moment) in enumerate(
-                interim_messages(history, answer=answer if isinstance(answer, str) else ""), start=1
+                interim_messages(history, answer=answer if isinstance(answer, str) else "")[: _INTERIM_PER_TURN + 1],
+                start=1,
             )
         )
         steered = tuple(
@@ -657,14 +676,19 @@ class TurnCapture:
             )
             for steer in _steers(identity, history)
         )
+        hook_deadline = current_hook_deadline()
         try:
             check = self._adapter._require_core().private_check
-            moments = [moment for _text, moment in said] + [steer.occurred_at for steer in steered]
+            moments = list(dict.fromkeys([moment for _text, moment in said] + [steer.occurred_at for steer in steered]))
             # Keep no body if any of this observation is private or unverified.
-            refused = any(
-                check(context, moments[start : start + 64])["capture_blocked"]
-                for start in range(0, max(1, len(moments)), 64)
-            )
+            refused = False
+            for start in range(0, max(1, len(moments)), 64):
+                if hook_deadline is not None and time.monotonic() >= hook_deadline:
+                    refused = True
+                    break
+                if check(context, moments[start : start + 64])["capture_blocked"]:
+                    refused = True
+                    break
         except (ContractError, OSError, RuntimeError, sqlite3.Error):
             refused = True
         if refused:
@@ -949,6 +973,12 @@ class TurnCapture:
                                 if gaps:
                                     adapter._merge_gaps(gaps)
                             elif not fits(deadline, took):
+                                if lock_deadline is not None and len(adapter._retry.captures) >= RETRY_CAPACITY:
+                                    # Request hooks leave overflow steers in conversation history for post-turn sync
+                                    # rather than blocking the foreground request on disk spool fsyncs.
+                                    adapter._ledger.rollback(ledger_identity)
+                                    adapter._merge_gaps(("capture_gap:input_hook_deadline",))
+                                    break
                                 # The hook's time is spent, or what is left would not hold another write as long as
                                 # the last (``fits``): kept to retry with no store call.
                                 adapter._writer.defer(

@@ -1,4 +1,4 @@
-"""Worker control of the single resident recall process belonging to a local shared library."""
+"""Worker control of the single resident recall process belonging to a local library or standalone Hermes store."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import time
 
 from ...runtime.validation import strict_int
-from .hermes_resident import shared_resident_entries
+from .hermes_resident import resident_entries, shared_resident_entries
 from .local_endpoint import configured_minutes, ensure_resident, resident_alive, stop_residents
 
 
@@ -15,17 +15,22 @@ def library_minutes(binding, *, missing: int | None = 0) -> int | None:
     path = binding.data_directory / "runtime-config.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        override = raw.get("resident_recall_minutes")
-        if override is not None:
-            strict_int("resident_recall_minutes", override, minimum=0, maximum=1440)
-            return override
+        raw_binding = raw.get("binding") if isinstance(raw, dict) else None
+        if (
+            isinstance(raw_binding, dict)
+            and raw_binding.get("installation_id") == binding.installation_id
+            and raw_binding.get("installation_kind") == binding.installation_kind
+        ):
+            override = raw.get("resident_recall_minutes")
+            if override is not None:
+                strict_int("resident_recall_minutes", override, minimum=0, maximum=1440)
+                return override
     except FileNotFoundError:
         pass
     except (OSError, ValueError, AttributeError):
         return missing
     values = [
-        configured_minutes(config.home, config.host, missing=missing)
-        for config, _stamp in shared_resident_entries(binding)
+        configured_minutes(config.home, config.host, missing=missing) for config, _stamp in resident_entries(binding)
     ]
     known = [value for value in values if value is not None]
     return max(known) if known and (max(known) > 0 or None not in values) else missing
@@ -33,12 +38,15 @@ def library_minutes(binding, *, missing: int | None = 0) -> int | None:
 
 def manage(binding, *, minutes: int | None = None) -> str:
     """Reconcile one library service during a worker pass; never prevent the durable queue from draining."""
-    if binding.installation_kind != "shared":
-        return "not_shared"
     try:
-        clients = list(shared_resident_entries(binding))
-        if not clients:
-            return "no_clients"
+        if binding.installation_kind == "shared":
+            clients = list(shared_resident_entries(binding))
+            if not clients:
+                return "no_clients"
+        else:
+            clients = list(resident_entries(binding))
+            if not clients:
+                return "not_shared"
         config = clients[0][0]
         allowance = (library_minutes(binding) or 0) if minutes is None else minutes
         if allowance <= 0:
