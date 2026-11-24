@@ -622,3 +622,12 @@ def test_a_passed_over_lexical_hit_stays_when_meaning_could_not_judge_it(tmp_pat
     automatic = core.recall_packet(ctx, recall_request(query=query))
 
     assert said.ref in {item["ref"] for item in automatic["items"]}, automatic["gaps"]
+
+
+def test_unix_path_prefix_is_not_skipped_as_slash_command():
+    assert automatic_recall_skip_reason("/srv/workspace/project\n\nInspect the tools in this repository") is None
+    assert automatic_recall_skip_reason("/tmp/check.py inspect this file") is None
+    assert automatic_recall_skip_reason("/.config/app.toml check this config") is None
+    assert automatic_recall_skip_reason("/code-review /tmp/check.py") == "slash_command"
+    assert automatic_recall_skip_reason("/status") == "slash_command"
+    assert automatic_recall_skip_reason("/") == "slash_command"
