@@ -7,7 +7,7 @@ latest release, because Hermes installs that directory from the default branch.
 
 import re
 
-__version__ = "4.0.7.dev0"
+__version__ = "4.0.7"
 
 
 def manifest_version(version: str) -> str:

@@ -1,6 +1,6 @@
 # Changelog
 
-## [4.0.7.dev0]
+## [4.0.7]
 
 ### Added
 
