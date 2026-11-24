@@ -1086,3 +1086,41 @@ def test_mcp_recall_description_and_no_match_fallback_hint(tmp_path: Path):
     )
     validate_payload("recall_packet", tiny["result"])
     assert NO_MATCH_FALLBACK_HINT not in tiny["result"]["unmet_needs"]
+
+
+def test_recall_inspect_status_tool_guidance_and_parameter_descriptions(tmp_path: Path) -> None:
+    """Both MCP and Hermes surfaces publish situational recall guidance and parameter descriptions."""
+    from scope_recall.adapters.clients.config import install_codex_scope_recall
+    from scope_recall.adapters.clients.mcp_server import build_server
+    from scope_recall.adapters.hermes.tool_surface import _SCHEMAS
+
+    project = tmp_path / "project"
+    project.mkdir()
+    config, core = install_codex_scope_recall(tmp_path / "install", project_root=project)
+    adapter = build_server(config, workspace=project, core=core)
+
+    mcp_recall = adapter.server._tool_manager.get_tool("recall")
+    mcp_inspect = adapter.server._tool_manager.get_tool("inspect")
+    mcp_status = adapter.server._tool_manager.get_tool("status")
+    assert mcp_recall is not None and mcp_inspect is not None and mcp_status is not None
+
+    for desc in (mcp_recall.description, _SCHEMAS["recall"]["description"]):
+        lower = desc.lower()
+        assert "transcript search" in lower
+        assert "inspect(" in lower
+    for desc in (mcp_inspect.description, _SCHEMAS["inspect"]["description"]):
+        assert "verbatim text" in desc.lower()
+    for desc in (mcp_status.description, _SCHEMAS["status"]["description"]):
+        assert "health" in desc.lower()
+
+    mcp_recall_props = mcp_recall.parameters["properties"]
+    hermes_recall_props = _SCHEMAS["recall"]["parameters"]["properties"]
+    for param in ("query", "mode", "max_items", "as_of", "focus_refs"):
+        assert mcp_recall_props[param].get("description"), param
+        assert hermes_recall_props[param].get("description"), param
+
+    mcp_inspect_props = mcp_inspect.parameters["properties"]
+    hermes_inspect_props = _SCHEMAS["inspect"]["parameters"]["properties"]
+    for param in ("ref", "limit"):
+        assert mcp_inspect_props[param].get("description"), param
+        assert hermes_inspect_props[param].get("description"), param
