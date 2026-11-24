@@ -156,8 +156,9 @@ def _check_model_change(store: Path, rows: list[dict], models: dict | None, bloc
     from scope_recall.core.recall_policy import embedding_space_id
     from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 
-    route = AuxiliaryRuntimeConfig.from_mapping(models["auxiliary"]).embedding
-    if route is None:
+    from .setup_configuration import merge_model_fields
+
+    if AuxiliaryRuntimeConfig.from_mapping(models["auxiliary"]).embedding is None:
         return
     candidates = [store / "runtime-config.json"]
     candidates += [_runtime_directory(row) / "runtime-config.json" for row in rows if row["state"] == "local"]
@@ -165,8 +166,11 @@ def _check_model_change(store: Path, rows: list[dict], models: dict | None, bloc
         if path.is_file():
             old = json.loads(path.read_text(encoding="utf-8"))
             previous = AuxiliaryRuntimeConfig.from_mapping(old["auxiliary"])
-            if previous.embedding is not None and embedding_space_id(previous.embedding.space()) != embedding_space_id(
-                route.space()
+            merged = AuxiliaryRuntimeConfig.from_mapping(merge_model_fields(old, models)["auxiliary"])
+            if (
+                previous.embedding is not None
+                and merged.embedding is not None
+                and embedding_space_id(previous.embedding.space()) != embedding_space_id(merged.embedding.space())
             ):
                 blockers.append(
                     "embedding space change needs respace-embeddings and coordinated entry routes; "

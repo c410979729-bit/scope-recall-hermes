@@ -27,6 +27,7 @@ from typing import Any
 
 from scope_recall.adapters.attachment_paths import local_attachment_stat, same_local_path
 from scope_recall.adapters.clients.config import CONFIG_FILENAME as CODEX_CONFIG_FILENAME
+from scope_recall.adapters.clients.local_endpoint import stop_residents
 from scope_recall.adapters.hermes.audiences import LOCAL_USER_ID
 from scope_recall.adapters.hermes.installation import (
     MANIFEST_FILENAME,
@@ -499,6 +500,8 @@ def _attach_locked(
         run.keep(worker_path, "worker")
         run.keep(attachment_path(instance_root), "entry")
         run.keep(entry_path, "entry")
+        if not attachment_path(instance_root).is_file():
+            stop_residents(instance_root, host)
         if source is not None:
             view = attach_shared_entry(
                 root, source, entry_id=entry_id, display_name=display_name, now=now, python_executable=python
@@ -575,6 +578,8 @@ def detach(*, instance_root: Path, now: str | None = None) -> dict[str, Any]:
         # The record stays, detached: the store's rows still name this entry, and
         # a capture it left in the inbox is still checked against its grants.
         record["detached_at"] = now
+        if not any(entry.get("detached_at") is None for entry in payload["entries"]):
+            stop_residents(instance_root, attachment.host)
         write_shared_payload(root, payload)
         for path in ledgers:
             run.folder.mkdir(parents=True, exist_ok=True)

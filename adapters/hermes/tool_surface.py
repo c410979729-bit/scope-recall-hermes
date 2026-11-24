@@ -65,10 +65,18 @@ def _parameters(properties: dict[str, Any], required: list[str], *, version_defa
     }
 
 
+_HERMES_RECALL_BUDGET_GUIDANCE = (
+    "budget_tokens caps the character-calibrated token estimate of the complete canonical "
+    "packet, including packet and source metadata (64..8000; recommended 4096 for explicit retrieval). "
+    "If a smaller budget hits budget_token_cap or budget_packet_cap, retry once with budget_tokens=4096."
+)
+
 _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "name": "recall",
-        "description": RECALL_TOOL_GUIDANCE + " Runs the shared bounded read-only recall pipeline.",
+        "description": RECALL_TOOL_GUIDANCE
+        + " Runs the shared bounded read-only recall pipeline. "
+        + _HERMES_RECALL_BUDGET_GUIDANCE,
         "parameters": _parameters(
             {
                 "query": {
@@ -97,7 +105,10 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                     "type": "integer",
                     "description": "Maximum items to return (higher values spend budget_tokens faster).",
                 },
-                "budget_tokens": {"type": "integer"},
+                "budget_tokens": {
+                    "type": "integer",
+                    "description": _HERMES_RECALL_BUDGET_GUIDANCE,
+                },
                 "focus_refs": {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1, "maxLength": 240},

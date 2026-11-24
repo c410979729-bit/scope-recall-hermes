@@ -1,6 +1,6 @@
 # Host capture and identity
 
-Hermes, Codex, Claude Code, WorkBuddy and dsh share immutable installation bindings and exact audience grants.
+Hermes, Codex, Claude Code, WorkBuddy, dsh, Antigravity and Cherry Studio share immutable installation bindings and exact audience grants.
 Session ids distinguish conversations; they do not attest a person's identity. Local Hermes surfaces require the
 owner's approved grant. A shared coding-client entry uses the route approved when it was attached. An unknown route
 never borrows another route's scopes.
@@ -116,7 +116,7 @@ recording keeps a session's input out of the store ([Private mode](private-mode.
 ## Task handoffs
 
 `handoff_write`, `handoff_list`, `handoff_accept` and `handoff_cancel` are available
-on the Codex, Claude Code, WorkBuddy and dsh MCP servers and the Hermes provider.
+on the Codex, Claude Code, WorkBuddy, dsh and Antigravity MCP servers and the Hermes provider.
 They use the authenticated entry's read and write scopes. Handoffs are agent
 reports attached to task episodes; they do not become facts or consolidation input.
 

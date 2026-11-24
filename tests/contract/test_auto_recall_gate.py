@@ -437,6 +437,11 @@ def test_status_links_bind_the_post_across_handles_hosts_and_media_views(tmp_pat
     packet = core.recall_packet(replace(ctx, session_id="reader"), recall_request(query=query))
     assert right.ref in {item["ref"] for item in packet["items"]}
     assert all("42018" not in item["content"] for item in packet["items"])
+    explicit_req = {**recall_request(query=query), "mode": "current"}
+    explicit_packet = core.recall_packet(
+        replace(ctx, session_id="reader"), explicit_req, background_without_evidence=False
+    )
+    assert right.ref in {item["ref"] for item in explicit_packet["items"]}
 
 
 @pytest.mark.parametrize(

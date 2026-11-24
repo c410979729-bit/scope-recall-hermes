@@ -1075,8 +1075,32 @@ def _spelled_out_forms(text: str) -> frozenset[str]:
     return _written_forms(text) | _written_forms(_IDENTIFIER_JOINT.sub("", text))
 
 
+def _is_hex_digest(form: str) -> bool:
+    """Whether ``form`` is an 8..64 character hexadecimal digest rather than a named product or version token."""
+    return (
+        8 <= len(form) <= 64
+        and all(ch in "0123456789abcdef" for ch in form)
+        and any(ch.isdigit() for ch in form)
+        and any(ch.isalpha() for ch in form)
+        and (len(form) >= 16 or sum(a.isdigit() != b.isdigit() for a, b in zip(form, form[1:], strict=False)) >= 2)
+    )
+
+
+def _hex_prefix_compatible(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    short, full = (left, right) if len(left) <= len(right) else (right, left)
+    return (
+        len(short) >= 7
+        and len(full) <= 64
+        and _is_hex_digest(full)
+        and all(ch in "0123456789abcdef" for ch in short)
+        and full.startswith(short)
+    )
+
+
 def identifiers_compatible(query: str, content: str, *, numbered_urls: bool = False) -> bool:
-    """Keep distinct hard identifiers separate while supporting comparisons.
+    """Keep distinct hard identifiers separate while supporting comparisons and short/full hex digest prefixes.
 
     A query naming H100 may only admit content that carries H100.  A query
     naming both H100 and H200 can therefore admit one side of the comparison
@@ -1090,7 +1114,10 @@ def identifiers_compatible(query: str, content: str, *, numbered_urls: bool = Fa
     requested = _written_forms(query)
     if not requested:
         return True
-    return bool(requested.intersection(_spelled_out_forms(content)))
+    offered = _spelled_out_forms(content)
+    if requested.intersection(offered):
+        return True
+    return any(_hex_prefix_compatible(req, off) for req in requested for off in offered)
 
 
 def _numbered_link(link: str) -> tuple[str, str, str] | None:

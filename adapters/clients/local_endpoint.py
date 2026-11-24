@@ -323,8 +323,11 @@ class Recaller:
         # A resident server first, newest first within each kind (the sort keeps the order): it stays warm, while a
         # server the client just started with a conversation may still be opening its vector store.
         named.sort(key=lambda item: item[1].get("resident") is not True)
+        until = started + budget
         for path, info, port, token, pid in named:
-            if tried >= MAX_TRIED or time.monotonic() - started > FIND_SECONDS:
+            if tried >= MAX_TRIED or (tried > 0 and time.monotonic() - started > FIND_SECONDS):
+                break
+            if time.monotonic() >= until - ANSWER_MARGIN_SECONDS - 0.5:
                 break
             try:
                 state = probe_process(pid)
@@ -339,7 +342,7 @@ class Recaller:
             if info.get("host") not in (self.host, "*") or info.get("version") != __version__:
                 continue
             tried += 1
-            outcome, answer = self._exchange(port, token, request, until=started + budget)
+            outcome, answer = self._exchange(port, token, request, until=until)
             if outcome == "answered":
                 self.outcome = outcome
                 return answer
@@ -419,7 +422,12 @@ def entry_files(home: Path | str) -> tuple[Path, ...]:
     """What an entry's handler is made from besides its credentials and runtime config: its pointer to a shared
     store, its local installation manifest path, and the shared store's record of the entry's grants and binding."""
     root = Path(home)
-    files = [attachment_path(root), root / "scope-recall" / MANIFEST_FILENAME]
+    files = [
+        attachment_path(root),
+        root / "scope-recall" / MANIFEST_FILENAME,
+        root / ".scope-recall-install-receipt.json",
+        root / ".env",
+    ]
     try:
         attachment = read_attachment(root)
     except Exception:  # noqa: BLE001 - an unreadable pointer is one more reason the stamp changed

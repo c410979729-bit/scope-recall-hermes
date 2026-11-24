@@ -6,14 +6,18 @@ description: Use when the user asks what Scope Recall remembers about them, wher
 The user asks in plain words and gets a plain answer. Do the lookups yourself; do
 not hand them refs or JSON to read. Never say something is remembered, changed or
 gone unless a tool said so. Tools: `profile`, `entity`, `recall`, `inspect`,
-`trace`, `status`.
+`trace`, `status` (plus `revise`, `forget`, and `propose_memory` where the host
+exposes verified request-message binding).
 
 When the user states a new value in conversation, no tool call is needed. Follow
-the new statement in your reply. The `revise` and `forget` tools are closed on
-Hermes and MCP because the host cannot attest the exact latest user message
-seen by each model request. `request_message_binding` identifies this limitation.
-Use the local memory management page or `scope-recall memory` commands for
-explicit corrections, withdrawal, suppression and deletion.
+the new statement in your reply. Explicit `revise` and `forget` require a
+host-verified binding to the exact latest complete user message in this model
+request (`request_message_binding`, supported on Hermes and local Codex shared
+entries). On MCP hosts without conversation-message attestation (such as Claude
+Code, WorkBuddy, dsh, Antigravity, or Cherry Studio), or whenever
+`request_message_binding` is returned, use the local memory management page or
+`scope-recall memory` commands for explicit corrections, withdrawal, suppression
+and deletion.
 
 ## What do you remember about me?
 
@@ -60,10 +64,11 @@ the old value.
 
 ## Change it, stop bringing it up, or delete it
 
-Explain the effects and direct the person to local memory management. Changing
-hosts or repeating the request cannot supply the missing host binding. The
-trusted core's source-backed mutation contract has the following semantics,
-which describe the stored operations. The model tools remain unavailable.
+Use `revise` or `forget` when available and bound to the user's current request
+message; when a host returns `request_message_binding` or omits those tools,
+explain the effects and direct the person to local memory management (`scope-recall ui`
+or `scope-recall memory`). The trusted core's source-backed mutation contract
+enforces the following rules:
 
 - **Correct** (`revise`): writes a new version; the old one stays as history.
   Their message must contain the new value, a correcting word (改为, 改成, 换成,
@@ -86,7 +91,7 @@ which describe the stored operations. The model tools remain unavailable.
      message will go with it.
   2. The core source-backed contract recognizes explicit deleting words (删除,
      删掉, 忘掉, 清除; delete, erase, forget) and the named item. A batch names every ref.
-  3. Use local memory management to perform the operation with current versions.
+  3. Call `forget(mode="delete", ...)` with current versions when bound, or use local memory management otherwise.
   4. Report the resulting receipt's `affected_objects` and cleanup layer states.
 
 In the trusted core contract, `forget_not_authorized` means the stored message did not ask

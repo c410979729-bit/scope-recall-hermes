@@ -148,9 +148,9 @@ def _identifiers_match(
         query = context.scope.rest
     elif candidate.source == "dated" and context.time is not None:
         query = context.time.rest
-    return identifiers_compatible(
-        query, obj.content, numbered_urls=context.automatic_injection and not context.focus_refs
-    ) and not conflicting_record(tx, context, obj, query=question)
+    return identifiers_compatible(query, obj.content, numbered_urls=not context.focus_refs) and not conflicting_record(
+        tx, context, obj, query=question
+    )
 
 
 def _said_within(obj: RetrievedObject, windows: tuple[tuple[str, str], ...]) -> bool:

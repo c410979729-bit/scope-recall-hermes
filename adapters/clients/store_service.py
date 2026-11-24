@@ -15,10 +15,16 @@ def library_minutes(binding, *, missing: int | None = 0) -> int | None:
     path = binding.data_directory / "runtime-config.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        override = raw.get("resident_recall_minutes")
-        if override is not None:
-            strict_int("resident_recall_minutes", override, minimum=0, maximum=1440)
-            return override
+        raw_binding = raw.get("binding") if isinstance(raw, dict) else None
+        if (
+            isinstance(raw_binding, dict)
+            and raw_binding.get("installation_id") == binding.installation_id
+            and raw_binding.get("installation_kind") == binding.installation_kind
+        ):
+            override = raw.get("resident_recall_minutes")
+            if override is not None:
+                strict_int("resident_recall_minutes", override, minimum=0, maximum=1440)
+                return override
     except FileNotFoundError:
         pass
     except (OSError, ValueError, AttributeError):

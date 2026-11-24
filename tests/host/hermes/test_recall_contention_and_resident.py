@@ -222,7 +222,7 @@ def _seed_shared_hermes_store(tmp_path: Path):
         },
         "session_id": "TEST-worker-session",
         "allowed_scope_ids": sorted(attached.scope_ids),
-        "actor_origin": "host_generated",
+        "actor_origin": "human_direct",
         "owner_id": "TEST-owner",
         "request_seconds": 5.0,
         "drain_seconds": 5.0,
@@ -283,8 +283,9 @@ def _exercise_resident_providers(hermes_home: Path, monkeypatch: pytest.MonkeyPa
         def gil_hog() -> None:
             acc = 0
             while not stop_hog.is_set():
-                for i in range(10_000):
+                for i in range(100_000):
                     acc = (acc + i) ^ 0x5A5A
+                time.sleep(0.002)
             assert acc >= 0
 
         hog = threading.Thread(target=gil_hog, daemon=True)
@@ -385,7 +386,6 @@ def test_hermes_resident_recall_serves_prefetch_and_preserves_scope_isolation(
         if resident_proc.poll() is None:
             resident_proc.kill()
         resident_proc.wait(timeout=10)
-
     assert resident_entry is not None
     assert hermes_hooks._input_hook_deadline(100.0, 0.2) < 100.2
 
@@ -511,7 +511,7 @@ def test_standalone_local_hermes_store_serves_resident_recall_outside_gateway_gi
         },
         "session_id": "TEST-local-worker",
         "allowed_scope_ids": sorted(manifest.scope_ids),
-        "actor_origin": "host_generated",
+        "actor_origin": "human_direct",
         "owner_id": "TEST-owner",
         "request_seconds": 5.0,
         "drain_seconds": 5.0,
@@ -588,3 +588,84 @@ def test_standalone_local_hermes_store_serves_resident_recall_outside_gateway_gi
         if resident_proc.poll() is None:
             resident_proc.kill()
         resident_proc.wait(timeout=10)
+
+
+def test_hermes_resident_handler_reads_profile_dotenv_without_host_secret_scope(tmp_path, monkeypatch):
+    """Resident handler resolves credentials from <hermes_home>/.env without calling agent.secret_scope."""
+    from types import SimpleNamespace
+
+    from scope_recall.adapters.clients.hermes_resident import HermesResidentHandler
+
+    hermes_home = tmp_path / "TEST-hermes-dotenv"
+    manifest, _core = install_hermes_scope_recall(
+        hermes_home,
+        agent_id="TEST-agent",
+        platform="cli",
+        user_id="local",
+        agent_workspace="hermes",
+        test_mode=False,
+    )
+    scope_id = next(iter(manifest.scope_ids))
+    embed_endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents"
+    config_payload = {
+        "binding": {
+            "agent_id": manifest.agent_id,
+            "installation_id": manifest.installation_id,
+            "data_directory": str(manifest.data_directory),
+            "scope_ids": sorted(manifest.scope_ids),
+            "test_mode": manifest.test_mode,
+        },
+        "session_id": "TEST-resident-dotenv",
+        "allowed_scope_ids": [scope_id],
+        "actor_origin": "human_direct",
+        "owner_id": "TEST-worker",
+        "request_seconds": 10.0,
+        "drain_seconds": 30.0,
+        "max_items": 16,
+        "lease_seconds": 30.0,
+        "auxiliary": {
+            "external_embedding": True,
+            "external_consolidation": False,
+            "installation_dir": str(manifest.data_directory),
+            "budget": {
+                "batch": "memory",
+                "approved_models": ["gemini-embedding-2"],
+                "pricing": {"gemini-embedding-2": {"input_usd_per_million": "0", "output_usd_per_million": "0"}},
+                "cap_micro_usd": 0,
+                "total_call_cap": 100,
+                "total_input_cap": 100000,
+                "total_output_cap": 0,
+            },
+            "embedding": {
+                "model": "gemini-embedding-2",
+                "endpoint": embed_endpoint,
+                "dimensions": 3072,
+                "dialect": "gemini",
+                "credential_env": "SCOPE_RECALL_TEST_RESIDENT_EMBED_KEY",
+            },
+        },
+    }
+    (manifest.data_directory / "runtime-config.json").write_text(json.dumps(config_payload), encoding="utf-8")
+    (hermes_home / ".env").write_text(
+        "SCOPE_RECALL_TEST_RESIDENT_EMBED_KEY=TEST-from-hermes-dotenv\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("SCOPE_RECALL_TEST_RESIDENT_EMBED_KEY", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.secret_scope",
+        SimpleNamespace(get_secret=lambda _name: (_ for _ in ()).throw(AssertionError("must not call secret_scope"))),
+    )
+
+    handler = HermesResidentHandler.from_home(hermes_home)
+    try:
+        handler.ensure_runtime()
+        assert handler.runtime_ready
+        assert handler._host_runtime._host_adapter == "hermes"
+        assert (
+            handler._host_runtime.runtime.auxiliary.query_embedding._credential_getter(
+                "SCOPE_RECALL_TEST_RESIDENT_EMBED_KEY"
+            )
+            == "TEST-from-hermes-dotenv"
+        )
+    finally:
+        handler.close()

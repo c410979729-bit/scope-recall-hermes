@@ -80,13 +80,20 @@ jobs:
             test "${DISPATCH_SOURCE_SHA}" = "${SOURCE_SHA}"
             test "${DISPATCH_RUN_ID}" = "${RELEASE_RUN_ID}"
           fi
-          RELEASE_RUN_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
-          test "$(jq -er '.path' <<<"${RELEASE_RUN_JSON}")" = ".github/workflows/release.yml"
-          test "$(jq -er '.head_sha' <<<"${RELEASE_RUN_JSON}")" = "${SOURCE_SHA}"
-          test "$(jq -er '.repository.full_name' <<<"${RELEASE_RUN_JSON}")" = "${GITHUB_REPOSITORY}"
-          WORKFLOW_RUN_STATUS="$(jq -er '.status' <<<"${RELEASE_RUN_JSON}")"
-          WORKFLOW_RUN_CONCLUSION="$(jq -er '.conclusion' <<<"${RELEASE_RUN_JSON}")"
+          WORKFLOW_RUN_STATUS=""
+          for _attempt in $(seq 1 18); do
+            RELEASE_RUN_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
+            test "$(jq -er '.path' <<<"${RELEASE_RUN_JSON}")" = ".github/workflows/release.yml"
+            test "$(jq -er '.head_sha' <<<"${RELEASE_RUN_JSON}")" = "${SOURCE_SHA}"
+            test "$(jq -er '.repository.full_name' <<<"${RELEASE_RUN_JSON}")" = "${GITHUB_REPOSITORY}"
+            WORKFLOW_RUN_STATUS="$(jq -er '.status' <<<"${RELEASE_RUN_JSON}")"
+            if [ "${WORKFLOW_RUN_STATUS}" = "completed" ]; then
+              break
+            fi
+            sleep 5
+          done
           test "${WORKFLOW_RUN_STATUS}" = "completed"
+          WORKFLOW_RUN_CONCLUSION="$(jq -er '.conclusion' <<<"${RELEASE_RUN_JSON}")"
           test "${WORKFLOW_RUN_CONCLUSION}" = "success"
           {
             echo "source_sha=${SOURCE_SHA}"

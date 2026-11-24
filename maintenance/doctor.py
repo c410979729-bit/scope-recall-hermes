@@ -423,6 +423,7 @@ _WORKER_STATUS_KEYS = frozenset(
         "worker_error",
         "ingress_deferred",
         "ingress_given_up",
+        "resident_recall",
     }
 )
 
@@ -971,18 +972,34 @@ def _entry_runtime_config(instance: Path, data_directory: Path):
     return _runtime_config(pointer.parent if pointer.is_file() else data_directory)
 
 
-def _check_vector_threshold(report: DoctorReport, binding, data_directory: Path) -> None:
+def _check_vector_threshold(
+    report: DoctorReport, binding, data_directory: Path, *, instance: Path | None = None
+) -> None:
     """Report recall's built-in default or configured floor without changing configuration."""
+    attached = instance is not None and (_hermes_data_dir(instance) / "attachment.json").is_file()
+    entry_file = _hermes_data_dir(instance) / "runtime-config.json" if attached and instance is not None else None
+    config_file = (
+        entry_file if entry_file is not None and entry_file.exists() else data_directory / "runtime-config.json"
+    )
     try:
-        raw = _read_control_file(data_directory / "runtime-config.json")
+        raw = _read_control_file(config_file)
         config = None if raw is None else RuntimeInstanceConfig.from_mapping(raw)
     except Exception as exc:  # noqa: BLE001 - an unusable config is a finding, not a crash.
         record_check(report, "vector_threshold", "invalid", type(exc).__name__)
         return
+    shared_store_config = (
+        attached
+        and config is not None
+        and config_file != entry_file
+        and config.binding.installation_kind == "shared"
+        and config.binding.installation_id == binding.installation_id
+        and config.binding.data_directory.resolve() == data_directory.resolve()
+        and config.binding.test_mode == binding.test_mode
+    )
     auxiliary = getattr(config, "auxiliary", None)
     if (
         config is None
-        or config.binding != binding
+        or (not bindings_match(binding, config.binding) and not shared_store_config)
         or config.vector is None
         or auxiliary is None
         or auxiliary.external_embedding is not True
@@ -1083,7 +1100,7 @@ def run_doctor(
     _check_running_code(report, data_directory)
     package_health.apply_package_health(report, instance, probe)
     check_runtime_config_present(report, data_directory)
-    _check_vector_threshold(report, binding, data_directory)
+    _check_vector_threshold(report, binding, data_directory, instance=instance)
 
     readable = check_storage(report, binding, data_directory)
     if entry_accounts:

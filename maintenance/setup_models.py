@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from scope_recall.core.endpoint_policy import is_loopback_host
 from scope_recall.core.recall_policy import BUILTIN_VECTOR_THRESHOLD
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 from scope_recall.runtime.instance_config import VectorRuntimeConfig
@@ -20,12 +22,21 @@ def _ask(label: str, default: str = "") -> str:
 
 def configure_models() -> dict:
     """Collect explicit model and budget choices before the final setup confirmation."""
+    embedding_model = _ask("Embedding model")
+    embedding_endpoint = _ask("Embedding endpoint (no key in URL)")
+    embedding_dimensions = int(_ask("Embedding dimensions", "3072"))
+    embedding_dialect = _ask("Embedding dialect", "openai")
+    if is_loopback_host(urlsplit(embedding_endpoint).hostname):
+        raw_embed_env = _ask("Embedding credential environment variable (or none for loopback)", "none")
+        embed_credential_env = None if raw_embed_env.lower() in {"", "none", "null"} else raw_embed_env
+    else:
+        embed_credential_env = _ask("Embedding credential environment variable", "SCOPE_RECALL_EMBED_KEY")
     embedding = dict(
-        model=_ask("Embedding model"),
-        endpoint=_ask("Embedding endpoint (no key in URL)"),
-        dimensions=int(_ask("Embedding dimensions", "3072")),
-        dialect=_ask("Embedding dialect", "openai"),
-        credential_env=_ask("Embedding credential environment variable", "SCOPE_RECALL_EMBED_KEY"),
+        model=embedding_model,
+        endpoint=embedding_endpoint,
+        dimensions=embedding_dimensions,
+        dialect=embedding_dialect,
+        credential_env=embed_credential_env,
     )
     extraction_model = _ask("Extraction model")
     extraction = dict(

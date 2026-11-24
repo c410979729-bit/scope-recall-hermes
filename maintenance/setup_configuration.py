@@ -113,6 +113,10 @@ def validate_models(raw: dict) -> dict:
         if structure_contains_secret_like_text(safe):
             raise ValueError
         normalized = _explicit_fields(value, raw)
+        if auxiliary.embedding is not None:
+            normalized["auxiliary"]["embedding"]["credential_env"] = auxiliary.embedding.credential_env
+            normalized["auxiliary"]["embedding"]["query_prefix"] = auxiliary.embedding.query_prefix
+            normalized["auxiliary"]["embedding"]["document_prefix"] = auxiliary.embedding.document_prefix
         if auxiliary.consolidation is not None:
             normalized["auxiliary"]["consolidation"]["kind"] = auxiliary.consolidation.kind
         # Store and ledger identity come from the binding, never from a model recipe.

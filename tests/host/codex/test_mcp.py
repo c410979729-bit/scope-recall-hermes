@@ -1115,7 +1115,7 @@ def test_recall_inspect_status_tool_guidance_and_parameter_descriptions(tmp_path
 
     mcp_recall_props = mcp_recall.parameters["properties"]
     hermes_recall_props = _SCHEMAS["recall"]["parameters"]["properties"]
-    for param in ("query", "mode", "max_items", "as_of", "focus_refs"):
+    for param in ("query", "mode", "max_items", "budget_tokens", "as_of", "focus_refs"):
         assert mcp_recall_props[param].get("description"), param
         assert hermes_recall_props[param].get("description"), param
 

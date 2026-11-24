@@ -792,6 +792,52 @@ def test_route_replacement_plan_includes_removed_active_fields(fake_user):
     )
 
 
+def test_loopback_embedding_route_update_clears_stale_credential_and_prefixes(fake_user):
+    from scope_recall.maintenance.setup_configuration import validate_models
+
+    from tests.v11_support import context
+
+    binding = context(fake_user / "TEST-loopback-embed-store").binding
+    initial = validate_models(
+        dict(
+            auxiliary=dict(
+                external_embedding=True,
+                external_consolidation=False,
+                embedding=dict(
+                    model="TEST-embed",
+                    endpoint="https://example.test/v1/embeddings",
+                    dimensions=1024,
+                    dialect="openai",
+                    credential_env="TEST_OLD_EMBED_KEY",
+                    query_prefix="Instruct: query\nQuery: ",
+                    document_prefix="",
+                ),
+            )
+        )
+    )
+    before = runtime_payload(binding, models=initial, worker="manual")
+    loopback_update = validate_models(
+        dict(
+            auxiliary=dict(
+                external_embedding=True,
+                external_consolidation=False,
+                embedding=dict(
+                    model="TEST-embed",
+                    endpoint="http://127.0.0.1:11434/v1/embeddings",
+                    dimensions=1024,
+                    dialect="openai",
+                ),
+            )
+        )
+    )
+    after = runtime_payload(binding, models=loopback_update, existing=before)
+    parsed = AuxiliaryRuntimeConfig.from_mapping(after["auxiliary"])
+    assert parsed.embedding is not None
+    assert parsed.embedding.credential_env is None
+    assert parsed.embedding.query_prefix is None
+    assert parsed.embedding.document_prefix is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows host configuration DACL")
 def test_uninstall_preserves_the_host_configuration_access_boundary(fake_user):
     import win32security

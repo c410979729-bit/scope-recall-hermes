@@ -68,3 +68,14 @@ def test_a_reply_that_spells_the_name_out_is_recalled(app):
     )
     refs = [item["ref"] for item in _packet(core, ctx, "DLSS5到底是什么")["items"]]
     assert question.ref in refs and answer.ref in refs
+
+
+def test_hex_digest_prefixes_match_same_commit_without_relaxing_named_tokens():
+    full_sha = "c688033b8e239fbbb44d201d1a2511c1c3b7fec8"
+    other_sha = "f9e8d7c6b5a43210fedcba9876543210abcdef12"
+    assert identifiers_compatible("Check commit c688033b", f"Shipped in {full_sha} for local resident recall.")
+    assert identifiers_compatible(f"Inspect {full_sha}", "Backported c688033b8e23 to release branch.")
+    assert not identifiers_compatible("Check commit c688033b", f"Shipped in {other_sha}.")
+    assert not identifiers_compatible("Check commit c688033b", "General cache key refactoring notes.")
+    assert not identifiers_compatible("ed25519 key rotation", "ed255190 test fixture")
+    assert not identifiers_compatible("cafe2026 token", "cafe20260 fixture")
